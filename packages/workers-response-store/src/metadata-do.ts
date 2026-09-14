@@ -11,44 +11,61 @@ import type {
 
 type RevalidationClaim = {
   claimId: string;
+  objectKey: string;
   revision: number;
 };
 
 type PublicationResult = {
+  entry: StoredEntry | null;
   published: boolean;
-  previousObjectKey?: string;
 };
 
-type TagIndexEntry = {
-  keyHash: string;
-  tag: string;
+type WriteReservation = {
+  objectKey: string;
+  revision: number;
+};
+
+type RefreshCandidate = {
+  entry: StoredEntry;
+  reservation?: Pick<WriteReservation, "objectKey" | "revision">;
 };
 
 export type CacheMetadataStub = DurableObjectStub & {
-  beginWrite(keyHash: string, cacheKey: string): Promise<number>;
+  reserveWrite(
+    keyHash: string,
+    cacheKey: string,
+    objectKeyPrefix: string,
+    createdAt: number,
+  ): Promise<WriteReservation>;
   claimRevalidation(
     keyHash: string,
     activeRevision: number,
     cacheKey: string,
+    objectKeyPrefix: string,
     now: number,
     leaseMs: number,
   ): Promise<RevalidationClaim | null>;
-  finishRevalidation(keyHash: string, claimId: string): Promise<void>;
   trackPendingObject(objectKey: string, createdAt: number): Promise<void>;
   trackPendingObjects(objectKeys: string[], createdAt: number): Promise<void>;
+  releaseWrite(keyHash: string, objectKey: string, claimId?: string): Promise<void>;
   finishPendingObjects(objectKeys: string[]): Promise<void>;
   listExpiredPendingObjects(cutoff: number, limit: number): Promise<string[]>;
+  sweepExpiredPendingObjects(cutoff?: number): Promise<number>;
   publish(
     keyHash: string,
     revision: number,
     metadata: CandidateMetadata,
+    claimId?: string,
   ): Promise<PublicationResult>;
   getEntry(keyHash: string): Promise<StoredEntry | null>;
   getTagExpiration(tags: string[]): Promise<number>;
-  getEntriesMatching(options: ResponseStoreRefreshOptions): Promise<StoredEntry[]>;
+  reserveRefresh(
+    options: ResponseStoreRefreshOptions,
+    objectKeyRoot: string,
+    createdAt: number,
+  ): Promise<RefreshCandidate[]>;
   purgeMatching(options: ResponseStorePurgeOptions): Promise<PurgedEntry[]>;
   inspect(): Promise<StoredEntry[]>;
-  inspectTagIndex(): Promise<TagIndexEntry[]>;
 };
 
 type EntryRow = Record<string, SqlStorageValue> & {
@@ -57,11 +74,14 @@ type EntryRow = Record<string, SqlStorageValue> & {
   active_revision: number | null;
   latest_revision: number;
   object_key: string | null;
-  status: number | null;
+  claim_active_revision?: number | null;
+  claim_id?: string | null;
+  claim_revision?: number | null;
+  current_invalidation_sequence?: number;
+  pending_invalidation_sequence?: number | null;
+  pending_publishable?: number | null;
   status_text: string | null;
   response_headers: string | null;
-  created_at: number | null;
-  initial_age: number | null;
   fresh_until: number | null;
   swr_until: number | null;
   revalidator_id: string | null;
@@ -70,16 +90,25 @@ type EntryRow = Record<string, SqlStorageValue> & {
   tombstoned: number;
 };
 
-type TagRow = Record<string, SqlStorageValue> & {
-  key_hash: string;
-  tag: string;
-};
-
 const MAX_SQL_PARAMETERS = 100;
+const R2_DELETE_BATCH_SIZE = 1_000;
+const ORPHAN_RETENTION_MS = 60 * 60 * 1000;
+const ORPHAN_CLEANUP_LIMIT = 100;
+const ORPHAN_CLEANUP_RETRY_MS = 60 * 1000;
+
+type CacheMetadataEnv = {
+  CACHE_BODIES: R2Bucket;
+};
 
 function normalizeTags(tags: string[]): string[] {
   const normalized = tags.map((tag) => tag.trim().toLowerCase()).filter(Boolean);
   return [...new Set(normalized)];
+}
+
+function* batches<T>(values: readonly T[], size: number): Generator<T[]> {
+  for (let offset = 0; offset < values.length; offset += size) {
+    yield values.slice(offset, offset + size);
+  }
 }
 
 function storedEntryFromRow(row: EntryRow): StoredEntry | null {
@@ -94,7 +123,7 @@ function storedEntryFromRow(row: EntryRow): StoredEntry | null {
     return null;
   }
 
-  const entry: StoredEntry = {
+  return {
     keyHash: row.key_hash,
     cacheKey: row.cache_key,
     activeRevision: row.active_revision,
@@ -113,16 +142,6 @@ function storedEntryFromRow(row: EntryRow): StoredEntry | null {
           },
     cacheTags: JSON.parse(row.cache_tags ?? "[]") as string[],
   };
-
-  if (row.status !== null && row.created_at !== null && row.initial_age !== null) {
-    entry.legacyResponseMetadata = {
-      status: row.status,
-      createdAt: row.created_at,
-      initialAge: row.initial_age,
-    };
-  }
-
-  return entry;
 }
 
 function storedEntriesFromRows(rows: EntryRow[]): StoredEntry[] {
@@ -138,8 +157,10 @@ function storedEntriesFromRows(rows: EntryRow[]): StoredEntry[] {
   return entries;
 }
 
-export class CacheMetadata extends DurableObject<Record<string, never>> {
-  constructor(ctx: DurableObjectState, env: Record<string, never>) {
+export class CacheMetadata extends DurableObject<CacheMetadataEnv> {
+  private cleanupAlarmKnown = false;
+
+  constructor(ctx: DurableObjectState, env: CacheMetadataEnv) {
     super(ctx, env);
     void ctx.blockConcurrencyWhile(async () => {
       ctx.storage.sql.exec(`
@@ -149,11 +170,8 @@ export class CacheMetadata extends DurableObject<Record<string, never>> {
           active_revision INTEGER,
           latest_revision INTEGER NOT NULL,
           object_key TEXT,
-          status INTEGER,
           status_text TEXT,
           response_headers TEXT,
-          created_at INTEGER,
-          initial_age INTEGER,
           fresh_until INTEGER,
           swr_until INTEGER,
           revalidator_id TEXT,
@@ -170,126 +188,168 @@ export class CacheMetadata extends DurableObject<Record<string, never>> {
           claimed_at INTEGER NOT NULL,
           expires_at INTEGER NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS entry_tags (
-          tag TEXT NOT NULL,
-          key_hash TEXT NOT NULL,
-          PRIMARY KEY (tag, key_hash)
-        ) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS entry_tags_key_hash ON entry_tags(key_hash);
         CREATE TABLE IF NOT EXISTS tag_invalidations (
           tag TEXT PRIMARY KEY,
-          invalidated_at INTEGER NOT NULL
+          invalidated_at INTEGER NOT NULL,
+          invalidation_sequence INTEGER NOT NULL DEFAULT 0
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS metadata_schema_migrations (
           version INTEGER PRIMARY KEY
         );
+        CREATE TABLE IF NOT EXISTS metadata_state (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          tag_invalidation_sequence INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO metadata_state (singleton, tag_invalidation_sequence) VALUES (1, 0);
         CREATE TABLE IF NOT EXISTS pending_objects (
           object_key TEXT PRIMARY KEY,
+          invalidation_sequence INTEGER NOT NULL DEFAULT 0,
+          publishable INTEGER NOT NULL DEFAULT 1,
           created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS pending_objects_created_at ON pending_objects(created_at);
       `);
 
-      const hasBackfilledTagIndex =
-        ctx.storage.sql
-          .exec<{ version: number }>(
-            "SELECT version FROM metadata_schema_migrations WHERE version = 1",
-          )
-          .toArray().length > 0;
-
-      if (!hasBackfilledTagIndex) {
-        ctx.storage.transactionSync(() => {
-          const rows = ctx.storage.sql
-            .exec<{ key_hash: string; cache_tags: string | null }>(
-              `SELECT key_hash, cache_tags FROM entries
-              WHERE tombstoned = 0 AND active_revision IS NOT NULL`,
+      ctx.storage.transactionSync(() => {
+        const migrations = new Set(
+          ctx.storage.sql
+            .exec<{ version: number }>(
+              "SELECT version FROM metadata_schema_migrations WHERE version IN (2, 3)",
             )
-            .toArray();
+            .toArray()
+            .map(({ version }) => version),
+        );
+        if (migrations.size === 2) return;
 
-          for (const row of rows) {
-            const tags = JSON.parse(row.cache_tags ?? "[]") as string[];
-
-            for (const tag of normalizeTags(tags)) {
-              ctx.storage.sql.exec(
-                "INSERT OR IGNORE INTO entry_tags (tag, key_hash) VALUES (?, ?)",
-                tag,
-                row.key_hash,
-              );
-            }
+        const schemas = ctx.storage.sql
+          .exec<{ name: string; sql: string }>(
+            `SELECT name, sql FROM sqlite_schema
+            WHERE type = 'table' AND name IN ('tag_invalidations', 'pending_objects')`,
+          )
+          .toArray();
+        if (
+          !migrations.has(2) &&
+          !schemas
+            .find(({ name }) => name === "tag_invalidations")
+            ?.sql.includes("invalidation_sequence")
+        ) {
+          ctx.storage.sql.exec(
+            "ALTER TABLE tag_invalidations ADD COLUMN invalidation_sequence INTEGER NOT NULL DEFAULT 0",
+          );
+        }
+        if (
+          !migrations.has(2) &&
+          !schemas
+            .find(({ name }) => name === "pending_objects")
+            ?.sql.includes("invalidation_sequence")
+        ) {
+          ctx.storage.sql.exec(
+            "ALTER TABLE pending_objects ADD COLUMN invalidation_sequence INTEGER NOT NULL DEFAULT 0",
+          );
+        }
+        if (!migrations.has(2)) {
+          ctx.storage.sql.exec("INSERT INTO metadata_schema_migrations (version) VALUES (2)");
+        }
+        if (!migrations.has(3)) {
+          if (
+            !schemas.find(({ name }) => name === "pending_objects")?.sql.includes("publishable")
+          ) {
+            ctx.storage.sql.exec(
+              "ALTER TABLE pending_objects ADD COLUMN publishable INTEGER NOT NULL DEFAULT 1",
+            );
           }
-
-          ctx.storage.sql.exec("INSERT INTO metadata_schema_migrations (version) VALUES (1)");
-        });
-      }
+          ctx.storage.sql.exec("INSERT INTO metadata_schema_migrations (version) VALUES (3)");
+        }
+      });
     });
   }
 
-  private findMatchingEntryRows(options: ResponseStorePurgeOptions): EntryRow[] {
-    if (options.purgeEverything) {
-      return this.ctx.storage.sql
-        .exec<EntryRow>(
-          "SELECT * FROM entries WHERE tombstoned = 0 AND active_revision IS NOT NULL",
-        )
-        .toArray();
+  private async ensureCleanupAlarm(createdAt: number): Promise<void> {
+    if (this.cleanupAlarmKnown) return;
+
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null) {
+      await this.ctx.storage.setAlarm(createdAt + ORPHAN_RETENTION_MS);
     }
-
-    const matches = new Map<string, EntryRow>();
-    const tags = normalizeTags(options.tags ?? []);
-
-    for (let offset = 0; offset < tags.length; offset += MAX_SQL_PARAMETERS) {
-      const batch = tags.slice(offset, offset + MAX_SQL_PARAMETERS);
-      const placeholders = batch.map(() => "?").join(", ");
-      const rows = this.ctx.storage.sql
-        .exec<EntryRow>(
-          `SELECT DISTINCT entries.* FROM entries
-          INNER JOIN entry_tags ON entry_tags.key_hash = entries.key_hash
-          WHERE entries.tombstoned = 0 AND entries.active_revision IS NOT NULL
-            AND entry_tags.tag IN (${placeholders})`,
-          ...batch,
-        )
-        .toArray();
-
-      for (const row of rows) {
-        matches.set(row.key_hash, row);
-      }
-    }
-
-    const prefixes = options.pathPrefixes ?? [];
-    if (prefixes.length) {
-      const rows = this.ctx.storage.sql
-        .exec<EntryRow>(
-          "SELECT * FROM entries WHERE tombstoned = 0 AND active_revision IS NOT NULL",
-        )
-        .toArray();
-
-      for (const row of rows) {
-        if (prefixes.some((prefix) => row.cache_key.startsWith(prefix))) {
-          matches.set(row.key_hash, row);
-        }
-      }
-    }
-
-    return [...matches.values()];
+    this.cleanupAlarmKnown = true;
   }
 
-  trackPendingObjects(objectKeys: string[], createdAt: number): void {
+  private async maintainCleanupAlarm(createdAt: number): Promise<void> {
+    await this.ensureCleanupAlarm(createdAt).catch((error) => {
+      console.error(
+        JSON.stringify({
+          message: "Workers Response Store cleanup alarm update failed",
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    });
+  }
+
+  private findMatchingEntryRows(
+    options: ResponseStorePurgeOptions,
+    includePending = false,
+  ): EntryRow[] {
+    const rows = this.ctx.storage.sql
+      .exec<EntryRow>(
+        includePending
+          ? `SELECT * FROM entries
+            WHERE (tombstoned = 0 AND active_revision IS NOT NULL)
+              OR active_revision IS NULL OR latest_revision > active_revision`
+          : "SELECT * FROM entries WHERE tombstoned = 0 AND active_revision IS NOT NULL",
+      )
+      .toArray();
+    if (options.purgeEverything) {
+      return rows;
+    }
+
+    const tags = new Set(normalizeTags(options.tags ?? []));
+    const prefixes = options.pathPrefixes ?? [];
+    return rows.filter(
+      (row) =>
+        prefixes.some((prefix) => row.cache_key.startsWith(prefix)) ||
+        normalizeTags(JSON.parse(row.cache_tags ?? "[]") as string[]).some((tag) => tags.has(tag)),
+    );
+  }
+
+  async trackPendingObjects(objectKeys: string[], createdAt: number): Promise<void> {
     if (!objectKeys.length) {
       return;
     }
 
     this.ctx.storage.transactionSync(() => {
-      for (const objectKey of objectKeys) {
+      for (const batch of batches(objectKeys, MAX_SQL_PARAMETERS / 2)) {
+        const values = batch.flatMap((objectKey) => [objectKey, createdAt]);
         this.ctx.storage.sql.exec(
-          "INSERT OR REPLACE INTO pending_objects (object_key, created_at) VALUES (?, ?)",
-          objectKey,
-          createdAt,
+          `INSERT OR REPLACE INTO pending_objects
+            (object_key, created_at, publishable) VALUES ${batch
+              .map(() => "(?, ?, 0)")
+              .join(", ")}`,
+          ...values,
         );
       }
     });
+    await this.ensureCleanupAlarm(createdAt);
   }
 
-  trackPendingObject(objectKey: string, createdAt: number): void {
-    this.trackPendingObjects([objectKey], createdAt);
+  trackPendingObject(objectKey: string, createdAt: number): Promise<void> {
+    return this.trackPendingObjects([objectKey], createdAt);
+  }
+
+  releaseWrite(keyHash: string, objectKey: string, claimId?: string): void {
+    // Keep the object registered for cleanup while expiring its overlap lease.
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        "UPDATE pending_objects SET created_at = 0, publishable = 0 WHERE object_key = ?",
+        objectKey,
+      );
+      if (claimId) {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM revalidation_claims WHERE key_hash = ? AND claim_id = ?",
+          keyHash,
+          claimId,
+        );
+      }
+    });
   }
 
   finishPendingObjects(objectKeys: string[]): void {
@@ -298,10 +358,50 @@ export class CacheMetadata extends DurableObject<Record<string, never>> {
     }
 
     this.ctx.storage.transactionSync(() => {
-      for (const objectKey of objectKeys) {
-        this.ctx.storage.sql.exec("DELETE FROM pending_objects WHERE object_key = ?", objectKey);
+      for (const batch of batches(objectKeys, MAX_SQL_PARAMETERS)) {
+        this.ctx.storage.sql.exec(
+          `DELETE FROM pending_objects WHERE object_key IN (${batch.map(() => "?").join(", ")})`,
+          ...batch,
+        );
       }
     });
+  }
+
+  private async deleteTrackedObjects(objectKeys: string[]): Promise<void> {
+    for (const batch of batches(objectKeys, R2_DELETE_BATCH_SIZE)) {
+      try {
+        await this.env.CACHE_BODIES.delete(batch);
+        this.finishPendingObjects(batch);
+      } catch (error) {
+        for (const retryBatch of batches(batch, MAX_SQL_PARAMETERS)) {
+          this.ctx.storage.sql.exec(
+            `INSERT OR REPLACE INTO pending_objects
+              (object_key, created_at, publishable) VALUES ${retryBatch
+                .map(() => "(?, 0, 0)")
+                .join(", ")}`,
+            ...retryBatch,
+          );
+        }
+        console.error(
+          JSON.stringify({
+            message: "Workers Response Store R2 cleanup failed",
+            objectKeys: batch,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+        try {
+          await this.ctx.storage.setAlarm(Date.now() + ORPHAN_CLEANUP_RETRY_MS);
+          this.cleanupAlarmKnown = true;
+        } catch (alarmError) {
+          console.error(
+            JSON.stringify({
+              message: "Workers Response Store cleanup retry scheduling failed",
+              error: alarmError instanceof Error ? alarmError.message : String(alarmError),
+            }),
+          );
+        }
+      }
+    }
   }
 
   listExpiredPendingObjects(cutoff: number, limit: number): string[] {
@@ -320,18 +420,102 @@ export class CacheMetadata extends DurableObject<Record<string, never>> {
       .map((row) => row.object_key);
   }
 
-  claimRevalidation(
+  async sweepExpiredPendingObjects(cutoff = Date.now() - ORPHAN_RETENTION_MS): Promise<number> {
+    this.cleanupAlarmKnown = false;
+    const rows = this.ctx.storage.sql
+      .exec<{
+        active: number;
+        created_at: number;
+        object_key: string;
+        publishable: number;
+      }>(
+        `SELECT pending_objects.object_key, pending_objects.created_at,
+          pending_objects.publishable,
+          entries.object_key IS NOT NULL AS active
+        FROM pending_objects
+        LEFT JOIN entries
+          ON entries.object_key = pending_objects.object_key AND entries.tombstoned = 0
+        ORDER BY pending_objects.created_at
+        LIMIT ?`,
+        ORPHAN_CLEANUP_LIMIT + 1,
+      )
+      .toArray();
+    const batch = rows.slice(0, ORPHAN_CLEANUP_LIMIT);
+    const activeObjectKeys = batch
+      .filter(({ active }) => active)
+      .map(({ object_key }) => object_key);
+    const expired = batch.filter(({ active, created_at }) => !active && created_at <= cutoff);
+    const reservations = expired.filter(({ publishable }) => publishable === 1);
+    const cleanupObjectKeys = expired
+      .filter(({ publishable }) => publishable === 0)
+      .map(({ object_key }) => object_key);
+    const fencedAt = Date.now();
+    const expiredObjectKeys = expired.map(({ object_key }) => object_key);
+    this.finishPendingObjects(activeObjectKeys);
+    for (const reservationBatch of batches(reservations, MAX_SQL_PARAMETERS - 1)) {
+      this.ctx.storage.sql.exec(
+        `UPDATE pending_objects SET created_at = ?, publishable = 0
+        WHERE object_key IN (${reservationBatch.map(() => "?").join(", ")})`,
+        fencedAt,
+        ...reservationBatch.map(({ object_key }) => object_key),
+      );
+    }
+    if (expiredObjectKeys.length) {
+      await this.env.CACHE_BODIES.delete(expiredObjectKeys);
+      this.finishPendingObjects(cleanupObjectKeys);
+    }
+
+    const next = batch.find(({ active, created_at }) => !active && created_at > cutoff);
+    if (!next && rows.length > ORPHAN_CLEANUP_LIMIT) {
+      await this.ctx.storage.setAlarm(Date.now());
+      this.cleanupAlarmKnown = true;
+    } else if (next || reservations.length) {
+      await this.ensureCleanupAlarm(
+        Math.min(next?.created_at ?? Number.POSITIVE_INFINITY, fencedAt),
+      );
+    }
+
+    return expiredObjectKeys.length;
+  }
+
+  async alarm(): Promise<void> {
+    try {
+      await this.sweepExpiredPendingObjects();
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          message: "Workers Response Store orphan cleanup failed",
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      await this.ctx.storage.setAlarm(Date.now() + ORPHAN_CLEANUP_RETRY_MS);
+      this.cleanupAlarmKnown = true;
+    }
+  }
+
+  async claimRevalidation(
     keyHash: string,
     activeRevision: number,
     cacheKey: string,
+    objectKeyPrefix: string,
     now: number,
     leaseMs: number,
-  ): RevalidationClaim | null {
-    return this.ctx.storage.transactionSync(() => {
+  ): Promise<RevalidationClaim | null> {
+    const claim = this.ctx.storage.transactionSync(() => {
       const entry = this.ctx.storage.sql
-        .exec<{ active_revision: number | null; latest_revision: number; tombstoned: number }>(
-          `SELECT active_revision, latest_revision, tombstoned
-          FROM entries WHERE key_hash = ? AND cache_key = ?`,
+        .exec<{
+          active_revision: number | null;
+          latest_revision: number;
+          tombstoned: number;
+          claim_active_revision: number | null;
+          claim_expires_at: number | null;
+        }>(
+          `SELECT entries.active_revision, entries.latest_revision, entries.tombstoned,
+            revalidation_claims.active_revision AS claim_active_revision,
+            revalidation_claims.expires_at AS claim_expires_at
+          FROM entries
+          LEFT JOIN revalidation_claims ON revalidation_claims.key_hash = entries.key_hash
+          WHERE entries.key_hash = ? AND entries.cache_key = ?`,
           keyHash,
           cacheKey,
         )
@@ -340,18 +524,13 @@ export class CacheMetadata extends DurableObject<Record<string, never>> {
         return null;
       }
 
-      const existing = this.ctx.storage.sql
-        .exec<{ active_revision: number; expires_at: number }>(
-          "SELECT active_revision, expires_at FROM revalidation_claims WHERE key_hash = ?",
-          keyHash,
-        )
-        .toArray()[0];
-      if (existing?.active_revision === activeRevision && existing.expires_at > now) {
+      if (entry.claim_active_revision === activeRevision && (entry.claim_expires_at ?? 0) > now) {
         return null;
       }
 
       const revision = entry.latest_revision + 1;
       const claimId = crypto.randomUUID();
+      const objectKey = `${objectKeyPrefix}/${revision}`;
 
       this.ctx.storage.sql.exec(
         "UPDATE entries SET latest_revision = ? WHERE key_hash = ? AND active_revision = ?",
@@ -370,75 +549,141 @@ export class CacheMetadata extends DurableObject<Record<string, never>> {
         now,
         now + leaseMs,
       );
+      this.ctx.storage.sql.exec(
+        `INSERT OR REPLACE INTO pending_objects
+          (object_key, created_at, invalidation_sequence)
+        VALUES (?, ?, (SELECT tag_invalidation_sequence FROM metadata_state WHERE singleton = 1))`,
+        objectKey,
+        now,
+      );
 
-      return { claimId, revision };
+      return { claimId, objectKey, revision };
     });
+    if (claim) await this.ensureCleanupAlarm(now);
+    return claim;
   }
 
-  finishRevalidation(keyHash: string, claimId: string): void {
-    this.ctx.storage.sql.exec(
-      "DELETE FROM revalidation_claims WHERE key_hash = ? AND claim_id = ?",
-      keyHash,
-      claimId,
-    );
+  private reserveRevision(
+    keyHash: string,
+    cacheKey: string,
+    current: { latest_revision: number } | undefined,
+  ): number {
+    const revision = (current?.latest_revision ?? 0) + 1;
+
+    if (!current) {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO entries (key_hash, cache_key, latest_revision, tombstoned) VALUES (?, ?, ?, 1)",
+        keyHash,
+        cacheKey,
+        revision,
+      );
+    } else {
+      this.ctx.storage.sql.exec(
+        "UPDATE entries SET cache_key = ?, latest_revision = ? WHERE key_hash = ?",
+        cacheKey,
+        revision,
+        keyHash,
+      );
+    }
+
+    return revision;
   }
 
-  beginWrite(keyHash: string, cacheKey: string): number {
-    return this.ctx.storage.transactionSync(() => {
+  async reserveWrite(
+    keyHash: string,
+    cacheKey: string,
+    objectKeyPrefix: string,
+    createdAt: number,
+  ): Promise<WriteReservation> {
+    const reservation = this.ctx.storage.transactionSync(() => {
       const current = this.ctx.storage.sql
-        .exec<{ latest_revision: number }>(
-          "SELECT latest_revision FROM entries WHERE key_hash = ?",
+        .exec<{ active_revision: number | null; latest_revision: number }>(
+          "SELECT active_revision, latest_revision FROM entries WHERE key_hash = ?",
           keyHash,
         )
         .toArray()[0];
-      const revision = (current?.latest_revision ?? 0) + 1;
 
-      if (!current) {
-        this.ctx.storage.sql.exec(
-          "INSERT INTO entries (key_hash, cache_key, latest_revision, tombstoned) VALUES (?, ?, ?, 1)",
-          keyHash,
-          cacheKey,
-          revision,
-        );
-      } else {
-        this.ctx.storage.sql.exec(
-          "UPDATE entries SET cache_key = ?, latest_revision = ? WHERE key_hash = ?",
-          cacheKey,
-          revision,
-          keyHash,
-        );
-      }
-
-      return revision;
+      const revision = this.reserveRevision(keyHash, cacheKey, current);
+      const objectKey = `${objectKeyPrefix}/${revision}`;
+      this.ctx.storage.sql.exec(
+        `INSERT OR REPLACE INTO pending_objects
+          (object_key, created_at, invalidation_sequence)
+        VALUES (?, ?, (SELECT tag_invalidation_sequence FROM metadata_state WHERE singleton = 1))`,
+        objectKey,
+        createdAt,
+      );
+      return { objectKey, revision };
     });
+    await this.ensureCleanupAlarm(createdAt);
+    return reservation;
   }
 
-  publish(keyHash: string, revision: number, metadata: CandidateMetadata): PublicationResult {
-    return this.ctx.storage.transactionSync(() => {
+  async publish(
+    keyHash: string,
+    revision: number,
+    metadata: CandidateMetadata,
+    claimId?: string,
+  ): Promise<PublicationResult> {
+    const { cleanupObjectKey, result } = this.ctx.storage.transactionSync(() => {
       const current = this.ctx.storage.sql
-        .exec<{ latest_revision: number; object_key: string | null }>(
-          "SELECT latest_revision, object_key FROM entries WHERE key_hash = ?",
+        .exec<EntryRow>(
+          `SELECT entries.*,
+            revalidation_claims.active_revision AS claim_active_revision,
+            revalidation_claims.claim_id AS claim_id,
+            revalidation_claims.revision AS claim_revision,
+            pending_objects.invalidation_sequence AS pending_invalidation_sequence,
+            pending_objects.publishable AS pending_publishable,
+            metadata_state.tag_invalidation_sequence AS current_invalidation_sequence
+          FROM entries
+          CROSS JOIN metadata_state
+          LEFT JOIN pending_objects ON pending_objects.object_key = ?
+          LEFT JOIN revalidation_claims ON revalidation_claims.key_hash = entries.key_hash
+          WHERE entries.key_hash = ?`,
+          metadata.objectKey,
           keyHash,
         )
         .toArray()[0];
-      if (!current || current.latest_revision !== revision) {
-        return { published: false };
+      if (
+        !current ||
+        current.pending_invalidation_sequence === null ||
+        current.pending_invalidation_sequence === undefined ||
+        current.pending_publishable !== 1 ||
+        revision > current.latest_revision ||
+        (current.active_revision !== null && revision <= current.active_revision) ||
+        (claimId !== undefined &&
+          (current.claim_id !== claimId ||
+            current.claim_revision !== revision ||
+            current.claim_active_revision !== current.active_revision)) ||
+        (metadata.fenceTags.length > 0 &&
+          current.current_invalidation_sequence! > current.pending_invalidation_sequence &&
+          this.getTagInvalidationMaximum(metadata.fenceTags, "invalidation_sequence") >
+            current.pending_invalidation_sequence)
+      ) {
+        if (claimId) {
+          this.ctx.storage.sql.exec(
+            "DELETE FROM revalidation_claims WHERE key_hash = ? AND claim_id = ?",
+            keyHash,
+            claimId,
+          );
+        }
+        return {
+          cleanupObjectKey:
+            current?.object_key === metadata.objectKey ? undefined : metadata.objectKey,
+          result: { entry: current ? storedEntryFromRow(current) : null, published: false },
+        };
       }
 
-      const responseMetadataIsInR2 = metadata.responseMetadataInR2 === true;
       const update = this.ctx.storage.sql.exec(
         `UPDATE entries SET
-          active_revision = ?, object_key = ?, status = ?, status_text = ?,
-          response_headers = ?, created_at = ?, initial_age = ?, fresh_until = ?, swr_until = ?,
+          active_revision = ?, object_key = ?, status_text = ?, response_headers = ?,
+          fresh_until = ?, swr_until = ?,
           revalidator_id = ?, revalidator_args = ?, cache_tags = ?, tombstoned = 0
-        WHERE key_hash = ? AND latest_revision = ?`,
+        WHERE key_hash = ? AND latest_revision >= ?
+          AND (active_revision IS NULL OR active_revision < ?)`,
         revision,
         metadata.objectKey,
-        responseMetadataIsInR2 ? null : metadata.status,
         metadata.statusText,
         JSON.stringify(metadata.responseHeaders),
-        responseMetadataIsInR2 ? null : metadata.createdAt,
-        responseMetadataIsInR2 ? null : metadata.initialAge,
         metadata.freshUntil,
         metadata.swrUntil,
         metadata.revalidator?.id ?? null,
@@ -446,26 +691,64 @@ export class CacheMetadata extends DurableObject<Record<string, never>> {
         JSON.stringify(metadata.cacheTags),
         keyHash,
         revision,
+        revision,
       );
 
       const published = update.rowsWritten === 1;
       if (published) {
-        this.ctx.storage.sql.exec("DELETE FROM entry_tags WHERE key_hash = ?", keyHash);
-
-        for (const tag of normalizeTags(metadata.cacheTags)) {
-          this.ctx.storage.sql.exec(
-            "INSERT INTO entry_tags (tag, key_hash) VALUES (?, ?)",
-            tag,
-            keyHash,
-          );
-        }
+        this.ctx.storage.sql.exec(
+          "DELETE FROM pending_objects WHERE object_key = ?",
+          metadata.objectKey,
+        );
+      }
+      if (published && current.object_key && current.object_key !== metadata.objectKey) {
+        this.ctx.storage.sql.exec(
+          `INSERT OR IGNORE INTO pending_objects
+            (object_key, created_at, publishable) VALUES (?, ?, 0)`,
+          current.object_key,
+          Date.now(),
+        );
+      }
+      if (claimId) {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM revalidation_claims WHERE key_hash = ? AND claim_id = ?",
+          keyHash,
+          claimId,
+        );
       }
 
+      const entry: StoredEntry = {
+        keyHash,
+        cacheKey: current.cache_key,
+        activeRevision: revision,
+        latestRevision: current.latest_revision,
+        objectKey: metadata.objectKey,
+        statusText: metadata.statusText,
+        responseHeaders: metadata.responseHeaders,
+        freshUntil: metadata.freshUntil,
+        swrUntil: metadata.swrUntil,
+        revalidator: metadata.revalidator,
+        cacheTags: metadata.cacheTags,
+      };
+
       return {
-        published,
-        ...(current.object_key ? { previousObjectKey: current.object_key } : {}),
+        cleanupObjectKey: published
+          ? current.object_key && current.object_key !== metadata.objectKey
+            ? current.object_key
+            : undefined
+          : metadata.objectKey,
+        result: {
+          entry: published ? entry : null,
+          published,
+        },
       };
     });
+
+    if (cleanupObjectKey) {
+      await this.maintainCleanupAlarm(Date.now());
+      await this.deleteTrackedObjects([cleanupObjectKey]);
+    }
+    return result;
   }
 
   getEntry(keyHash: string): StoredEntry | null {
@@ -475,16 +758,18 @@ export class CacheMetadata extends DurableObject<Record<string, never>> {
     return row ? storedEntryFromRow(row) : null;
   }
 
-  getTagExpiration(tags: string[]): number {
+  private getTagInvalidationMaximum(
+    tags: string[],
+    column: "invalidated_at" | "invalidation_sequence",
+  ): number {
     const normalized = normalizeTags(tags);
     let expiration = 0;
 
-    for (let offset = 0; offset < normalized.length; offset += MAX_SQL_PARAMETERS) {
-      const batch = normalized.slice(offset, offset + MAX_SQL_PARAMETERS);
+    for (const batch of batches(normalized, MAX_SQL_PARAMETERS)) {
       const placeholders = batch.map(() => "?").join(", ");
       const row = this.ctx.storage.sql
         .exec<{ invalidated_at: number | null }>(
-          `SELECT MAX(invalidated_at) AS invalidated_at
+          `SELECT MAX(${column}) AS invalidated_at
           FROM tag_invalidations WHERE tag IN (${placeholders})`,
           ...batch,
         )
@@ -495,58 +780,152 @@ export class CacheMetadata extends DurableObject<Record<string, never>> {
     return expiration;
   }
 
-  getEntriesMatching(options: ResponseStoreRefreshOptions): StoredEntry[] {
-    return storedEntriesFromRows(this.findMatchingEntryRows(options));
+  getTagExpiration(tags: string[]): number {
+    return this.getTagInvalidationMaximum(tags, "invalidated_at");
   }
 
-  purgeMatching(options: ResponseStorePurgeOptions): PurgedEntry[] {
-    return this.ctx.storage.transactionSync(() => {
+  async reserveRefresh(
+    options: ResponseStoreRefreshOptions,
+    objectKeyRoot: string,
+    createdAt: number,
+  ): Promise<RefreshCandidate[]> {
+    const candidates = this.ctx.storage.transactionSync(() => {
       const matches = this.findMatchingEntryRows(options);
-      const invalidatedAt = Date.now();
+      const reservations = matches.flatMap((row) => {
+        const entry = storedEntryFromRow(row);
+        return entry?.revalidator
+          ? [
+              {
+                keyHash: row.key_hash,
+                objectKey: `${objectKeyRoot}/${row.key_hash}/${row.latest_revision + 1}`,
+                revision: row.latest_revision + 1,
+              },
+            ]
+          : [];
+      });
 
-      for (const tag of normalizeTags(options.tags ?? [])) {
+      for (const batch of batches(reservations, MAX_SQL_PARAMETERS)) {
+        const keyHashes = batch.map(({ keyHash }) => keyHash);
         this.ctx.storage.sql.exec(
-          `INSERT INTO tag_invalidations (tag, invalidated_at) VALUES (?, ?)
-          ON CONFLICT(tag) DO UPDATE SET invalidated_at =
-            MAX(tag_invalidations.invalidated_at, excluded.invalidated_at)`,
-          tag,
-          invalidatedAt,
+          `UPDATE entries SET latest_revision = latest_revision + 1
+          WHERE key_hash IN (${keyHashes.map(() => "?").join(", ")})`,
+          ...keyHashes,
+        );
+      }
+      for (const batch of batches(reservations, MAX_SQL_PARAMETERS / 2)) {
+        this.ctx.storage.sql.exec(
+          `INSERT OR REPLACE INTO pending_objects
+            (object_key, created_at, invalidation_sequence) VALUES ${batch
+              .map(
+                () =>
+                  "(?, ?, (SELECT tag_invalidation_sequence FROM metadata_state WHERE singleton = 1))",
+              )
+              .join(", ")}`,
+          ...batch.flatMap(({ objectKey }) => [objectKey, createdAt]),
         );
       }
 
-      for (const row of matches) {
+      const byKey = new Map(reservations.map((reservation) => [reservation.keyHash, reservation]));
+      return matches.flatMap((row) => {
+        const entry = storedEntryFromRow(row);
+        if (!entry) return [];
+        const reservation = byKey.get(row.key_hash);
+        return [
+          {
+            entry,
+            ...(reservation
+              ? {
+                  reservation: {
+                    objectKey: reservation.objectKey,
+                    revision: reservation.revision,
+                  },
+                }
+              : {}),
+          },
+        ];
+      });
+    });
+
+    if (candidates.some(({ reservation }) => reservation)) {
+      await this.ensureCleanupAlarm(createdAt);
+    }
+    return candidates;
+  }
+
+  async purgeMatching(options: ResponseStorePurgeOptions): Promise<PurgedEntry[]> {
+    const invalidatedAt = Date.now();
+    const matches = this.ctx.storage.transactionSync(() => {
+      const matches = this.findMatchingEntryRows(options, true);
+
+      const tags = normalizeTags(options.tags ?? []);
+      if (tags.length) {
+        this.ctx.storage.sql.exec(
+          `UPDATE metadata_state SET tag_invalidation_sequence = tag_invalidation_sequence + 1
+          WHERE singleton = 1`,
+        );
+      }
+      for (const batch of batches(tags, MAX_SQL_PARAMETERS / 2)) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO tag_invalidations
+            (tag, invalidated_at, invalidation_sequence) VALUES ${batch
+              .map(
+                () =>
+                  "(?, ?, (SELECT tag_invalidation_sequence FROM metadata_state WHERE singleton = 1))",
+              )
+              .join(", ")}
+          ON CONFLICT(tag) DO UPDATE SET invalidated_at =
+            MAX(tag_invalidations.invalidated_at, excluded.invalidated_at),
+            invalidation_sequence = MAX(
+              tag_invalidations.invalidation_sequence,
+              excluded.invalidation_sequence
+            )`,
+          ...batch.flatMap((tag) => [tag, invalidatedAt]),
+        );
+      }
+
+      for (const batch of batches(matches, MAX_SQL_PARAMETERS - 1)) {
+        const keyHashes = batch.map((row) => row.key_hash);
+        const placeholders = keyHashes.map(() => "?").join(", ");
+        this.ctx.storage.sql.exec(
+          `INSERT OR IGNORE INTO pending_objects (object_key, created_at, publishable)
+          SELECT object_key, ?, 0 FROM entries
+          WHERE key_hash IN (${placeholders}) AND object_key IS NOT NULL`,
+          invalidatedAt,
+          ...keyHashes,
+        );
         this.ctx.storage.sql.exec(
           `UPDATE entries SET
             latest_revision = latest_revision + 1,
-            active_revision = NULL,
+            active_revision = latest_revision + 1,
             object_key = NULL,
-            status = NULL,
             status_text = NULL,
             response_headers = NULL,
-            created_at = NULL,
-            initial_age = NULL,
             fresh_until = NULL,
             swr_until = NULL,
             revalidator_id = NULL,
             revalidator_args = NULL,
             cache_tags = NULL,
             tombstoned = 1
-          WHERE key_hash = ?`,
-          row.key_hash,
+          WHERE key_hash IN (${placeholders})`,
+          ...keyHashes,
         );
         this.ctx.storage.sql.exec(
-          "DELETE FROM revalidation_claims WHERE key_hash = ?",
-          row.key_hash,
+          `DELETE FROM revalidation_claims WHERE key_hash IN (${placeholders})`,
+          ...keyHashes,
         );
-        this.ctx.storage.sql.exec("DELETE FROM entry_tags WHERE key_hash = ?", row.key_hash);
       }
 
-      return matches.map((row) => ({
-        keyHash: row.key_hash,
-        cacheKey: row.cache_key,
-        objectKey: row.object_key!,
-      }));
+      return matches.flatMap((row) =>
+        row.object_key === null
+          ? []
+          : [{ keyHash: row.key_hash, cacheKey: row.cache_key, objectKey: row.object_key }],
+      );
     });
+    if (matches.length) {
+      await this.maintainCleanupAlarm(invalidatedAt);
+      await this.deleteTrackedObjects(matches.map((entry) => entry.objectKey));
+    }
+    return matches;
   }
 
   inspect(): StoredEntry[] {
@@ -554,12 +933,5 @@ export class CacheMetadata extends DurableObject<Record<string, never>> {
       .exec<EntryRow>("SELECT * FROM entries ORDER BY cache_key")
       .toArray();
     return storedEntriesFromRows(rows);
-  }
-
-  inspectTagIndex(): TagIndexEntry[] {
-    return this.ctx.storage.sql
-      .exec<TagRow>("SELECT key_hash, tag FROM entry_tags ORDER BY tag, key_hash")
-      .toArray()
-      .map((row) => ({ keyHash: row.key_hash, tag: row.tag }));
   }
 }

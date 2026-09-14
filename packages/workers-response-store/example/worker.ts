@@ -62,6 +62,13 @@ async function handlePut(request: Request, store: WorkersResponseStore): Promise
   if (cdnCacheControl) headers.set("CDN-Cache-Control", cdnCacheControl);
 
   let body = request.body;
+  if (request.headers.get("X-Body-Failure") === "1") {
+    body = new ReadableStream({
+      start(controller) {
+        controller.error(new Error("Fixture body failure"));
+      },
+    });
+  }
   if (body && bodyDelayMs > 0) {
     const reader = body.getReader();
     let delayed = false;
@@ -82,6 +89,10 @@ async function handlePut(request: Request, store: WorkersResponseStore): Promise
       },
     });
   }
+  let teeSibling: ReadableStream | undefined;
+  if (body && request.headers.get("X-Tee-Body") === "1") {
+    [body, teeSibling] = body.tee();
+  }
 
   const response = new Response(NULL_BODY_STATUSES.has(status) ? null : body, {
     status,
@@ -99,9 +110,11 @@ async function handlePut(request: Request, store: WorkersResponseStore): Promise
         };
 
   const result = await store.put(target, response, {
+    coalesce: request.headers.get("X-Coalesce") === "1",
     revalidator,
     purgeExisting: request.headers.get("X-Purge-Existing") === "1",
   });
+  await new Response(teeSibling).arrayBuffer();
 
   return json(result);
 }
@@ -186,6 +199,11 @@ export default {
       if (request.method === "POST" && url.pathname === "/admin/purge") {
         const options = (await request.json()) as ResponseStorePurgeOptions;
         return json(await responseStore.purge(options));
+      }
+
+      if (request.method === "POST" && url.pathname === "/admin/tag-expiration") {
+        const { tags } = (await request.json()) as { tags: string[] };
+        return json({ expiration: await responseStore.getTagExpiration(tags) });
       }
 
       if (request.method === "GET" && url.pathname === "/admin/stats") {
