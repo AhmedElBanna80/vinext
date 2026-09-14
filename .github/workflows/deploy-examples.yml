@@ -3,7 +3,8 @@ name: Deploy Examples
 on:
   push:
     branches: [main]
-  pull_request: # run on PRs against any base branch, not just main
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
 
 concurrency:
   group: deploy-${{ github.event_name }}-${{ github.ref }}
@@ -14,7 +15,7 @@ permissions: {}
 jobs:
   response_store:
     # Skip entirely for fork PRs — they don't have access to deploy secrets.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'push' || (github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository)
     name: Deploy and test Workers Response Store
     runs-on: ubuntu-latest
     permissions:
@@ -48,14 +49,6 @@ jobs:
             echo "inline_name=${prefix}-rs-inline"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Deploy cache Worker
-        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: packages/workers-response-store
-          command: deploy --config example/service-binding/wrangler.cache.jsonc --name ${{ steps.names.outputs.service_name }}
-
       - name: Configure live client Worker
         working-directory: packages/workers-response-store
         env:
@@ -74,21 +67,17 @@ jobs:
             fs.writeFileSync(".wrangler-e2e.user.jsonc", config);
           '
 
-      - name: Deploy live client Worker
-        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: packages/workers-response-store
-          command: deploy --config .wrangler-e2e.user.jsonc
-
-      - name: Deploy live self-contained Worker
-        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: packages/workers-response-store
-          command: deploy --config wrangler.jsonc --name ${{ steps.names.outputs.inline_name }}
+      - name: Deploy live Response Store Workers
+        working-directory: packages/workers-response-store
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SERVICE_NAME: ${{ steps.names.outputs.service_name }}
+          INLINE_NAME: ${{ steps.names.outputs.inline_name }}
+        run: |
+          node "$GITHUB_WORKSPACE/.github/scripts/wrangler-deploy.mjs" --config example/service-binding/wrangler.cache.jsonc --name "$SERVICE_NAME"
+          node "$GITHUB_WORKSPACE/.github/scripts/wrangler-deploy.mjs" --config .wrangler-e2e.user.jsonc
+          node "$GITHUB_WORKSPACE/.github/scripts/wrangler-deploy.mjs" --config wrangler.jsonc --name "$INLINE_NAME"
 
       - name: Run live Response Store E2E
         working-directory: packages/workers-response-store
@@ -135,7 +124,7 @@ jobs:
 
   deploy:
     # Skip entirely for fork PRs — they don't have access to deploy secrets.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'push' || (github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository)
     name: Deploy ${{ matrix.example.name }}
     needs: response_store
     runs-on: ubuntu-latest
@@ -199,28 +188,45 @@ jobs:
       - name: Build vinext plugin
         run: vp run build
 
-      - name: Build example
-        if: matrix.example.static_export != true
-        run: vp build
-        working-directory: ${{ matrix.example.working_directory }}
-
-      - name: Bind Response Store demo to this run's cache Worker
-        if: matrix.example.name == 'response-store-demo'
+      - name: Configure Response Store demo preview
+        if: matrix.example.name == 'response-store-demo' && github.event_name == 'pull_request'
         working-directory: ${{ matrix.example.working_directory }}
         env:
-          RESPONSE_STORE_SERVICE: ${{ needs.response_store.outputs.service_name }}
+          SERVICE_NAME: pr-${{ github.event.pull_request.number }}-response-store-demo-response-store
         run: |
           # Node reads the value from process.env.
           # shellcheck disable=SC2016
           node -e '
             const fs = require("node:fs");
-            const path = "dist/server/wrangler.json";
-            const config = JSON.parse(fs.readFileSync(path, "utf8"));
-            const binding = config.services?.find(({ binding }) => binding === "RESPONSE_STORE");
-            if (!binding) throw new Error("Missing RESPONSE_STORE service binding");
-            binding.service = process.env.RESPONSE_STORE_SERVICE;
-            fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+            const appPath = "wrangler.jsonc";
+            const servicePath = "wrangler.response-store.jsonc";
+            const app = fs.readFileSync(appPath, "utf8").replace(
+              `"service": "response-store-demo-response-store"`,
+              `"service": "${process.env.SERVICE_NAME}"`,
+            );
+            const service = fs.readFileSync(servicePath, "utf8").replace(
+              `"name": "response-store-demo-response-store"`,
+              `"name": "${process.env.SERVICE_NAME}"`,
+            );
+            if (!app.includes(process.env.SERVICE_NAME) || !service.includes(process.env.SERVICE_NAME)) {
+              throw new Error("Could not configure the Response Store preview Worker name");
+            }
+            fs.writeFileSync(appPath, app);
+            fs.writeFileSync(servicePath, service);
           '
+
+      - name: Deploy configured Response Store service
+        if: matrix.example.name == 'response-store-demo' || (matrix.example.name == 'web' && github.event_name == 'push' && github.ref == 'refs/heads/main')
+        working-directory: ${{ matrix.example.working_directory }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node "$GITHUB_WORKSPACE/.github/scripts/wrangler-deploy.mjs" --config wrangler.response-store.jsonc
+
+      - name: Build example
+        if: matrix.example.static_export != true
+        run: vp build
+        working-directory: ${{ matrix.example.working_directory }}
 
       - name: Build static export
         if: matrix.example.static_export == true
@@ -348,7 +354,7 @@ jobs:
           tests/e2e/cloudflare-workers/optimistic-search-navigation.spec.ts
 
   cleanup-response-store:
-    name: Clean up Workers Response Store service
+    name: Clean up Workers Response Store services
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     needs: [response_store, deploy, smoke-test, deployed-e2e]
     runs-on: ubuntu-latest
@@ -361,13 +367,18 @@ jobs:
       - uses: ./.github/actions/setup
 
       - name: Delete cache Worker
+        continue-on-error: true
         working-directory: packages/workers-response-store
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           SERVICE_NAME: ${{ needs.response_store.outputs.service_name }}
+          DEMO_SERVICE_NAME: pr-${{ github.event.pull_request.number }}-response-store-demo-response-store
+          PR_ACTION: ${{ github.event.action }}
         run: |
-          if [[ -n "$SERVICE_NAME" ]]; then
+          if [[ "$PR_ACTION" == "closed" ]]; then
+            vp exec wrangler delete "$DEMO_SERVICE_NAME" --force
+          elif [[ -n "$SERVICE_NAME" ]]; then
             vp exec wrangler delete "$SERVICE_NAME" --force
           fi
 

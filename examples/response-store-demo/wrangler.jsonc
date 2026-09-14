@@ -22,10 +22,11 @@
       "enabled": true,
     },
   },
+  "cache": { "enabled": false },
   "services": [
     {
       "binding": "RESPONSE_STORE",
-      "service": "vinext-workers-response-store-service-poc",
+      "service": "response-store-demo-response-store",
       "entrypoint": "ResponseStoreService",
     },
   ],
