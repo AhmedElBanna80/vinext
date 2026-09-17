@@ -43,6 +43,23 @@ const isFirstParty = (id: string) => id === "vinext" || id.startsWith("vinext/")
 const renameBundledDepsOutput = (chunk: { name: string }) =>
   `${chunk.name.replaceAll("node_modules", "deps")}.js`;
 
+const bundledDependencies = [
+  "am-i-vibing",
+  "ignore",
+  "image-size",
+  "process-ancestry",
+  "pathslash",
+  "ua-parser-js",
+];
+
+const isBundledDependency = (id: string) =>
+  bundledDependencies.some(
+    (dependency) =>
+      id === dependency ||
+      id.startsWith(`${dependency}/`) ||
+      id.includes(`/node_modules/${dependency}/`),
+  );
+
 const externalizeBareThirdPartySpecifiers = (
   id: string,
   _importer: string | undefined,
@@ -61,15 +78,7 @@ const externalizeBareThirdPartySpecifiers = (
   if (isFirstParty(id)) return false;
   // Packages inlined into `dist` via `alwaysBundle` must keep resolving so they
   // get bundled rather than externalized.
-  if (
-    id === "am-i-vibing" ||
-    id === "image-size" ||
-    id === "process-ancestry" ||
-    id === "pathslash" ||
-    id === "ua-parser-js"
-  ) {
-    return false;
-  }
+  if (isBundledDependency(id)) return false;
   return true;
 };
 
@@ -79,19 +88,12 @@ export default defineConfig({
     clean: true,
     deps: {
       resolveDepSubpath: true,
-      // Agent detection, user-agent parsing, and image dimension extraction are
-      // implementation details, so inline them rather than requiring vinext
-      // consumers to install them. Same for pathslash: it is our own ~90-line
-      // node:path wrapper (zero deps), so bundling it keeps it out of consumers'
-      // install graphs.
-      alwaysBundle: ["am-i-vibing", "image-size", "process-ancestry", "pathslash", "ua-parser-js"],
-      neverBundle: (id) =>
-        id.includes("node_modules") &&
-        !id.includes("am-i-vibing") &&
-        !id.includes("image-size") &&
-        !id.includes("process-ancestry") &&
-        !id.includes("pathslash") &&
-        !id.includes("ua-parser-js"),
+      // Build-time implementation details, including user-agent parsing, are
+      // inlined rather than installed by vinext consumers. Same for pathslash:
+      // it is our own ~90-line node:path wrapper (zero deps), so bundling it
+      // keeps it out of consumer installs.
+      alwaysBundle: bundledDependencies,
+      neverBundle: (id) => id.includes("node_modules") && !isBundledDependency(id),
     },
     inputOptions: {
       external: externalizeBareThirdPartySpecifiers,
