@@ -3777,7 +3777,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         const configuredExtensions =
           name === "client"
             ? nextConfig.resolveExtensions
-            : name === "nitro"
+            : hasNitroPlugin && name === "nitro"
               ? null
               : nextConfig.serverResolveExtensions;
         // Nitro's final environment bundles its own preset entry; app code is

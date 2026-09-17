@@ -292,6 +292,7 @@ describe("vinext plugin configures Vite resolve.extensions", () => {
         {
           root: tmpDir,
           configFile: false,
+          environments: { nitro: { consumer: "server" } },
           plugins: [vinext({ appDir: tmpDir })],
           logLevel: "silent",
         },
@@ -303,6 +304,11 @@ describe("vinext plugin configures Vite resolve.extensions", () => {
         ".ts",
       ]);
       expect(resolved.environments.ssr.resolve.extensions).toEqual([
+        ".server.ts",
+        ".prod.ts",
+        ".ts",
+      ]);
+      expect(resolved.environments.nitro.resolve.extensions).toEqual([
         ".server.ts",
         ".prod.ts",
         ".ts",
