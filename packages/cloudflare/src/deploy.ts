@@ -41,7 +41,7 @@ import {
   hasUncachedRequestRouting,
   hasVerbatimResponseVary,
   supportsCanonicalRscWarmup,
-  usesVinextCacheWarmupStatus,
+  cacheWarmupStatusSource,
   requiresRouteCacheabilityProbeManifest,
   resolveVinextPrerenderDecision,
   type ResolvedVinextPrerenderConfig,
@@ -1199,7 +1199,7 @@ async function deployUploadedVersionWithCdnWarmup(
               routeHandlerPaths: warmResult.retryPlan.routeHandlerPaths,
               rscPaths: warmResult.retryPlan.rscPaths,
             };
-            if (hasPreparedWarmPlan && options.warmCdnCertify && warmResult.warmed > 0) {
+            if (options.warmCdnCertify && warmResult.warmed > 0) {
               console.log(
                 `  CDN warmup: certifying ${warmResult.warmed} staged cache entr${warmResult.warmed === 1 ? "y" : "ies"} before promotion...`,
               );
@@ -1970,12 +1970,17 @@ export async function deploy(options: DeployOptions): Promise<void> {
   const hasStagedRequestRouting = hasUncachedRequestRouting(viteConfigMetadata.cacheConfig);
   const hasBuildIdentityHeader = hasBuildIdentityResponseHeader(viteConfigMetadata.cacheConfig);
   const hasCanonicalRscWarmup = supportsCanonicalRscWarmup(viteConfigMetadata.cacheConfig);
-  const hasVinextCacheWarmupStatus = usesVinextCacheWarmupStatus(viteConfigMetadata.cacheConfig);
+  const warmupStatusSource = cacheWarmupStatusSource(viteConfigMetadata.cacheConfig);
   const needsCacheabilityProbeManifest = projectRequiresRouteCacheabilityProbeManifest(
     info,
     viteConfigMetadata.cacheConfig,
   );
   const shouldEmitPrerenderPathManifest = !options.skipBuild && prerenderDecision;
+  // Static export still needs local artifacts. Other pre-warm deploys render
+  // through the staged Worker so runtime-backed adapters populate themselves.
+  const shouldPrerenderLocally =
+    prerenderDecision &&
+    (options.warmCdnCache !== true || prerenderDecision.reason === "next-export");
   // Step 5: Build
   if (!options.skipBuild) {
     await runBuild(info, buildEnv);
@@ -2025,7 +2030,7 @@ export async function deploy(options: DeployOptions): Promise<void> {
   // output: 'export'. CDN warmup performs path discovery above, but relies on
   // the deployed Worker to render and classify each response.
   let ranPrerender = false;
-  if (prerenderDecision) {
+  if (shouldPrerenderLocally) {
     console.log(`\n  ${formatVinextPrerenderLabel(prerenderDecision)}`);
     if (nextConfig.enablePrerenderSourceMaps) {
       process.setSourceMapsEnabled(true);
@@ -2110,7 +2115,7 @@ export async function deploy(options: DeployOptions): Promise<void> {
           strict: options.warmCdnCertify === true || !options.dangerouslyPromoteOnCdnWarmError,
         });
       },
-      statusSource: hasVinextCacheWarmupStatus ? "vinext" : "cloudflare",
+      statusSource: warmupStatusSource,
       warmCdnConcurrency: options.warmCdnConcurrency,
       warmCdnTarget,
       warmCdnTimeout: options.warmCdnTimeout,
