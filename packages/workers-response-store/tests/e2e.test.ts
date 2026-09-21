@@ -15,7 +15,9 @@ import type {
 import { IsolateNegativeCache } from "../src/isolate-negative-cache.js";
 
 const workerScript = fileURLToPath(new URL("../dist/worker/worker.js", import.meta.url));
-const metadataName = "poc-v2";
+const versionId = "poc-v2";
+const metadataName = `${versionId}:r2-v1`;
+const r2Root = `runtime-cache/${versionId}/r2-v1`;
 
 type PutOptions = {
   age?: number;
@@ -27,6 +29,7 @@ type PutOptions = {
   coalesce?: boolean;
   contentType?: string;
   host?: string;
+  largeHeaderBytes?: number;
   noRevalidator?: boolean;
   purgeExisting?: boolean;
   revalidator?: Record<string, SerializableValue>;
@@ -99,6 +102,9 @@ async function put(path: string, body: BodyInit | null, options: PutOptions = {}
   if (options.bodyFailure) headers.set("X-Body-Failure", "1");
   if (options.bodyDelayMs) headers.set("X-Body-Delay-Ms", String(options.bodyDelayMs));
   if (options.teeBody) headers.set("X-Tee-Body", "1");
+  if (options.largeHeaderBytes) {
+    headers.set("X-Response-Large-Header-Bytes", String(options.largeHeaderBytes));
+  }
   if (options.shards) headers.set("X-Response-Store-Shards", String(options.shards));
   const response = await worker.fetch(`https://user.test/admin/put${path}`, {
     method: "PUT",
@@ -190,11 +196,13 @@ function metadataShardName(shards: number, index: number): string {
 }
 
 async function cacheKeyShard(cacheKey: string, shards: number): Promise<number> {
+  const hash = await cacheKeyHash(cacheKey);
+  return Number.parseInt(hash.slice(0, 8), 16) % shards;
+}
+
+async function cacheKeyHash(cacheKey: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(cacheKey));
-  const prefix = [...new Uint8Array(digest).slice(0, 4)]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-  return Number.parseInt(prefix, 16) % shards;
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 async function onePathPerShard(shards: number): Promise<string[]> {
@@ -211,50 +219,25 @@ async function onePathPerShard(shards: number): Promise<string[]> {
   return paths as string[];
 }
 
-test("isolate miss caching coalesces loads, expires, and evicts least-recently-used keys", async () => {
+test("isolate miss caching expires and evicts least-recently-used keys", () => {
   vi.useFakeTimers();
   vi.setSystemTime(0);
-  const cache = new IsolateNegativeCache<string, string>(2, 1_000);
-  let release!: (value: string | null) => void;
-  let loads = 0;
-  const pendingLoad = () => {
-    loads++;
-    return new Promise<string | null>((resolve) => {
-      release = resolve;
-    });
-  };
+  const cache = new IsolateNegativeCache<string>(2, 1_000);
 
-  const first = cache.getOrLoad("coalesced", pendingLoad);
-  const second = cache.getOrLoad("coalesced", pendingLoad);
-  await Promise.resolve();
-  assert.equal(loads, 1);
-  release(null);
-  assert.deepEqual(await Promise.all([first, second]), [null, null]);
-  assert.equal(await cache.getOrLoad("coalesced", pendingLoad), null);
-  assert.equal(loads, 1);
-
-  await cache.getOrLoad("other", async () => null);
-  await cache.getOrLoad("coalesced", pendingLoad);
-  await cache.getOrLoad("newest", async () => null);
-  await cache.getOrLoad("other", async () => {
-    loads++;
-    return "evicted";
-  });
-  assert.equal(loads, 2);
+  cache.add("oldest");
+  cache.add("newer");
+  assert.equal(cache.has("oldest"), true);
+  cache.add("newest");
+  assert.equal(cache.has("newer"), false);
+  assert.equal(cache.has("oldest"), true);
+  assert.equal(cache.has("newest"), true);
 
   vi.advanceTimersByTime(1_001);
-  assert.equal(
-    await cache.getOrLoad("newest", async () => {
-      loads++;
-      return "expired";
-    }),
-    "expired",
-  );
-  assert.equal(loads, 3);
-  vi.useRealTimers();
+  assert.equal(cache.has("oldest"), false);
+  assert.equal(cache.has("newest"), false);
 });
 
-test("put invalidates an isolate-local cached miss", async () => {
+test("a put after a miss is visible to the next read", async () => {
   assert.equal((await read("/miss-then-put")).status, 404);
   await put("/miss-then-put", "stored-after-miss");
 
@@ -298,23 +281,221 @@ test("put and fetch use pathname plus query, excluding host", async () => {
   assert.equal("body" in entries[0], false);
   const objects = await r2Objects();
   assert.equal(objects.objects.length, 1);
+  assert.match(objects.objects[0].key, /\/active$/);
+  assert.equal(entries[0].objectKey, objects.objects[0].key);
   const bucket = await mf.getR2Bucket("CACHE_BODIES", "user-worker");
   const object = await bucket.head(objects.objects[0].key);
   assert.ok(object);
   assert.ok(object.customMetadata);
   assert.deepEqual(Object.keys(object.customMetadata).sort(), [
     "createdAt",
+    "freshUntil",
     "initialAge",
+    "latestRevision",
+    "responseHeaders",
     "status",
+    "statusText",
+    "swrUntil",
   ]);
   assert.equal(object.customMetadata.status, "200");
   assert.equal(object.customMetadata.initialAge, "0");
   assert.match(object.customMetadata.createdAt, /^\d{13}$/);
-  assert.ok(
-    new TextEncoder().encode(JSON.stringify(object.customMetadata)).byteLength < 128,
-    "R2 custom metadata should remain tiny relative to the 8 KiB object metadata limit",
-  );
   assert.equal(await metadataRowCount("pending_objects"), 0);
+});
+
+test("large response headers are stored in the R2 object body envelope", async () => {
+  const result = await put("/large-response-headers", "body", { largeHeaderBytes: 9_000 });
+  assert.deepEqual(result.json, { backingStoreUpdated: true, edgePurgeAccepted: true });
+
+  const response = await read("/large-response-headers");
+  assert.equal(response.headers.get("X-Large-Response-Header"), "x".repeat(9_000));
+  assert.equal(await response.text(), "body");
+
+  const object = await (
+    await mf.getR2Bucket("CACHE_BODIES", "user-worker")
+  ).head((await r2Objects()).objects[0].key);
+  assert.match(object?.customMetadata?.responseMetadataBytes ?? "", /^\d+$/);
+  assert.equal(object?.customMetadata?.responseHeaders, undefined);
+});
+
+test("default R2 keys fetch and miss without SQLite", async () => {
+  const path = "/r2-native";
+  const digest = await cacheKeyHash(path);
+  const result = await put(path, "stored-through-r2", {
+    cacheControl: "public, max-age=60, stale-while-revalidate=60",
+  });
+  assert.deepEqual(result.json, { backingStoreUpdated: true, edgePurgeAccepted: true });
+
+  const objects = await r2Objects();
+  assert.deepEqual(
+    objects.objects.map(({ key }) => key),
+    [`${r2Root}/${digest}/active`],
+  );
+
+  const storage = await mf.unsafeGetDurableObjectStorage("user-worker", "CacheMetadata", {
+    name: metadataName,
+  });
+  await storage.exec("DROP TABLE entries");
+
+  const stored = await read(path);
+  assert.equal(stored.status, 200);
+  assert.equal(stored.headers.get("X-Workers-Response-Store"), "BLOB-FRESH");
+  assert.equal(await stored.text(), "stored-through-r2");
+
+  const miss = await read("/r2-miss");
+  assert.equal(miss.status, 404);
+  assert.equal(miss.headers.get("X-Workers-Response-Store"), "MISS");
+});
+
+test("versioned response-store keys remain ordinary keys in the Worker and shard layout", async () => {
+  const digest = "01".repeat(32);
+  const path = `/r2-sharded?__workers_response_store=v1.${digest}`;
+  await put(path, "sharded", { shards: 4 });
+
+  assert.deepEqual(
+    (await r2Objects()).objects.map(({ key }) => key),
+    [`${r2Root}/shards-4/${await cacheKeyHash(path)}/active`],
+  );
+  assert.equal(
+    await metadataRowCount("entries", metadataShardName(4, await cacheKeyShard(path, 4))),
+    1,
+  );
+  assert.equal(await (await read(path, { shards: 4 })).text(), "sharded");
+});
+
+test("a versioned-looking query parameter cannot alias another cache key", async () => {
+  const victim = "/digest-victim";
+  const attacker = `/digest-attacker?__workers_response_store=v1.${await cacheKeyHash(victim)}`;
+  await put(victim, "victim");
+  await put(attacker, "attacker");
+
+  assert.equal(await (await read(victim)).text(), "victim");
+  assert.equal(await (await read(attacker)).text(), "attacker");
+  assert.equal((await r2Objects()).objects.length, 2);
+});
+
+test("framework-specific and malformed markers remain ordinary R2 keys", async () => {
+  const frameworkKey = `/framework-key?__some_framework_cache_key=${"12".repeat(32)}`;
+  const malformedNewKey = "/malformed-key?__workers_response_store=not-versioned";
+  await put(frameworkKey, "framework");
+  await put(malformedNewKey, "malformed");
+
+  const objects = await r2Objects();
+  assert.deepEqual(
+    objects.objects.map(({ key }) => key).sort(),
+    [
+      `${r2Root}/${await cacheKeyHash(frameworkKey)}/active`,
+      `${r2Root}/${await cacheKeyHash(malformedNewKey)}/active`,
+    ].sort(),
+  );
+  assert.equal(await (await read(frameworkKey)).text(), "framework");
+  assert.equal(await (await read(malformedNewKey)).text(), "malformed");
+});
+
+test("legacy revision objects become cold misses and refill through the unchanged API", async () => {
+  const path = `/legacy-layout?__vinext_response_store=${"34".repeat(32)}`;
+  const digest = await cacheKeyHash(path);
+  const namespace = await mf.getDurableObjectNamespace("CACHE_METADATA", "user-worker");
+  const stub = namespace.getByName(versionId) as any;
+  const reservation = await stub.reserveWrite(
+    digest,
+    path,
+    `runtime-cache/${versionId}/${digest}`,
+    Date.now(),
+  );
+  const bucket = await mf.getR2Bucket("CACHE_BODIES", "user-worker");
+  await bucket.put(reservation.objectKey, "legacy-body", {
+    customMetadata: { status: "200", createdAt: String(Date.now()), initialAge: "0" },
+  });
+  const publication = await stub.publish(digest, reservation.revision, {
+    objectKey: reservation.objectKey,
+    statusText: "",
+    responseHeaders: [["cache-control", "public, max-age=60"]],
+    freshUntil: Date.now() + 60_000,
+    swrUntil: Date.now() + 60_000,
+    revalidator: null,
+    cacheTags: [],
+    fenceTags: [],
+  });
+  assert.equal(publication.published, true);
+
+  assert.equal((await read(path)).status, 404);
+  assert.deepEqual((await put(path, "current-layout")).json, {
+    backingStoreUpdated: true,
+    edgePurgeAccepted: true,
+  });
+  assert.equal(await (await read(path)).text(), "current-layout");
+  assert.equal((await metadata())[0].objectKey, `${r2Root}/${digest}/active`);
+  assert.notEqual(await bucket.head(reservation.objectKey), null);
+  assert.notEqual(await bucket.head(`${r2Root}/${digest}/active`), null);
+});
+
+test("purge fences a default R2 key with a tombstone that a later put replaces", async () => {
+  const path = "/r2-purge";
+  const digest = await cacheKeyHash(path);
+  const objectKey = `${r2Root}/${digest}/active`;
+  await put(path, "before-purge", { tags: ["r2-tag"] });
+
+  const purged = await purge({ tags: ["r2-tag"] });
+  assert.deepEqual(purged.json, { backingStoreUpdated: true, edgePurgeAccepted: false });
+
+  const bucket = await mf.getR2Bucket("CACHE_BODIES", "user-worker");
+  const tombstone = await bucket.head(objectKey);
+  assert.deepEqual(tombstone?.customMetadata, {
+    latestRevision: "2",
+    tombstoned: "1",
+  });
+  assert.equal(tombstone?.size, 0);
+  assert.equal((await read(path)).status, 404);
+
+  await put(path, "after-purge");
+  const replacement = await bucket.head(objectKey);
+  assert.equal(replacement?.customMetadata?.tombstoned, undefined);
+  assert.equal(replacement?.customMetadata?.latestRevision, "3");
+  assert.equal(await (await read(path)).text(), "after-purge");
+});
+
+test("a reserved write cannot recreate a default R2 object after purge", async () => {
+  const path = "/r2-purge-race";
+  const digest = await cacheKeyHash(path);
+  const objectKey = `${r2Root}/${digest}/active`;
+  await put(path, "active");
+
+  const delayed = put(path, "too-late", { bodyDelayMs: 300 });
+  for (let attempt = 0; attempt < 50; attempt++) {
+    if ((await metadataRowCount("pending_objects")) > 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(await metadataRowCount("pending_objects"), 1);
+
+  await purge({ pathPrefixes: ["/r2-purge-race"] });
+  assert.deepEqual((await delayed).json, {
+    backingStoreUpdated: false,
+    edgePurgeAccepted: false,
+  });
+
+  const bucket = await mf.getR2Bucket("CACHE_BODIES", "user-worker");
+  const tombstone = await bucket.head(objectKey);
+  assert.equal(tombstone?.customMetadata?.tombstoned, "1");
+  assert.equal(tombstone?.customMetadata?.latestRevision, "3");
+  assert.equal((await read(path)).status, 404);
+});
+
+test("refresh rewrites the metadata and body on a default R2 object", async () => {
+  const path = "/r2-refresh";
+  const digest = await cacheKeyHash(path);
+  const objectKey = `${r2Root}/${digest}/active`;
+  await put(path, "before-refresh", {
+    revalidator: { body: "after-refresh", cacheControl: "public, max-age=60" },
+  });
+
+  const refreshed = await refreshSelectors({ pathPrefixes: ["/r2-refresh"] });
+  assert.equal(refreshed.json.backingStoreUpdated, true);
+
+  const bucket = await mf.getR2Bucket("CACHE_BODIES", "user-worker");
+  const object = await bucket.head(objectKey);
+  assert.equal(object?.customMetadata?.latestRevision, "2");
+  assert.equal(await (await read(path)).text(), "after-refresh");
 });
 
 test("opt-in shards distribute keys while preserving refresh, tag invalidation, and SWR", async () => {
@@ -600,17 +781,16 @@ test("hard-expired content is never returned and regeneration is committed befor
   assert.equal(objects.objects.length, 1, "the superseded R2 revision is deleted");
 });
 
-test("missing active R2 content regenerates through the named user entrypoint", async () => {
-  await put("/missing-body", "lost", {
-    revalidator: { body: "recovered", cacheControl: "public, max-age=60" },
-  });
+test("missing R2 content returns a cache miss without querying metadata", async () => {
+  const path = "/missing-body";
+  await put(path, "lost");
   const bucket = await mf.getR2Bucket("CACHE_BODIES", "user-worker");
   const before = await bucket.list();
   await bucket.delete(before.objects[0].key);
 
-  const response = await read("/missing-body");
-  assert.equal(await response.text(), "recovered");
-  assert.equal(response.headers.get("X-Revalidation-Reason"), "missing");
+  const response = await read(path);
+  assert.equal(response.status, 404);
+  assert.equal(response.headers.get("X-Workers-Response-Store"), "MISS");
 });
 
 test("manual refresh replaces R2 before reporting the local edge-purge limitation", async () => {
@@ -778,12 +958,76 @@ test("purge supports tags, path prefixes, and purgeEverything", async () => {
 
   await purge({ purgeEverything: true });
   assert.equal((await read("/other")).status, 404);
-  assert.equal((await r2Objects()).objects.length, 0);
+  assert.equal((await r2Objects()).objects.length, 3);
 });
 
-test("purge batches more entries than the SQL parameter limit", async () => {
+test("a failed R2 purge remains queued and retryable after SQLite is tombstoned", async () => {
+  await put("/retry-purge", "still-readable-until-r2-is-tombstoned", {
+    tags: ["retry-purge"],
+  });
+  const stub = await metadataStub();
+  const reserved = await stub.purgeMatching({ tags: ["retry-purge"] });
+  assert.equal(reserved.pendingTombstones, 1);
+  assert.equal(await metadataRowCount("pending_r2_tombstones"), 1);
+  assert.equal(await (await read("/retry-purge")).text(), "still-readable-until-r2-is-tombstoned");
+
+  const retry = await stub.purgeMatching({ tags: ["retry-purge"] });
+  assert.equal(retry.pendingTombstones, 1);
+  assert.deepEqual(await stub.listPendingEdgePurges(400), []);
+  const drained = await stub.drainPendingTombstones(400);
+  assert.deepEqual(drained.failures, []);
+  assert.equal(drained.purged.length, 1);
+  assert.equal(await metadataRowCount("pending_r2_tombstones"), 1);
+  assert.equal((await stub.listPendingEdgePurges(400)).length, 1);
+  await stub.markTombstonesEdgePurged(drained.pending);
+  assert.equal(await metadataRowCount("pending_r2_tombstones"), 0);
+  assert.equal((await read("/retry-purge")).status, 404);
+});
+
+test("autonomous cleanup retains edge work when cache purge is unavailable", async () => {
+  await put("/alarm-purge", "old", { tags: ["alarm-purge"] });
+  const stub = await metadataStub();
+  const reserved = await stub.purgeMatching({ tags: ["alarm-purge"] });
+  assert.equal(reserved.pendingTombstones, 1);
+  assert.equal(await (await read("/alarm-purge")).text(), "old");
+
+  await assert.rejects(stub.retryPendingTombstones());
+
+  assert.equal(await metadataRowCount("pending_r2_tombstones"), 1);
+  assert.equal((await read("/alarm-purge")).status, 404);
+  await stub.markTombstonesEdgePurged(await stub.listPendingEdgePurges(1));
+});
+
+test("a failed R2 publication can be fenced with a newer tombstone", async () => {
+  await put("/failed-publication", "possibly-committed");
+  await put("/unrelated-pending-tombstone", "unrelated", { tags: ["unrelated"] });
+  const entry = (await metadata()).find(({ cacheKey }) => cacheKey === "/failed-publication");
+  assert.ok(entry);
+  const stub = await metadataStub();
+  await stub.purgeMatching({ tags: ["unrelated"] });
+
+  const reconciled = await stub.invalidatePublishedRevision(entry.keyHash, entry.activeRevision);
+
+  assert.deepEqual(reconciled.failures, []);
+  assert.equal(reconciled.purged.length, 1);
+  assert.equal(reconciled.pending[0].keyHash, entry.keyHash);
+  await stub.markTombstonesEdgePurged(reconciled.pending);
+  assert.deepEqual(await metadata(), []);
+  assert.equal(await metadataRowCount("pending_r2_tombstones"), 1);
+
+  const unrelated = await stub.drainPendingTombstones(1);
+  assert.equal(unrelated.pending[0].cacheKey, "/unrelated-pending-tombstone");
+  await stub.markTombstonesEdgePurged(unrelated.pending);
+  assert.equal(await metadataRowCount("pending_r2_tombstones"), 0);
+  assert.equal((await read("/failed-publication")).status, 404);
+
+  await put("/failed-publication", "replacement");
+  assert.equal(await (await read("/failed-publication")).text(), "replacement");
+});
+
+test("purge batches more entries than the SQL and R2 drain limits", async () => {
   await Promise.all(
-    Array.from({ length: 101 }, (_, index) => put(`/large-purge/${index}`, `${index}`)),
+    Array.from({ length: 401 }, (_, index) => put(`/large-purge/${index}`, `${index}`)),
   );
 
   assert.deepEqual((await purge({ pathPrefixes: ["/large-purge/"] })).json, {
@@ -791,7 +1035,7 @@ test("purge batches more entries than the SQL parameter limit", async () => {
     edgePurgeAccepted: false,
   });
   assert.equal((await metadata()).length, 0);
-  assert.equal((await r2Objects()).objects.length, 0);
+  assert.equal((await r2Objects()).objects.length, 401);
 });
 
 test("a newer put wins and the superseded candidate is cleaned up", async () => {
@@ -915,7 +1159,7 @@ test("purge prevents coalesced writes from resurrecting an entry", async () => {
     edgePurgeAccepted: false,
   });
   assert.equal((await read("/purge-coalesced")).status, 404);
-  assert.equal((await r2Objects()).objects.length, 0);
+  assert.equal((await r2Objects()).objects.length, 1);
 });
 
 test("purge prevents an initial slow write from creating an entry", async () => {
@@ -1085,6 +1329,59 @@ test("a write reserved after a tag purge is not rejected by its timestamp", asyn
   assert.equal(result.published, true);
 });
 
+test("a failed write replacement preserves an intervening purge fence", async () => {
+  const stub = await metadataStub();
+  const prefix = "runtime-cache/poc-v2/retry-fence";
+  const first = await stub.reserveWrite("retry-fence", "/retry-fence", prefix, Date.now());
+  const replacement = await stub.replaceFailedWrite(
+    "retry-fence",
+    "/retry-fence",
+    prefix,
+    first.objectKey,
+    [],
+    Date.now(),
+  );
+  assert.ok(replacement);
+
+  await stub.purgeMatching({ purgeEverything: true });
+
+  assert.equal(
+    await stub.replaceFailedWrite(
+      "retry-fence",
+      "/retry-fence",
+      prefix,
+      replacement.objectKey,
+      [],
+      Date.now(),
+    ),
+    null,
+  );
+});
+
+test("an unrelated purge does not discard a failed write replacement", async () => {
+  const stub = await metadataStub();
+  const prefix = "runtime-cache/poc-v2/retry-unrelated-purge";
+  const first = await stub.reserveWrite(
+    "retry-unrelated-purge",
+    "/retry-unrelated-purge",
+    prefix,
+    Date.now(),
+  );
+
+  await stub.purgeMatching({ pathPrefixes: ["/other"] });
+
+  assert.ok(
+    await stub.replaceFailedWrite(
+      "retry-unrelated-purge",
+      "/retry-unrelated-purge",
+      prefix,
+      first.objectKey,
+      [],
+      Date.now(),
+    ),
+  );
+});
+
 test("the previous metadata schema is upgraded in place", async () => {
   const persistencePath = await mkdtemp(path.join(tmpdir(), "response-store-migration-"));
   let legacy;
@@ -1188,11 +1485,28 @@ test("the previous metadata schema is upgraded in place", async () => {
   }
 });
 
-test("retention sweep removes orphaned candidates without deleting active R2 objects", async () => {
-  await put("/active-cleanup", "active");
+test("retention sweep forgets expired reservations without deleting R2 objects", async () => {
   const bucket = await mf.getR2Bucket("CACHE_BODIES", "user-worker");
   const stub = await metadataStub();
-  const activeObjectKey = (await metadata())[0].objectKey;
+  const reservation = await stub.reserveWrite(
+    "active-cleanup",
+    "/active-cleanup",
+    "runtime-cache/poc-v2/active-cleanup",
+    Date.now(),
+  );
+  await bucket.put(reservation.objectKey, "active");
+  const publication = await stub.publish("active-cleanup", reservation.revision, {
+    objectKey: reservation.objectKey,
+    statusText: "",
+    responseHeaders: [],
+    freshUntil: 1_000,
+    swrUntil: 1_000,
+    revalidator: null,
+    cacheTags: [],
+    fenceTags: [],
+  });
+  assert.equal(publication.published, true);
+  const activeObjectKey = reservation.objectKey;
   const orphanObjectKey = "runtime-cache/orphaned-candidate";
   await bucket.put(orphanObjectKey, "orphan");
   await stub.trackPendingObject(activeObjectKey, 0);
@@ -1200,7 +1514,7 @@ test("retention sweep removes orphaned candidates without deleting active R2 obj
 
   assert.equal(await stub.sweepExpiredPendingObjects(1), 1);
 
-  assert.equal(await bucket.head(orphanObjectKey), null);
+  assert.notEqual(await bucket.head(orphanObjectKey), null);
   assert.notEqual(await bucket.head(activeObjectKey), null);
   await stub.finishPendingObjects([activeObjectKey]);
 
@@ -1236,9 +1550,8 @@ test("retention cleanup uses the persistent active-object index", async () => {
   );
 });
 
-test("retention cleanup fences a body recreated after its first delete", async () => {
+test("retention cleanup fences an expired reservation without touching R2", async () => {
   const stub = await metadataStub();
-  const bucket = await mf.getR2Bucket("CACHE_BODIES", "user-worker");
   const createdAt = Date.now();
   const reservation = await stub.reserveWrite(
     "expired-reservation",
@@ -1248,8 +1561,7 @@ test("retention cleanup fences a body recreated after its first delete", async (
   );
 
   assert.equal(await stub.sweepExpiredPendingObjects(createdAt + 1), 1);
-  assert.equal(await metadataRowCount("pending_objects"), 1);
-  await bucket.put(reservation.objectKey, "recreated-after-delete");
+  assert.equal(await metadataRowCount("pending_objects"), 0);
 
   const result = await stub.publish("expired-reservation", reservation.revision, {
     objectKey: reservation.objectKey,
@@ -1262,7 +1574,6 @@ test("retention cleanup fences a body recreated after its first delete", async (
     fenceTags: [],
   });
   assert.equal(result.published, false);
-  assert.equal(await bucket.head(reservation.objectKey), null);
   assert.equal(await metadataRowCount("pending_objects"), 0);
 });
 
@@ -1278,7 +1589,7 @@ test("replacement and purge clean their durable object markers", async () => {
   await purge({ pathPrefixes: ["/replacement-cleanup"] });
   assert.equal(await metadataRowCount("pending_objects"), 0);
   assert.deepEqual(await stub.listExpiredPendingObjects(Date.now() + 1, 10), []);
-  assert.equal((await r2Objects()).objects.length, 0);
+  assert.equal((await r2Objects()).objects.length, 1);
 });
 
 test("purge tombstones an entry before a slow regeneration can publish", async () => {
@@ -1293,7 +1604,7 @@ test("purge tombstones an entry before a slow regeneration can publish", async (
 
   assert.deepEqual(refreshResult.json, { backingStoreUpdated: false, edgePurgeAccepted: false });
   assert.equal((await read("/purge-race")).status, 404);
-  assert.equal((await r2Objects()).objects.length, 0);
+  assert.equal((await r2Objects()).objects.length, 1);
 });
 
 test("regeneration failure retains the last durable revision", async () => {
