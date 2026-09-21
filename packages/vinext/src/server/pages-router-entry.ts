@@ -22,6 +22,11 @@ import { cloneRequestWithHeaders, cloneRequestWithUrl } from "./request-pipeline
 import { validateCdnRequest } from "./cache-control.js";
 import { runWithExecutionContext, type ExecutionContextLike } from "vinext/shims/request-context";
 
+// @ts-expect-error -- virtual modules resolved by vinext at build time
+import { __ensureInstrumentation as ensureRequestStageInstrumentation } from "virtual:vinext-pages-request-entry";
+// @ts-expect-error -- virtual modules resolved by vinext at build time
+import { __ensureInstrumentation as ensureResponseStageInstrumentation } from "virtual:vinext-pages-response-entry";
+
 // @ts-expect-error -- virtual module resolved by vinext at build time
 import { registerConfiguredCacheAdapters } from "virtual:vinext-cache-adapters";
 // @ts-expect-error -- virtual module resolved by vinext at build time
@@ -47,6 +52,12 @@ async function handleSingleStageRequest(
   );
   const readinessResponse = createWorkerPrerenderReadinessResponse(ctx, request);
   if (readinessResponse) {
+    if (readinessResponse.status === 204) {
+      await Promise.all([
+        ensureRequestStageInstrumentation(),
+        ensureResponseStageInstrumentation(),
+      ]);
+    }
     return (await validateCdnRequest(request)) ?? readinessResponse;
   }
 

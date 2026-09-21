@@ -333,14 +333,20 @@ ${
   instrumentationPath
     ? `import * as _instrumentation from ${JSON.stringify(toSlash(instrumentationPath))};
 import { ensureInstrumentationRegistered as __ensureInstrumentationRegistered } from ${JSON.stringify(instrumentationRuntimePath)};
-export function __ensureInstrumentation() { return __ensureInstrumentationRegistered(_instrumentation, ${JSON.stringify(toSlash(instrumentationPath))}); }
-await __ensureInstrumentation();`
+let __applicationInitialization;
+async function __initializeApplication() {
+  await __ensureInstrumentationRegistered(_instrumentation, ${JSON.stringify(toSlash(instrumentationPath))});
+  ${middlewarePath ? `middlewareModule = await import(${JSON.stringify(toSlash(middlewarePath))});` : ""}
+}
+export function __ensureInstrumentation() {
+  return __applicationInitialization ??= __initializeApplication();
+}`
     : "export function __ensureInstrumentation() {}"
 }
 ${
   middlewarePath
     ? instrumentationPath
-      ? `const middlewareModule = await import(${JSON.stringify(toSlash(middlewarePath))});`
+      ? "let middlewareModule;"
       : `import * as middlewareModule from ${JSON.stringify(toSlash(middlewarePath))};`
     : ""
 }
@@ -353,6 +359,14 @@ import { buildRequestHeadersFromMiddlewareResponse as __buildRequestHeadersFromM
 import { decodePathParams as __decodePathParams } from ${JSON.stringify(normalizePathModulePath)};
 import { applyRouteHandlerMiddlewareContext as __applyRouteHandlerMiddlewareContext } from ${JSON.stringify(appRouteHandlerMiddlewareContextPath)};`
     : ""
+}
+
+${
+  hasPagesDir
+    ? `export function __ensureHybridPagesApplication() {
+  return __pagesRequestEntry.__ensureInstrumentation?.();
+}`
+    : "export function __ensureHybridPagesApplication() {}"
 }
 
 const __basePath = ${JSON.stringify(bp)};
@@ -420,11 +434,7 @@ const __requestHandler = createAppRscRequestHandler({
   draftModeSecret: __draftModeSecret,
   dispatchMatchedPage() { throw new Error("App request stage attempted to render a page inline"); },
   dispatchMatchedRouteHandler() { throw new Error("App request stage attempted to render a route handler inline"); },
-  ${
-    instrumentationPath
-      ? `ensureInstrumentation() { return __ensureInstrumentationRegistered(_instrumentation, ${JSON.stringify(toSlash(instrumentationPath))}); },`
-      : ""
-  }
+  ${instrumentationPath ? "ensureInstrumentation() { return __ensureInstrumentation(); }," : ""}
   i18nConfig: ${JSON.stringify(config?.i18n ?? null)},
   imageConfig: ${JSON.stringify(config?.imageConfig)},
   isMetadataRoute: __isMetadataPath,
@@ -595,6 +605,7 @@ export function generateRscEntry(
   });
   const {
     imports,
+    importInitializers,
     routeEntries,
     metaRouteEntries,
     generateStaticParamsEntries,
@@ -608,12 +619,39 @@ export function generateRscEntry(
   } = manifestCode;
   const loadPrerenderPagesRoutesCode = hasPagesDir
     ? `
+let __hybridPagesApplication;
+export function __ensureHybridPagesApplication() {
+  return __hybridPagesApplication ??= (async () => {
+    const __pagesEntry = await import.meta.viteRsc.loadModule("ssr", "index");
+    await __pagesEntry.__ensureInstrumentation?.();
+    return __pagesEntry;
+  })();
+}
 async function __loadPrerenderPagesRoutes() {
-  const __gspSsrEntry = await import.meta.viteRsc.loadModule("ssr", "index");
+  const __gspSsrEntry = await __ensureHybridPagesApplication();
   return __gspSsrEntry.pageRoutes;
 }
 `
-    : "";
+    : "export function __ensureHybridPagesApplication() {}";
+  const applicationInitializationCode = instrumentationPath
+    ? `let __applicationInitialization;
+async function __initializeApplication() {
+  await __ensureInstrumentationRegistered(_instrumentation, ${JSON.stringify(toSlash(instrumentationPath))});
+  ${middlewarePath ? `middlewareModule = await import(${JSON.stringify(toSlash(middlewarePath))});` : ""}
+  ${importInitializers.join("\n  ")}
+  metadataRoutes = [
+${metaRouteEntries.join(",\n")}
+  ];
+  rootNotFoundModule = ${rootNotFoundVar ?? "null"};
+  rootForbiddenModule = ${rootForbiddenVar ?? "null"};
+  rootUnauthorizedModule = ${rootUnauthorizedVar ?? "null"};
+  rootLayouts = [${rootLayoutVars.join(", ")}];
+  __fallbackRenderer = __createFallbackRenderer();
+}
+export function __ensureInstrumentation() {
+  return __applicationInitialization ??= __initializeApplication();
+}`
+    : "export function __ensureInstrumentation() {}";
 
   return `
 ${
@@ -668,15 +706,14 @@ ${middlewarePath ? `import { applyAppMiddleware as __applyAppMiddleware } from $
 ${
   instrumentationPath
     ? `import * as _instrumentation from ${JSON.stringify(toSlash(instrumentationPath))};
-import { ensureInstrumentationRegistered as __ensureInstrumentationRegistered } from ${JSON.stringify(instrumentationRuntimePath)};
-export function __ensureInstrumentation() { return __ensureInstrumentationRegistered(_instrumentation, ${JSON.stringify(toSlash(instrumentationPath))}); }
-await __ensureInstrumentation();`
-    : "export function __ensureInstrumentation() {}"
+import { ensureInstrumentationRegistered as __ensureInstrumentationRegistered } from ${JSON.stringify(instrumentationRuntimePath)};`
+    : ""
 }
+${applicationInitializationCode}
 ${
   middlewarePath
     ? instrumentationPath
-      ? `const middlewareModule = await import(${JSON.stringify(toSlash(middlewarePath))});`
+      ? "let middlewareModule;"
       : `import * as middlewareModule from ${JSON.stringify(toSlash(middlewarePath))};`
     : ""
 }
@@ -919,9 +956,13 @@ ${routeEntries.join(",\n")}
 ];
 const __routeMatcher = __createAppRscRouteMatcher(routes);
 
-const metadataRoutes = [
+${
+  instrumentationPath
+    ? "let metadataRoutes;"
+    : `const metadataRoutes = [
 ${metaRouteEntries.join(",\n")}
-];
+];`
+}
 
 // Hoisted ahead of __fallbackRenderer / buildPageElements so both can thread
 // the configured basePath through file-based metadata href emission.
@@ -941,10 +982,17 @@ const __trailingSlash = ${JSON.stringify(ts)};
 // request user-agent. The later per-request references still read this const.
 const __htmlLimitedBots = ${JSON.stringify(htmlLimitedBots)};
 
-const rootNotFoundModule = ${rootNotFoundVar ? rootNotFoundVar : "null"};
+${
+  instrumentationPath
+    ? `let rootNotFoundModule;
+let rootForbiddenModule;
+let rootUnauthorizedModule;
+let rootLayouts;`
+    : `const rootNotFoundModule = ${rootNotFoundVar ? rootNotFoundVar : "null"};
 const rootForbiddenModule = ${rootForbiddenVar ? rootForbiddenVar : "null"};
 const rootUnauthorizedModule = ${rootUnauthorizedVar ? rootUnauthorizedVar : "null"};
-const rootLayouts = [${rootLayoutVars.join(", ")}];
+const rootLayouts = [${rootLayoutVars.join(", ")}];`
+}
 // Root-level app/global-not-found loader. When present, route-miss 404s render
 // this module standalone (it provides its own html/body) instead of wrapping
 // the not-found.tsx boundary inside the root layout. Page-triggered notFound()
@@ -964,7 +1012,8 @@ const __loadGlobalNotFoundModule = ${
 const createRscOnErrorHandler = (request, pathname, routePath, overrides) =>
   createAppRscOnErrorHandler(_reportRequestError, request, pathname, routePath, overrides);
 
-const __fallbackRenderer = __createAppFallbackRenderer({
+function __createFallbackRenderer() {
+  return __createAppFallbackRenderer({
   ${(metadataRoutes?.length ?? 0) > 0 ? "applyFileBasedMetadata: __applyFileBasedMetadata," : ""}
   basePath: __basePath,
   trailingSlash: __trailingSlash,
@@ -1000,7 +1049,13 @@ const __fallbackRenderer = __createAppFallbackRenderer({
   createRscOnErrorHandler(request, pathname, routePath, overrides) {
     return createRscOnErrorHandler(request, pathname, routePath, overrides);
   },
-});
+  });
+}
+${
+  instrumentationPath
+    ? "let __fallbackRenderer;"
+    : "const __fallbackRenderer = __createFallbackRenderer();"
+}
 
 function matchRoute(url) {
   return __routeMatcher.matchRoute(url);
@@ -1416,9 +1471,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   ${
     instrumentationPath
       ? `ensureInstrumentation() {
-    return __ensureInstrumentationRegistered(_instrumentation, ${JSON.stringify(
-      instrumentationPath ? toSlash(instrumentationPath) : "",
-    )});
+    return __ensureInstrumentation();
   },`
       : ""
   }
@@ -1795,7 +1848,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       { allowRscDocumentFallback, appRouteMatch, initialResponseHeaders, isDataRequest, isRscRequest, matchKind, middlewareContext, pathname, pagesDataRequest, request, url },
       {
         async loadPagesEntry() {
-          const __pagesEntry = await import.meta.viteRsc.loadModule("ssr", "index");
+          const __pagesEntry = await __ensureHybridPagesApplication();
           if (!dispatchPagesResponseStage) {
             return __pagesEntry;
           }

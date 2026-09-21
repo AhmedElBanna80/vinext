@@ -1,6 +1,10 @@
 /** Cacheable App response stage. This is the only multi-stage App entry that imports user routes. */
 
-import rscHandler, { __cacheabilityManifest } from "virtual:vinext-app-response-entry";
+import rscHandler, {
+  __cacheabilityManifest,
+  __ensureHybridPagesApplication,
+  __ensureInstrumentation,
+} from "virtual:vinext-app-response-entry";
 import { ensureFetchPatch } from "vinext/shims/fetch-cache";
 import { runWithExecutionContext, type ExecutionContextLike } from "vinext/shims/request-context";
 import { createRequestContext, runWithRequestContext } from "vinext/shims/unified-request-context";
@@ -39,6 +43,7 @@ export async function invokeCacheFunction(
   platformCtx: ExecutionContextLike | undefined,
   dispatchRequestStage: VinextRequestStageTransport,
 ): Promise<void> {
+  await __ensureInstrumentation();
   const [{ loadServerAction }, { invokeCacheFunction: invokeRegisteredCacheFunction }] =
     await Promise.all([
       import("@vitejs/plugin-rsc/core/rsc"),
@@ -75,6 +80,14 @@ export async function handleResponseStage(
   if (props.requestOrigin !== new URL(request.url).origin) {
     return new Response("Invalid vinext App response stage", { status: 400 });
   }
+  const currentBuildId = process.env.__VINEXT_BUILD_ID ?? null;
+  if (props.buildId !== currentBuildId) {
+    return new Response("Incompatible vinext App response stage", { status: 409 });
+  }
+  await __ensureInstrumentation();
+  if (props.kind === "app-full-request" && props.prerenderDiscovery) {
+    await __ensureHybridPagesApplication();
+  }
   registerConfiguredImageOptimizer(env);
   let ctx = createWorkerRevalidationContext(
     platformCtx,
@@ -99,10 +112,6 @@ export async function handleResponseStage(
     },
     async (cacheabilityContext) => {
       if (props.kind === "app-full-request") {
-        const currentBuildId = process.env.__VINEXT_BUILD_ID ?? null;
-        if (props.buildId !== currentBuildId) {
-          return new Response("Incompatible vinext App response stage", { status: 409 });
-        }
         if (props.prerenderDiscovery) {
           const readinessResponse = createWorkerPrerenderReadinessResponse(
             cacheabilityContext,

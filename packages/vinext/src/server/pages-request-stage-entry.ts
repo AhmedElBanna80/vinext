@@ -221,8 +221,9 @@ function handleRequest(
   assets: VinextAssetFetcher | undefined,
 ): Promise<Response> {
   const url = new URL(request.url);
-  const trace = () =>
-    traceFrameworkRequest({
+  const trace = async () => {
+    await pagesEntry.__ensureInstrumentation?.();
+    return traceFrameworkRequest({
       callback: () =>
         handleRequestImpl(
           request,
@@ -238,6 +239,7 @@ function handleRequest(
       method: request.method,
       target: url.pathname + url.search,
     });
+  };
   return platformCtx &&
     typeof platformCtx.waitUntil === "function" &&
     (!forceCacheBypass || !Reflect.has(platformCtx, CACHEABILITY_REQUEST_STATE))
