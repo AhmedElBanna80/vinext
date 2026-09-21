@@ -55,7 +55,8 @@ import {
   getMissingDeps,
   type ProjectInfo,
 } from "vinext/internal/utils/project";
-import { parseWranglerConfig, runTPR } from "./tpr.js";
+import { resolveTPRRoutes, selectRoutes, type TrafficEntry } from "./tpr.js";
+import { parseWranglerConfig } from "./wrangler-config.js";
 import { VINEXT_EXPECTED_WORKER_VERSION_HEADER } from "./version-headers.js";
 import {
   createCdnWarmTargets,
@@ -90,6 +91,7 @@ import {
 } from "./version-deploy.js";
 import { parseWorkerDeploymentUrl } from "./worker-deployment-url.js";
 import { PHASE_PRODUCTION_BUILD } from "vinext/shims/constants";
+import { normalizePathTrailingSlash } from "vinext/shims/url-utils";
 import { cacheabilityRoutePathname } from "vinext/internal/server/cacheability-manifest";
 import { buildPrerenderKVPairs, type KVBulkPair } from "./prerender-kv-populate.js";
 import { writeCacheabilityManifestArtifact } from "./cacheability-artifact.js";
@@ -162,11 +164,11 @@ export type DeployOptions = {
   warmCdnPromotionDelay?: number;
   /** Include PPR fallback-shell placeholder paths during CDN warmup */
   warmCdnIncludeFallbacks?: boolean;
-  /** Enable experimental TPR (Traffic-aware Pre-Rendering) */
+  /** Select CDN pre-warm routes using traffic analytics */
   experimentalTPR?: boolean;
   /** TPR: traffic coverage percentage target (0–100, default: 90) */
   tprCoverage?: number;
-  /** TPR: hard cap on number of pages to pre-render (default: 1000) */
+  /** TPR: hard cap on selected routes (default: 1000) */
   tprLimit?: number;
   /** TPR: analytics lookback window in hours (default: 24) */
   tprWindow?: number;
@@ -264,6 +266,8 @@ function formatUnknownError(error: unknown): string {
   return String(error);
 }
 
+class StagedWarmupError extends Error {}
+
 // ─── CLI arg parsing (uses Node.js util.parseArgs) ──────────────────────────
 
 /** Deploy command flag definitions for util.parseArgs. */
@@ -297,6 +301,11 @@ const deployArgOptions = {
   "warm-cdn-no-promote": { type: "boolean", default: false },
   "warm-cdn-promotion-delay": { type: "string" },
   "warm-cdn-include-fallbacks": { type: "boolean", default: false },
+  "experimental-traffic-aware-warm-cache": { type: "boolean", default: false },
+  "traffic-aware-coverage": { type: "string" },
+  "traffic-aware-limit": { type: "string" },
+  "traffic-aware-window": { type: "string" },
+  // Backwards-compatible aliases.
   "experimental-tpr": { type: "boolean", default: false },
   "tpr-coverage": { type: "string" },
   "tpr-limit": { type: "string" },
@@ -422,10 +431,19 @@ export function parseDeployArgs(args: string[]) {
             values["warm-cdn-promotion-delay"],
           ),
     warmCdnIncludeFallbacks: values["warm-cdn-include-fallbacks"],
-    experimentalTPR: values["experimental-tpr"],
-    tprCoverage: parseIntArg("tpr-coverage", values["tpr-coverage"]),
-    tprLimit: parseIntArg("tpr-limit", values["tpr-limit"]),
-    tprWindow: parseIntArg("tpr-window", values["tpr-window"]),
+    experimentalTPR: values["experimental-traffic-aware-warm-cache"] || values["experimental-tpr"],
+    tprCoverage: parseIntArg(
+      "traffic-aware-coverage",
+      values["traffic-aware-coverage"] ?? values["tpr-coverage"],
+    ),
+    tprLimit: parseIntArg(
+      "traffic-aware-limit",
+      values["traffic-aware-limit"] ?? values["tpr-limit"],
+    ),
+    tprWindow: parseIntArg(
+      "traffic-aware-window",
+      values["traffic-aware-window"] ?? values["tpr-window"],
+    ),
   };
 }
 
@@ -780,6 +798,57 @@ export function hasCdnWarmRequests(
   );
 }
 
+export function selectTPRWarmPlan(
+  plan: PrerenderWarmPlan,
+  traffic: readonly TrafficEntry[],
+  coverage: number,
+  limit: number,
+): PrerenderWarmPlan {
+  const canonical = (pathname: string): string => normalizePathTrailingSlash(pathname, false);
+  const resolved = new Set(
+    Object.entries(plan.routePatterns ?? {}).map(([pathname, route]) =>
+      canonical(route.cacheabilityProbe?.concretePathname ?? pathname),
+    ),
+  );
+  const requestsByPath = new Map<string, number>();
+  for (const { path, requests } of traffic) {
+    const pathname = canonical(path);
+    if (!resolved.has(pathname)) continue;
+    requestsByPath.set(pathname, (requestsByPath.get(pathname) ?? 0) + requests);
+  }
+  const selected = new Set(
+    selectRoutes(
+      Array.from(requestsByPath, ([path, requests]) => ({ path, requests })).sort(
+        (a, b) => b.requests - a.requests,
+      ),
+      coverage,
+      limit,
+    ).routes.map(({ path }) => path),
+  );
+  const includes = (pathname: string): boolean =>
+    selected.has(
+      canonical(plan.routePatterns?.[pathname]?.cacheabilityProbe?.concretePathname ?? pathname),
+    );
+  const filter = (pathnames: readonly string[] | undefined): string[] | undefined =>
+    pathnames?.filter(includes);
+
+  return {
+    ...plan,
+    appPaths: filter(plan.appPaths),
+    loadingShellPaths: filter(plan.loadingShellPaths) ?? [],
+    pagesDataPaths: filter(plan.pagesDataPaths),
+    pagesPaths: filter(plan.pagesPaths),
+    paths: filter(plan.paths) ?? [],
+    routeHandlerPaths: filter(plan.routeHandlerPaths),
+    routePatterns: plan.routePatterns
+      ? Object.fromEntries(
+          Object.entries(plan.routePatterns).filter(([pathname]) => includes(pathname)),
+        )
+      : undefined,
+    rscPaths: filter(plan.rscPaths) ?? [],
+  };
+}
+
 export function projectRequiresRouteCacheabilityProbeManifest(
   project: Pick<ProjectInfo, "isAppRouter" | "isPagesRouter">,
   cacheConfig: VinextCacheConfig | null,
@@ -826,12 +895,16 @@ type CdnWarmDeployOptions = Pick<
     | "rscPaths"
     | "statusSource"
   > & {
+    /** Allow optional route selection to discover no warmable requests. */
+    allowEmptyWarmPlan?: boolean;
     /** Probe a staged Worker and upload the resulting manifest as a second version. */
     cacheabilityProbe?: boolean;
     discoverWarmPlan?: (target: {
       headers?: HeadersInit;
       targetUrl: string;
     }) => Promise<PrerenderWarmPlan>;
+    /** Narrow the final warm requests without changing discovery or probe metadata. */
+    selectWarmPlan?: (plan: PrerenderWarmPlan) => PrerenderWarmPlan;
   };
 
 type PreparedCdnWarmDeployOptions = CdnWarmDeployOptions & {
@@ -976,7 +1049,8 @@ async function deployUploadedVersionWithCdnWarmup(
 
   const discoverWarmPlan = async (targetUrl: string, headers?: HeadersInit): Promise<void> => {
     if (!options.discoverWarmPlan) return;
-    const plan = await options.discoverWarmPlan({ headers, targetUrl });
+    const discovered = await options.discoverWarmPlan({ headers, targetUrl });
+    const plan = options.selectWarmPlan?.(discovered) ?? discovered;
     deploymentId = plan.deploymentId;
     expectedBuildId = plan.buildIdentity;
     expectedRscBuildId = plan.rscBuildId;
@@ -1042,18 +1116,24 @@ async function deployUploadedVersionWithCdnWarmup(
     });
 
   const wranglerConfig = parseWranglerConfig(root, options.config);
-  const deploymentStatus = runWranglerDeploymentStatus(root, options);
+  let deploymentStatus: WranglerDeploymentStatus;
+  try {
+    deploymentStatus = runWranglerDeploymentStatus(root, options);
+  } catch (error) {
+    if (!hasPreparedWarmPlan) throw error;
+    throw new StagedWarmupError(formatUnknownError(error), { cause: error });
+  }
   if (
     options.expectedDeploymentState &&
     !deploymentStateEquals(deploymentStatus, options.expectedDeploymentState)
   ) {
-    throw new Error(
+    throw new StagedWarmupError(
       "Two-stage CDN warming stopped because Worker deployment traffic or deployment identity changed before the final version could be staged. No final version was promoted.",
     );
   }
   const stagingTraffic = getZeroPercentStagingTraffic(deploymentStatus, upload.versionId);
   if (hasPreparedWarmPlan && !stagingTraffic) {
-    throw new Error(
+    throw new StagedWarmupError(
       "Two-stage CDN warming stopped because Worker deployment traffic changed before the final version could be staged. No final version was promoted.",
     );
   }
@@ -1229,7 +1309,7 @@ async function deployUploadedVersionWithCdnWarmup(
         "CDN warmup failed: pre-traffic warmup needs a production URL and Worker name for version overrides. " +
         "Configure a route/custom domain and Worker name, or deploy without --experimental-warm-cdn-cache.";
       if (!allowUnverifiedPromotion) {
-        throw new Error(`${message} ${getStagedVersionCleanupNote()}`);
+        throw new StagedWarmupError(`${message} ${getStagedVersionCleanupNote()}`);
       }
       console.warn(`  ${message} Promoting because the dangerous override is enabled.`);
     }
@@ -1262,7 +1342,12 @@ async function deployUploadedVersionWithCdnWarmup(
       );
     }
     const remainingWarmRequests = countRemainingWarmRequests();
-    if (!hasPreparedWarmPlan && options.discoverWarmPlan && discoveredWarmRequests === 0) {
+    if (
+      !options.allowEmptyWarmPlan &&
+      !hasPreparedWarmPlan &&
+      options.discoverWarmPlan &&
+      discoveredWarmRequests === 0
+    ) {
       throw withStagedVersionCleanupNote(
         new Error(
           "CDN warmup cannot skip promotion because no build-discovered requests were found to warm.",
@@ -1282,14 +1367,14 @@ async function deployUploadedVersionWithCdnWarmup(
         currentDeployment = runWranglerDeploymentStatus(root, options);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        throw new Error(
+        throw new StagedWarmupError(
           `${message} CDN warmup cannot confirm that the uploaded Worker remains staged at 0% traffic; ` +
             "production Worker triggers/routes remain applied. Inspect `wrangler deployments status` before continuing.",
           { cause: error },
         );
       }
       if (!deploymentStateEquals(currentDeployment, stagedDeploymentState)) {
-        throw new Error(
+        throw new StagedWarmupError(
           "Two-stage CDN warming stopped because Worker deployment traffic or deployment identity changed before the no-promote handoff. " +
             "The uploaded Worker is not confirmed staged at 0% traffic; production Worker triggers/routes remain applied.",
         );
@@ -1443,12 +1528,14 @@ function reconcileVersionDeployFailure(
 ): Error {
   const message = error instanceof Error ? error.message : String(error);
   let reconciliation: string;
+  let mayNeedCleanup = true;
   try {
     const current = runWranglerDeploymentStatus(root, options);
     if (deploymentTrafficEquals(current.versions, expected.desiredTraffic)) {
       reconciliation = expected.desiredDescription;
     } else if (deploymentStateEquals(current, expected.priorState)) {
       reconciliation = expected.priorDescription;
+      mayNeedCleanup = false;
     } else {
       reconciliation =
         "Worker deployment state differs from both the requested and prior state, so the deployment outcome is unknown or another deployment changed it.";
@@ -1460,7 +1547,10 @@ function reconcileVersionDeployFailure(
         : String(reconciliationError);
     reconciliation = `Worker deployment status could not be read after the command failed, so the deployment outcome is unknown (${detail}).`;
   }
-  return new Error(`${message} ${reconciliation}`, { cause: error });
+  const detail = `${message} ${reconciliation}`;
+  return mayNeedCleanup
+    ? new StagedWarmupError(detail, { cause: error })
+    : new Error(detail, { cause: error });
 }
 
 function assertDeploymentStateUnchanged(
@@ -1519,7 +1609,7 @@ async function deployWithCacheabilityProbe(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(
+    throw new StagedWarmupError(
       `${message} The probe staging command completed, but its current deployment state could not be confirmed; ` +
         "production Worker triggers/routes were not changed. Inspect `wrangler deployments status` and remove the staged probe version if necessary.",
       { cause: error },
@@ -1702,6 +1792,7 @@ async function deployWithCacheabilityProbe(
         .filter((target) => target.kind === "rsc-full")
         .map((target) => target.sourcePathname),
     };
+    const selectedFinalPlan = options.selectWarmPlan?.(finalPlan) ?? finalPlan;
     // A concurrent deployment invalidates the probe. Avoid creating an orphan
     // final version when the probe is already stale. The final deployment path
     // checks this state again immediately before it stages the uploaded version.
@@ -1722,7 +1813,7 @@ async function deployWithCacheabilityProbe(
     prepared = {
       optionalWarmTargetKeys: new Set(probe.speculativeTargets.map(cdnWarmTargetKey)),
       prerenderSecret,
-      plan: finalPlan,
+      plan: selectedFinalPlan,
       upload: finalUpload,
     };
   } catch (error) {
@@ -1818,14 +1909,14 @@ export function buildVersionOverrideHeaders(
 
 function withStagedVersionCleanupNote(error: unknown): Error {
   const message = error instanceof Error ? error.message : String(error);
-  return new Error(`${message} ${getStagedVersionCleanupNote()}`, {
+  return new StagedWarmupError(`${message} ${getStagedVersionCleanupNote()}`, {
     cause: error,
   });
 }
 
 function withStagedProbeVersionCleanupNote(error: unknown): Error {
   const message = error instanceof Error ? error.message : String(error);
-  return new Error(
+  return new StagedWarmupError(
     `${message} The probe version may remain staged at 0% with the previous version still serving 100% traffic; ` +
       "production Worker triggers/routes were not changed.",
     { cause: error },
@@ -1967,20 +2058,17 @@ export async function deploy(options: DeployOptions): Promise<void> {
     nextOutput: nextConfig.output,
   });
   const hasStrictResponseVary = hasVerbatimResponseVary(viteConfigMetadata.cacheConfig);
-  const hasStagedRequestRouting = hasUncachedRequestRouting(viteConfigMetadata.cacheConfig);
+  const warmupStatusSource = cacheWarmupStatusSource(viteConfigMetadata.cacheConfig);
+  const hasStagedRequestRouting =
+    hasUncachedRequestRouting(viteConfigMetadata.cacheConfig) ||
+    warmupStatusSource === "data-cache";
   const hasBuildIdentityHeader = hasBuildIdentityResponseHeader(viteConfigMetadata.cacheConfig);
   const hasCanonicalRscWarmup = supportsCanonicalRscWarmup(viteConfigMetadata.cacheConfig);
-  const warmupStatusSource = cacheWarmupStatusSource(viteConfigMetadata.cacheConfig);
   const needsCacheabilityProbeManifest = projectRequiresRouteCacheabilityProbeManifest(
     info,
     viteConfigMetadata.cacheConfig,
   );
   const shouldEmitPrerenderPathManifest = !options.skipBuild && prerenderDecision;
-  // Static export still needs local artifacts. Other pre-warm deploys render
-  // through the staged Worker so runtime-backed adapters populate themselves.
-  const shouldPrerenderLocally =
-    prerenderDecision &&
-    (options.warmCdnCache !== true || prerenderDecision.reason === "next-export");
   // Step 5: Build
   if (!options.skipBuild) {
     await runBuild(info, buildEnv);
@@ -1988,7 +2076,54 @@ export async function deploy(options: DeployOptions): Promise<void> {
     console.log("\n  Skipping build (--skip-build)");
   }
 
-  if (options.warmCdnCache && cdnAdapterConfig) {
+  const canWarmTpr = options.experimentalTPR && !prerenderDecision && hasBuildIdentityHeader;
+  if (options.experimentalTPR && prerenderDecision) {
+    console.log("  TPR: Skipping route selection (all-route prerendering configured)");
+  } else if (options.experimentalTPR && !hasBuildIdentityHeader) {
+    console.log(
+      workerEntryHasCacheHandler(root)
+        ? "  TPR: Skipping pre-warm (legacy imperative cache handlers must migrate to declarative vinext({ cache }) for standard warming)"
+        : "  TPR: Skipping pre-warm (configured cache does not expose build identity)",
+    );
+  }
+  const tpr = canWarmTpr
+    ? await resolveTPRRoutes({
+        root,
+        config: options.config,
+        env: buildEnv,
+        hostname: warmCdnTarget ? new URL(warmCdnTarget).hostname : undefined,
+        window: Math.max(1, options.tprWindow ?? 24),
+      })
+    : null;
+  if (tpr?.skipped) console.log(`  TPR: Skipped (${tpr.skipped})`);
+  const tprRoutes = tpr?.routes ?? [];
+  const wranglerOptions = {
+    env: deployEnv === "production" && !options.env ? undefined : deployEnv,
+    name: options.name,
+    config: options.config,
+    verbose: options.verbose,
+  };
+  let shouldWarmTpr = tprRoutes.length > 0;
+  if (shouldWarmTpr && !options.warmCdnCache) {
+    try {
+      const deployment = runWranglerDeploymentStatus(root, wranglerOptions);
+      shouldWarmTpr = getZeroPercentStagingTraffic(deployment, "tpr-preflight") !== null;
+    } catch {
+      shouldWarmTpr = false;
+    }
+    if (!shouldWarmTpr) {
+      console.log("  TPR: Skipping pre-warm (current deployment cannot be staged safely)");
+    }
+  }
+  const shouldWarmCdnCache = options.warmCdnCache || shouldWarmTpr;
+  const shouldSelectTpr = shouldWarmTpr && !options.warmCdnCache;
+  const candidatePathsOnly = shouldSelectTpr && !needsCacheabilityProbeManifest;
+  // Static export still needs local artifacts. Other pre-warm deploys render
+  // through the staged Worker so runtime-backed adapters populate themselves.
+  const shouldPrerenderLocally =
+    prerenderDecision && (!shouldWarmCdnCache || prerenderDecision.reason === "next-export");
+
+  if (shouldWarmCdnCache && cdnAdapterConfig) {
     const wrangler = await loadProjectWranglerApi(info.root);
     const previousCwd = process.cwd();
     try {
@@ -2059,81 +2194,84 @@ export async function deploy(options: DeployOptions): Promise<void> {
     }
   }
 
-  // Step 6b: TPR — pre-render hot pages into KV cache (experimental, opt-in)
-  if (options.experimentalTPR) {
-    console.log();
-    const tprResult = await runTPR({
-      root,
-      config: options.config,
-      coverage: Math.max(1, Math.min(100, options.tprCoverage ?? 90)),
-      limit: Math.max(1, options.tprLimit ?? 1000),
-      window: Math.max(1, options.tprWindow ?? 24),
-    });
+  // Step 7: Deploy via wrangler
+  let url: string | undefined;
 
-    if (tprResult.skipped) {
-      console.log(`  TPR: Skipped (${tprResult.skipped})`);
+  if (shouldWarmCdnCache) {
+    try {
+      url = await deployWithCdnWarmup(root, [], {
+        ...wranglerOptions,
+        allowEmptyWarmPlan: tprRoutes.length > 0 && !options.warmCdnCache,
+        cacheabilityProbe: needsCacheabilityProbeManifest,
+        discoverWarmPlan: async ({ headers, targetUrl }) => {
+          const discovery = await discoverPrerenderPathManifest({
+            root: info.root,
+            candidatePaths: tprRoutes.map(({ path }) => path),
+            candidatePathsOnly,
+            nextConfig,
+            buildIdentity: hasBuildIdentityHeader ? "response-header" : undefined,
+            includeCanonicalRsc: hasCanonicalRscWarmup,
+            requestRouting: hasStagedRequestRouting ? "uncached-stage" : undefined,
+            responseVary: hasStrictResponseVary ? "verbatim" : undefined,
+            isResponsePolicyHeader: (name) =>
+              isConfiguredCdnResponsePolicyHeader(viteConfigMetadata.cacheConfig, name),
+            routeRootConfig: viteConfigMetadata.routeRootConfig,
+            pathDiscoveryTarget: {
+              baseUrl: targetUrl,
+              headers,
+              phaseTimeoutMs:
+                options.warmCdnDiscoveryTimeout ?? DEFAULT_REMOTE_PATH_DISCOVERY_PHASE_TIMEOUT_MS,
+              retries: options.warmCdnDiscoveryRetries,
+              retryDelayMs: DEFAULT_REMOTE_PATH_DISCOVERY_RETRY_DELAY_MS,
+            },
+          });
+          if (!discovery) return { loadingShellPaths: [], paths: [], rscPaths: [] };
+          return createPrerenderWarmPlan(root, discovery, {
+            includeCanonicalRsc: hasCanonicalRscWarmup,
+            includeFallbackShells: options.warmCdnIncludeFallbacks,
+            strict: options.warmCdnCertify === true || !options.dangerouslyPromoteOnCdnWarmError,
+          });
+        },
+        selectWarmPlan: shouldSelectTpr
+          ? (plan) =>
+              selectTPRWarmPlan(
+                plan,
+                tprRoutes,
+                Math.max(1, Math.min(100, options.tprCoverage ?? 90)),
+                Math.max(1, options.tprLimit ?? 1000),
+              )
+          : undefined,
+        statusSource: warmupStatusSource,
+        warmCdnConcurrency: options.warmCdnConcurrency,
+        warmCdnTarget,
+        warmCdnTimeout: options.warmCdnTimeout,
+        warmCdnRetries: options.warmCdnRetries,
+        warmCdnDiscoveryTimeout: options.warmCdnDiscoveryTimeout,
+        warmCdnDiscoveryRetries: options.warmCdnDiscoveryRetries,
+        warmCdnProbeTimeout: options.warmCdnProbeTimeout,
+        warmCdnProbeRetries: options.warmCdnProbeRetries,
+        warmCdnCertify: options.warmCdnCertify,
+        warmCdnReadinessTimeout: options.warmCdnReadinessTimeout,
+        warmCdnReadinessRetries: options.warmCdnReadinessRetries,
+        warmCdnReadinessProbes: options.warmCdnReadinessProbes,
+        warmCdnReadinessProbeDelay: options.warmCdnReadinessProbeDelay,
+        dangerouslyPromoteOnCdnWarmError: options.dangerouslyPromoteOnCdnWarmError,
+        warmCdnPromote: options.warmCdnPromote,
+        warmCdnPromotionDelay: options.warmCdnPromotionDelay,
+      });
+    } catch (error) {
+      if (
+        options.warmCdnCache ||
+        (options.warmCdnPromote === false && error instanceof StagedWarmupError)
+      ) {
+        throw error;
+      }
+      console.log(
+        `  TPR: Skipping pre-warm (${formatUnknownError(error)}). Continuing with deploy.`,
+      );
     }
   }
-
-  // Step 7: Deploy via wrangler
-  const wranglerOptions = {
-    env: deployEnv === "production" && !options.env ? undefined : deployEnv,
-    name: options.name,
-    config: options.config,
-    verbose: options.verbose,
-  };
-  let url: string;
-
-  if (options.warmCdnCache) {
-    url = await deployWithCdnWarmup(root, [], {
-      ...wranglerOptions,
-      cacheabilityProbe: needsCacheabilityProbeManifest,
-      discoverWarmPlan: async ({ headers, targetUrl }) => {
-        const discovery = await discoverPrerenderPathManifest({
-          root: info.root,
-          nextConfig,
-          buildIdentity: hasBuildIdentityHeader ? "response-header" : undefined,
-          includeCanonicalRsc: hasCanonicalRscWarmup,
-          requestRouting: hasStagedRequestRouting ? "uncached-stage" : undefined,
-          responseVary: hasStrictResponseVary ? "verbatim" : undefined,
-          isResponsePolicyHeader: (name) =>
-            isConfiguredCdnResponsePolicyHeader(viteConfigMetadata.cacheConfig, name),
-          routeRootConfig: viteConfigMetadata.routeRootConfig,
-          pathDiscoveryTarget: {
-            baseUrl: targetUrl,
-            headers,
-            phaseTimeoutMs:
-              options.warmCdnDiscoveryTimeout ?? DEFAULT_REMOTE_PATH_DISCOVERY_PHASE_TIMEOUT_MS,
-            retries: options.warmCdnDiscoveryRetries,
-            retryDelayMs: DEFAULT_REMOTE_PATH_DISCOVERY_RETRY_DELAY_MS,
-          },
-        });
-        if (!discovery) return { loadingShellPaths: [], paths: [], rscPaths: [] };
-        return createPrerenderWarmPlan(root, discovery, {
-          includeCanonicalRsc: hasCanonicalRscWarmup,
-          includeFallbackShells: options.warmCdnIncludeFallbacks,
-          strict: options.warmCdnCertify === true || !options.dangerouslyPromoteOnCdnWarmError,
-        });
-      },
-      statusSource: warmupStatusSource,
-      warmCdnConcurrency: options.warmCdnConcurrency,
-      warmCdnTarget,
-      warmCdnTimeout: options.warmCdnTimeout,
-      warmCdnRetries: options.warmCdnRetries,
-      warmCdnDiscoveryTimeout: options.warmCdnDiscoveryTimeout,
-      warmCdnDiscoveryRetries: options.warmCdnDiscoveryRetries,
-      warmCdnProbeTimeout: options.warmCdnProbeTimeout,
-      warmCdnProbeRetries: options.warmCdnProbeRetries,
-      warmCdnCertify: options.warmCdnCertify,
-      warmCdnReadinessTimeout: options.warmCdnReadinessTimeout,
-      warmCdnReadinessRetries: options.warmCdnReadinessRetries,
-      warmCdnReadinessProbes: options.warmCdnReadinessProbes,
-      warmCdnReadinessProbeDelay: options.warmCdnReadinessProbeDelay,
-      dangerouslyPromoteOnCdnWarmError: options.dangerouslyPromoteOnCdnWarmError,
-      warmCdnPromote: options.warmCdnPromote,
-      warmCdnPromotionDelay: options.warmCdnPromotionDelay,
-    });
-  } else {
+  if (url === undefined) {
     url = await runWranglerDeploy(root, {
       ...wranglerOptions,
       promote: options.warmCdnPromote,
