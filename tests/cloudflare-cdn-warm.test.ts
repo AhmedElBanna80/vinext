@@ -1425,6 +1425,46 @@ describe("Cloudflare CDN warmup", () => {
     );
   });
 
+  it("retries staged CDN certification until the admitted response is reusable", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response("cacheable", {
+          headers: {
+            "cache-control": "public, max-age=0, s-maxage=60",
+            "cf-cache-status": "BYPASS",
+            "content-type": "text/html",
+            [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response("cacheable", {
+          headers: {
+            "cache-control": "public, max-age=0, s-maxage=60",
+            "cf-cache-status": "HIT",
+            "content-type": "text/html",
+            [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
+          },
+        }),
+      );
+
+    await expect(
+      warmCdnCache({
+        expectedBuildId: "build-a",
+        fetchImpl: fetchImpl as typeof fetch,
+        paths: ["/cached"],
+        propagatingTarget: true,
+        requireCacheHit: true,
+        retries: 1,
+        retryDelayMs: 0,
+        strict: true,
+        targetUrl: "https://app.example.com",
+      }),
+    ).resolves.toMatchObject({ warmed: 1, skipped: 0, failed: 0 });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it("does not retry permanent validation failures from the uploaded build", async () => {
     const fetchImpl = vi.fn(async () => {
       const response = cacheableRsc();

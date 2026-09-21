@@ -1156,6 +1156,114 @@ describe("App Router entry templates", () => {
     expect(code).toContain('"canUseCanonicalLoadingShell":false');
   });
 
+  it("marks statically known force-dynamic App routes for shared-cache bypass", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-request-routes-"));
+    const staticPage = path.join(tmpDir, "static-page.tsx");
+    const dynamicPage = path.join(tmpDir, "dynamic-page.tsx");
+    const dynamicLayout = path.join(tmpDir, "dynamic-layout.tsx");
+    const dynamicHandler = path.join(tmpDir, "dynamic-route.ts");
+    fs.writeFileSync(staticPage, "export default function Page() { return null; }");
+    fs.writeFileSync(
+      dynamicPage,
+      'export const dynamic = "force-dynamic"; export default function Page() { return null; }',
+    );
+    fs.writeFileSync(
+      dynamicLayout,
+      'export const dynamic = "force-dynamic"; export default function Layout({ children }) { return children; }',
+    );
+    fs.writeFileSync(
+      dynamicHandler,
+      'export const dynamic = "force-dynamic"; export function GET() { return new Response(); }',
+    );
+
+    try {
+      const code = generateAppRequestRscEntry(tmpDir, [
+        { ...minimalAppRoutes[0], pattern: "/static", pagePath: staticPage, layouts: [] },
+        { ...minimalAppRoutes[0], pattern: "/page", pagePath: dynamicPage, layouts: [] },
+        {
+          ...minimalAppRoutes[0],
+          pattern: "/layout",
+          pagePath: staticPage,
+          layouts: [dynamicLayout],
+        },
+        {
+          ...minimalAppRoutes[0],
+          pattern: "/slot-intercept",
+          pagePath: staticPage,
+          layouts: [],
+          parallelSlots: [
+            {
+              key: "modal@slot-intercept/@modal",
+              name: "modal",
+              ownerDir: tmpDir,
+              ownerTreePath: "/slot-intercept",
+              hasPage: false,
+              pagePath: null,
+              defaultPath: null,
+              layoutPath: null,
+              loadingPath: null,
+              errorPath: null,
+              interceptingRoutes: [
+                {
+                  convention: ".",
+                  targetPattern: "/slot-intercept/photo",
+                  sourceMatchPattern: "/slot-intercept",
+                  pagePath: dynamicPage,
+                  layoutPaths: [],
+                  params: [],
+                },
+              ],
+              layoutIndex: 0,
+              routeSegments: null,
+            },
+          ],
+        },
+        {
+          ...minimalAppRoutes[0],
+          pattern: "/sibling-intercept",
+          pagePath: staticPage,
+          layouts: [],
+          siblingIntercepts: [
+            {
+              convention: ".",
+              targetPattern: "/sibling-intercept/photo",
+              sourceMatchPattern: "/sibling-intercept",
+              pagePath: staticPage,
+              layoutPaths: [dynamicLayout],
+              params: [],
+            },
+          ],
+        },
+        {
+          ...minimalAppRoutes[0],
+          pattern: "/api",
+          pagePath: null,
+          routePath: dynamicHandler,
+          layouts: [],
+        },
+      ]);
+      const serializedRoutes = code.match(/^const __routes = (.+);$/m)?.[1];
+      expect(serializedRoutes).toBeDefined();
+      const routes = JSON.parse(serializedRoutes!) as Array<{
+        forceDynamic: boolean;
+        pattern: string;
+      }>;
+
+      expect(
+        Object.fromEntries(routes.map((route) => [route.pattern, route.forceDynamic])),
+      ).toEqual({
+        "/api": true,
+        "/layout": true,
+        "/page": true,
+        "/sibling-intercept": true,
+        "/slot-intercept": true,
+        "/static": false,
+      });
+    } finally {
+      fs.rmSync(tmpDir, { force: true, recursive: true });
+    }
+  });
+
   it("preserves exact and generated metadata identities in the App request stage", () => {
     const code = generateAppRequestRscEntry("/tmp/test/app", minimalAppRoutes, null, [
       {
