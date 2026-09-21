@@ -187,6 +187,8 @@ type AppRouterConfig = {
    * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/assetPrefix
    */
   assetPrefix?: string;
+  /** CORS mode for framework-managed assets from next.config. */
+  crossOrigin?: "anonymous" | "use-credentials";
   /** Route-level expire fallback in seconds for ISR entries with numeric revalidate. */
   expireTime?: number;
   /**
@@ -410,6 +412,7 @@ const __trailingSlash = ${JSON.stringify(ts)};
 const __draftModeSecret = ${JSON.stringify(config?.draftModeSecret ?? "")};
 export const __prerenderSecret = ${JSON.stringify(config?.prerenderSecret ?? "")};
 export const __assetPrefix = ${JSON.stringify(config?.assetPrefix ?? "")};
+export const __crossOrigin = ${JSON.stringify(config?.crossOrigin ?? "")};
 export { __basePath };
 export const __imageAllowedWidths = ${JSON.stringify([
     ...(config?.imageConfig?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
@@ -606,6 +609,7 @@ export function generateRscEntry(
   const htmlLimitedBots = config?.htmlLimitedBots;
   const clientTraceMetadata = config?.clientTraceMetadata;
   const assetPrefix = config?.assetPrefix ?? "";
+  const crossOrigin = config?.crossOrigin ?? "";
   const expireTime = config?.expireTime ?? DEFAULT_EXPIRE_TIME;
   const reactMaxHeadersLength = config?.reactMaxHeadersLength ?? DEFAULT_REACT_MAX_HEADERS_LENGTH;
   const cacheMaxMemorySize = config?.cacheMaxMemorySize;
@@ -1152,6 +1156,7 @@ const __reactMaxHeadersLength = ${JSON.stringify(reactMaxHeadersLength)};
 // mirrors the embedded \`__basePath\` pattern (and Pages Router's
 // \`vinextConfig\` export). Empty string when unset.
 export const __assetPrefix = ${JSON.stringify(assetPrefix)};
+export const __crossOrigin = ${JSON.stringify(crossOrigin)};
 export const __imageAllowedWidths = ${JSON.stringify(imageAllowedWidths)};
 export const __imageConfig = ${JSON.stringify(imageConfig)};
 export const __inlineCss = ${JSON.stringify(inlineCss)};
