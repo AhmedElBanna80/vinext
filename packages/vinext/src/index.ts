@@ -3478,6 +3478,17 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               ),
             ]
           : [];
+        // Some build options suppress the dedicated plain-Pages client
+        // environment. During dev, Vite then uses its default client
+        // environment, so seed that optimizer at the top level instead.
+        if (
+          env.command === "serve" &&
+          !hasAppDir &&
+          !hasCloudflarePlugin &&
+          !shouldInjectPlainPagesEnvironments
+        ) {
+          viteConfig.optimizeDeps.include = [...new Set([...incomingInclude, "react-dom/client"])];
+        }
 
         // If app/ directory exists, configure RSC environments
         if (hasAppDir) {
@@ -3694,6 +3705,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             client: {
               consumer: "client",
               optimizeDeps: {
+                include: ["react-dom/client"],
                 ...(pagesOptimizeEntries.length > 0 ? { entries: pagesOptimizeEntries } : {}),
                 ...depOptimizeNodeEnvOptions,
               },
@@ -3722,6 +3734,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             client: {
               consumer: "client",
               optimizeDeps: {
+                include: ["react-dom/client"],
                 ...(pagesOptimizeEntries.length > 0 ? { entries: pagesOptimizeEntries } : {}),
                 ...depOptimizeNodeEnvOptions,
               },
