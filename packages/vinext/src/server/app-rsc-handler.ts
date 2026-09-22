@@ -229,6 +229,10 @@ function haveSamePageParams(first: AppPageParams, second: AppPageParams): boolea
   return true;
 }
 
+function rewriteCachePathname(sourcePathname: string, resolvedPathname: string): string {
+  return `${sourcePathname}?__vinext_rewrite=${encodeURIComponent(resolvedPathname)}`;
+}
+
 function requestOptsOutOfWorkerResponseStage(
   request: Request,
   options: Pick<CreateAppRscHandlerOptions<AppRscHandlerRoute>, "draftModeSecret">,
@@ -313,6 +317,7 @@ function applyMiddlewareContextToResponse(
 
 type DispatchMatchedPageOptions<TRoute> = {
   bypassInterceptionContextCache: boolean;
+  cachePathname: string;
   clientReuseManifest: ClientReuseManifestParseResult;
   cleanPathname: string;
   displayPathname: string;
@@ -352,6 +357,12 @@ type DispatchMatchedPageOptions<TRoute> = {
 };
 
 type DispatchMatchedRouteHandlerOptions<TRoute> = {
+  /**
+   * Legacy transported cache-bypass bit. Also covers request/cache route-identity
+   * divergence so the response cannot be published under another route's key.
+   */
+  bypassInterceptionContextCache: boolean;
+  cachePathname: string;
   cleanPathname: string;
   middlewareContext: AppRscMiddlewareContext;
   /**
@@ -2160,6 +2171,35 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   }
 
   const { route, params } = match;
+  const requestPathnameDiffersFromCachePath = requestCleanPathname !== cleanPathname;
+  const rawRequestPathnameIsObservable =
+    isInterceptionMatch ||
+    route.routeHandler != null ||
+    typeof route.__loadRouteHandler === "function";
+  if ((!isInterceptionMatch || requestPathnameDiffersFromCachePath) && options.matchRequestRoute) {
+    const cachePathMatch = options.matchRoute(cleanPathname);
+    if (
+      (requestPathnameDiffersFromCachePath && rawRequestPathnameIsObservable) ||
+      !cachePathMatch ||
+      cachePathMatch.route.pattern !== route.pattern ||
+      !haveSamePageParams(cachePathMatch.params, params)
+    ) {
+      // The raw request spelling remains observable to Route Handlers, while
+      // ISR/CDN identity uses the normalized pathname. Reuse the existing
+      // internal bypass channel when either the spelling or semantic route
+      // differs so every local and split response stage skips shared reads and
+      // writes without changing the worker protocol.
+      bypassInterceptionContextCache = true;
+      setInterceptionResponseUncacheable(true);
+    }
+  }
+  // Next.js keys App ISR by the resolved pathname:
+  // packages/next/src/build/templates/app-route.ts
+  // Keep that resolved identity while also partitioning by the public source
+  // pathname that user code observes through usePathname().
+  const cachePathname = cleanPathnameIsRequestPathname
+    ? cleanPathname
+    : rewriteCachePathname(canonicalPathname, cleanPathname);
   setFrameworkRequestRoute(patternToNextFormat(route.pattern), isRscRequest);
   // Hydrate lazy page/route-handler modules before the page-vs-handler dispatch
   // branch and any downstream synchronous module reads.
@@ -2243,6 +2283,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
         buildId: options.buildId,
         cacheability: responseStageCacheability(resolvedUrl),
         bypassInterceptionContextCache,
+        cachePathname,
         canUseCanonicalLoadingShell: route.canUseCanonicalLoadingShell === true,
         canonicalPathname,
         cleanPathname,
@@ -2270,6 +2311,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       buildPageCacheTags(cleanPathname, [], [...route.routeSegments], "route"),
     );
     return options.dispatchMatchedRouteHandler({
+      bypassInterceptionContextCache,
+      cachePathname,
       cleanPathname,
       middlewareContext,
       // Non-dynamic routes report params as `null` to match Next.js. Internal
@@ -2289,6 +2332,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
         buildId: options.buildId,
         cacheability: responseStageCacheability(resolvedUrl),
         bypassInterceptionContextCache,
+        cachePathname,
         canUseCanonicalLoadingShell: route.canUseCanonicalLoadingShell === true,
         canonicalPathname,
         cleanPathname,
@@ -2311,6 +2355,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       }).then(composeResponseStageResponse)
     : await options.dispatchMatchedPage({
         bypassInterceptionContextCache,
+        cachePathname,
         clientReuseManifest,
         cleanPathname,
         displayPathname: canonicalPathname,

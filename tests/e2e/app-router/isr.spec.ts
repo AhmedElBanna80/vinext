@@ -174,6 +174,136 @@ test.describe("App Router ISR", () => {
     expect(cc).toContain("stale-while-revalidate");
   });
 
+  // A request spelling that selects a catch-all route must not publish that
+  // artifact under a static sibling's ISR key. Encoded delimiters and /index
+  // remain distinct cache identities.
+  for (const { attackPath, expectedVictim, label, mustBypassCache, victimPath } of [
+    {
+      attackPath: "/route-cache-identity/%61bout",
+      expectedVictim: "CACHE_IDENTITY_STATIC_PAGE",
+      label: "encoded literal route divergence",
+      mustBypassCache: true,
+      victimPath: "/route-cache-identity/about",
+    },
+    {
+      attackPath: "/route-cache-identity/nested%2Fabout",
+      expectedVictim: "CACHE_IDENTITY_NESTED_STATIC_PAGE",
+      label: "encoded separator",
+      mustBypassCache: false,
+      victimPath: "/route-cache-identity/nested/about",
+    },
+    {
+      attackPath: "/route-cache-identity/index",
+      expectedVictim: "CACHE_IDENTITY_ROOT_STATIC_PAGE",
+      label: "/index alias",
+      mustBypassCache: false,
+      victimPath: "/route-cache-identity",
+    },
+  ]) {
+    test(`keeps ${label} catch-all output out of a static route`, async ({ request }) => {
+      await resetIsrPath(request, victimPath);
+
+      const attacker = await request.get(`${baseUrl()}${attackPath}`);
+      expect(attacker.status()).toBe(200);
+      expect(await attacker.text()).toContain("CACHE_IDENTITY_CATCH_ALL:");
+      if (mustBypassCache) {
+        expect(attacker.headers()["cache-control"]).toContain("no-store");
+      }
+
+      const victim = await waitForCacheHit(request, victimPath);
+      expect(await victim.text()).toContain(expectedVictim);
+    });
+  }
+
+  test("does not let an encoded catch-all request poison a static route handler", async ({
+    request,
+  }) => {
+    const staticPath = "/route-handler-cache-identity/about";
+    await resetIsrPath(request, staticPath);
+
+    const attacker = await request.get(`${baseUrl()}/route-handler-cache-identity/%61bout`);
+    expect(attacker.status()).toBe(200);
+    expect(await attacker.text()).toBe(
+      "CACHE_IDENTITY_ROUTE_CATCH_ALL:about:/route-handler-cache-identity/%61bout",
+    );
+    expect(attacker.headers()["cache-control"]).toContain("no-store");
+
+    const victim = await waitForCacheHit(request, staticPath);
+    expect(await victim.text()).toBe("CACHE_IDENTITY_STATIC_ROUTE_HANDLER");
+  });
+
+  test("does not share differently spelled paths for one dynamic route handler", async ({
+    request,
+  }) => {
+    const decodedPath = "/route-handler-cache-identity/dynamic/alpha";
+    await resetIsrPath(request, decodedPath);
+
+    const encoded = await request.get(`${baseUrl()}/route-handler-cache-identity/dynamic/%61lpha`);
+    expect(encoded.status()).toBe(200);
+    expect(await encoded.text()).toBe(
+      "CACHE_IDENTITY_ROUTE_CATCH_ALL:dynamic:alpha:/route-handler-cache-identity/dynamic/%61lpha",
+    );
+    expect(encoded.headers()["cache-control"]).toContain("no-store");
+
+    const decoded = await waitForCacheHit(request, decodedPath);
+    expect(await decoded.text()).toBe(
+      "CACHE_IDENTITY_ROUTE_CATCH_ALL:dynamic:alpha:/route-handler-cache-identity/dynamic/alpha",
+    );
+  });
+
+  test("keeps rewritten route handler output out of the destination cache", async ({ request }) => {
+    const destinationPath = "/route-handler-cache-identity/rewrite";
+    await resetIsrPath(request, destinationPath);
+
+    const rewritten = await request.get(`${baseUrl()}/route-cache-rewrite/rewrite`);
+    expect(rewritten.status()).toBe(200);
+    expect(await rewritten.text()).toBe(
+      "CACHE_IDENTITY_ROUTE_CATCH_ALL:rewrite:/route-cache-rewrite/rewrite",
+    );
+    expect(rewritten.headers()["cache-control"]).toContain("no-store");
+
+    const destination = await waitForCacheHit(request, destinationPath);
+    expect(await destination.text()).toBe(
+      "CACHE_IDENTITY_ROUTE_CATCH_ALL:rewrite:/route-handler-cache-identity/rewrite",
+    );
+  });
+
+  test("keeps query-selected rewrite destinations in distinct cache entries", async ({
+    request,
+  }) => {
+    await resetIsrPath(request, "/route-cache-identity/about");
+    await resetIsrPath(request, "/route-cache-identity/nested/about");
+
+    const aboutPath = "/route-cache-choice?view=about";
+    const nestedPath = "/route-cache-choice?view=nested";
+    const about = await waitForCacheHit(request, aboutPath);
+    expect(await about.text()).toContain("CACHE_IDENTITY_STATIC_PAGE");
+
+    const initialNested = await request.get(`${baseUrl()}${nestedPath}`);
+    expect(await initialNested.text()).toContain("CACHE_IDENTITY_NESTED_STATIC_PAGE");
+
+    const nested = await waitForCacheHit(request, nestedPath);
+    expect(await nested.text()).toContain("CACHE_IDENTITY_NESTED_STATIC_PAGE");
+
+    const cachedAbout = await waitForCacheHit(request, aboutPath);
+    expect(await cachedAbout.text()).toContain("CACHE_IDENTITY_STATIC_PAGE");
+  });
+
+  test("keeps trailing-slash route handler cache entries distinct", async ({ request }) => {
+    const plainPath = "/api/route-cache-identity/trailing";
+    const trailingPath = `${plainPath}/`;
+    await resetIsrPath(request, plainPath);
+    await resetIsrPath(request, trailingPath);
+
+    const trailing = await waitForCacheHit(request, trailingPath);
+    expect(await trailing.text()).toBe(`CACHE_IDENTITY_API_ROUTE:${plainPath}`);
+
+    const initialPlain = await request.get(`${baseUrl()}${plainPath}`);
+    expect(initialPlain.headers()["x-vinext-cache"]).toBe("MISS");
+    const plain = await waitForCacheHit(request, plainPath);
+    expect(await plain.text()).toBe(`CACHE_IDENTITY_API_ROUTE:${plainPath}`);
+  });
+
   test("dynamic metadata images honor dynamicParams=false", async ({ request }) => {
     const publicImage = await request.get(
       `${baseUrl()}/metadata-static-params/public-post/opengraph-image`,

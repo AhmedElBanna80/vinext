@@ -368,7 +368,8 @@ export function appIsrCacheKey(
   suffix: string,
   buildId = process.env.__VINEXT_BUILD_ID,
 ): string {
-  const prefix = buildId ? `app:${buildId}` : "app";
+  // Keep incompatible App cache identities unreachable even when generateBuildId is stable.
+  const prefix = buildId ? `app:v2:${buildId}` : "app:v2";
   return buildCacheKey(prefix, pathname, suffix);
 }
 
@@ -415,5 +416,6 @@ export function appIsrRscKey(
 }
 
 export function appIsrRouteKey(pathname: string): string {
-  return appIsrCacheKey(pathname, "route");
+  const suffix = pathname !== "/" && pathname.endsWith("/") ? "route:trailing-slash" : "route";
+  return appIsrCacheKey(pathname, suffix);
 }
