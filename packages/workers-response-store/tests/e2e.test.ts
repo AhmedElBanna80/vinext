@@ -851,6 +851,30 @@ test("manual refresh replaces R2 before reporting the local edge-purge limitatio
   assert.equal((await r2Objects()).objects.length, 1);
 });
 
+test("refresh candidate selection returns only reservation fields", async () => {
+  const path = "/refresh-candidate-projection";
+  await put(path, "seed", {
+    largeHeaderBytes: 16_000,
+    revalidator: { body: "refreshed", cacheControl: "public, max-age=60" },
+  });
+
+  const metadata = await metadataStub();
+  const options = { pathPrefixes: [path] };
+  assert.deepEqual(await metadata.findRefreshCandidates(options, "reservation"), [
+    {
+      keyHash: await cacheKeyHash(path),
+      cacheKey: path,
+      activeRevision: 1,
+      latestRevision: 1,
+      hasRevalidator: true,
+    },
+  ]);
+  assert.deepEqual((await metadata.findRefreshCandidates(options))[0]?.revalidator, {
+    id: "fixture-render",
+    args: [{ body: "refreshed", cacheControl: "public, max-age=60" }],
+  });
+});
+
 test("refresh selects entries by tag and path prefix", async () => {
   await put("/refresh-select/tagged", "tagged-seed", {
     tags: ["refresh-group"],

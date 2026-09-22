@@ -3,6 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 import type {
   CandidateMetadata,
   PurgedEntry,
+  RefreshCandidate,
   ResponseStoreRefreshOptions,
   ResponseStorePurgeOptions,
   SerializableValue,
@@ -99,6 +100,10 @@ export type CacheMetadataStub = DurableObjectStub & {
   getEntry(keyHash: string): Promise<StoredEntry | null>;
   getTagExpiration(tags: string[]): Promise<number>;
   findRefreshCandidates(options: ResponseStoreRefreshOptions): Promise<StoredEntry[]>;
+  findRefreshCandidates(
+    options: ResponseStoreRefreshOptions,
+    projection: "reservation",
+  ): Promise<RefreshCandidate[]>;
   purgeMatching(
     options: ResponseStorePurgeOptions,
     invalidatedAt?: number,
@@ -140,6 +145,11 @@ type EntryRow = Record<string, SqlStorageValue> & {
 };
 
 type PurgeEntryRow = Pick<EntryRow, "key_hash" | "cache_key" | "latest_revision" | "object_key">;
+
+type RefreshCandidateRow = Pick<EntryRow, "key_hash" | "cache_key" | "latest_revision"> & {
+  active_revision: number;
+  has_revalidator: number;
+};
 
 const MAX_SQL_PARAMETERS = 100;
 const ORPHAN_RETENTION_MS = 60 * 60 * 1000;
@@ -450,12 +460,16 @@ export class CacheMetadata extends DurableObject<CacheMetadataEnv> {
   private findMatchingEntryRows(options: ResponseStorePurgeOptions): EntryRow[];
   private findMatchingEntryRows(
     options: ResponseStorePurgeOptions,
-    includePending: true,
+    projection: "purge",
   ): PurgeEntryRow[];
   private findMatchingEntryRows(
     options: ResponseStorePurgeOptions,
-    includePending = false,
-  ): EntryRow[] | PurgeEntryRow[] {
+    projection: "refresh",
+  ): RefreshCandidateRow[];
+  private findMatchingEntryRows(
+    options: ResponseStorePurgeOptions,
+    projection: "entry" | "purge" | "refresh" = "entry",
+  ): EntryRow[] | PurgeEntryRow[] | RefreshCandidateRow[] {
     const selectors: string[] = [];
     const parameters: string[] = [];
     if (!options.purgeEverything) {
@@ -480,8 +494,13 @@ export class CacheMetadata extends DurableObject<CacheMetadataEnv> {
     if (!options.purgeEverything && !selectors.length) return [];
 
     const conditions: string[] = [];
-    if (!includePending) {
+    if (projection !== "purge") {
       conditions.push("tombstoned = 0 AND active_revision IS NOT NULL");
+    }
+    if (projection === "refresh") {
+      conditions.push(
+        "object_key IS NOT NULL AND response_headers IS NOT NULL AND fresh_until IS NOT NULL AND swr_until IS NOT NULL",
+      );
     }
     if (!options.purgeEverything) {
       conditions.push(`(${selectors.join(" OR ")})`);
@@ -490,7 +509,11 @@ export class CacheMetadata extends DurableObject<CacheMetadataEnv> {
     return this.ctx.storage.sql
       .exec<EntryRow>(
         `SELECT ${
-          includePending ? "key_hash, cache_key, latest_revision, object_key" : "*"
+          projection === "purge"
+            ? "key_hash, cache_key, latest_revision, object_key"
+            : projection === "refresh"
+              ? "key_hash, cache_key, active_revision, latest_revision, revalidator_id IS NOT NULL AS has_revalidator"
+              : "*"
         } FROM entries ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}`,
         ...parameters,
       )
@@ -1083,11 +1106,25 @@ export class CacheMetadata extends DurableObject<CacheMetadataEnv> {
     return this.getTagInvalidationMaximum(tags, "invalidated_at");
   }
 
-  findRefreshCandidates(options: ResponseStoreRefreshOptions): StoredEntry[] {
-    return this.findMatchingEntryRows(options).flatMap((row) => {
-      const entry = storedEntryFromRow(row);
-      return entry ? [entry] : [];
-    });
+  findRefreshCandidates(options: ResponseStoreRefreshOptions): StoredEntry[];
+  findRefreshCandidates(
+    options: ResponseStoreRefreshOptions,
+    projection: "reservation",
+  ): RefreshCandidate[];
+  findRefreshCandidates(
+    options: ResponseStoreRefreshOptions,
+    projection?: "reservation",
+  ): StoredEntry[] | RefreshCandidate[] {
+    if (projection === undefined) {
+      return storedEntriesFromRows(this.findMatchingEntryRows(options));
+    }
+    return this.findMatchingEntryRows(options, "refresh").map((row) => ({
+      keyHash: row.key_hash,
+      cacheKey: row.cache_key,
+      activeRevision: row.active_revision,
+      latestRevision: row.latest_revision,
+      hasRevalidator: row.has_revalidator === 1,
+    }));
   }
 
   async purgeMatching(
@@ -1095,7 +1132,7 @@ export class CacheMetadata extends DurableObject<CacheMetadataEnv> {
     invalidatedAt = Date.now(),
   ): Promise<PurgeReservation> {
     const reservation = this.ctx.storage.transactionSync(() => {
-      const matches = this.findMatchingEntryRows(options, true);
+      const matches = this.findMatchingEntryRows(options, "purge");
       const tombstoneSequence = this.tombstoneSequence(
         matches.some((row) => row.object_key !== null),
       );
