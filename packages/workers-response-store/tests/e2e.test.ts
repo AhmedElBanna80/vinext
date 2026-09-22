@@ -13,6 +13,7 @@ import type {
   SerializableValue,
 } from "../src/index.js";
 import { IsolateNegativeCache } from "../src/isolate-negative-cache.js";
+import { mapSettledWithR2Concurrency } from "../src/r2-concurrency.js";
 
 const workerScript = fileURLToPath(new URL("../dist/worker/worker.js", import.meta.url));
 const versionId = "poc-v2";
@@ -218,6 +219,27 @@ async function onePathPerShard(shards: number): Promise<string[]> {
   }
   return paths as string[];
 }
+
+test("bounded concurrency preserves settled results", async () => {
+  let active = 0;
+  let maximumActive = 0;
+  const settled = await mapSettledWithR2Concurrency(
+    Array.from({ length: 13 }, (_, index) => index),
+    async (index) => {
+      active++;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active--;
+      if (index === 7) throw new Error("expected failure");
+      return index * 2;
+    },
+  );
+
+  assert.equal(maximumActive, 6);
+  assert.deepEqual(settled[0], { status: "fulfilled", value: 0 });
+  assert.equal(settled[7]?.status, "rejected");
+  assert.deepEqual(settled[12], { status: "fulfilled", value: 24 });
+});
 
 test("isolate miss caching expires and evicts least-recently-used keys", () => {
   vi.useFakeTimers();
@@ -1041,6 +1063,26 @@ test("a broad purge only acknowledges tombstones in its snapshot", async () => {
   await stub.markTombstonesEdgePurged(await stub.listPendingEdgePurges(400));
 });
 
+test("stale edge completion cannot remove a replacement tombstone", async () => {
+  await put("/stale-edge-completion", "first", { tags: ["stale-edge-completion"] });
+  const stub = await metadataStub();
+
+  await stub.purgeMatching({ tags: ["stale-edge-completion"] });
+  const first = await stub.drainPendingTombstones(1);
+  assert.equal(first.purged.length, 1);
+
+  await put("/stale-edge-completion", "second", { tags: ["stale-edge-completion"] });
+  await stub.purgeMatching({ tags: ["stale-edge-completion"] });
+  await stub.markTombstonesEdgePurged(first.purged);
+
+  assert.equal(await metadataRowCount("pending_r2_tombstones"), 1);
+  const replacement = await stub.drainPendingTombstones(1);
+  assert.equal(replacement.purged.length, 1);
+  assert.ok(replacement.purged[0].revision > first.purged[0].revision);
+  await stub.markTombstonesEdgePurged(replacement.purged);
+  assert.equal(await metadataRowCount("pending_r2_tombstones"), 0);
+});
+
 test("a failed R2 publication can be fenced with a newer tombstone", async () => {
   await put("/failed-publication", "possibly-committed", { tags: ["failed-publication"] });
   await put("/unrelated-pending-tombstone", "unrelated", { tags: ["unrelated"] });
@@ -1582,6 +1624,19 @@ test("the previous metadata schema is upgraded in place", async () => {
       await storage.exec("SELECT invalidation_sequence, publishable FROM pending_objects"),
       [],
     );
+    assert.deepEqual(
+      await storage.exec(
+        `SELECT name FROM sqlite_schema
+        WHERE type = 'index' AND name IN (
+          'pending_r2_tombstones_r2_pending',
+          'pending_r2_tombstones_edge_pending'
+        ) ORDER BY name`,
+      ),
+      [
+        { name: "pending_r2_tombstones_edge_pending" },
+        { name: "pending_r2_tombstones_r2_pending" },
+      ],
+    );
   } finally {
     await legacy?.dispose();
     await upgraded?.dispose();
@@ -1651,6 +1706,58 @@ test("retention cleanup uses the persistent active-object index", async () => {
   assert.ok(
     details.every((detail) => !detail.includes("AUTOMATIC")),
     JSON.stringify(plan),
+  );
+});
+
+test("tombstone cleanup uses persistent queue indexes and keyed completion", async () => {
+  await put("/tombstone-query-plan", "active");
+  const storage = await mf.unsafeGetDurableObjectStorage("user-worker", "CacheMetadata", {
+    name: metadataName,
+  });
+
+  const unfinished = await storage.exec(`
+    EXPLAIN QUERY PLAN
+    SELECT key_hash, cache_key, object_key, revision, r2_complete, edge_purge_complete
+    FROM pending_r2_tombstones
+    WHERE r2_complete = 0
+    ORDER BY key_hash LIMIT 400
+  `);
+  const pendingEdge = await storage.exec(`
+    EXPLAIN QUERY PLAN
+    SELECT key_hash, cache_key, object_key, revision, r2_complete, edge_purge_complete
+    FROM pending_r2_tombstones
+    WHERE r2_complete = 1 AND edge_purge_complete = 0
+    ORDER BY key_hash LIMIT 400
+  `);
+  const completed = await storage.exec(`
+    EXPLAIN QUERY PLAN
+    DELETE FROM pending_r2_tombstones
+    WHERE r2_complete = 1 AND edge_purge_complete = 1
+      AND key_hash = 'tombstone-query-plan' AND revision = 1
+  `);
+  const unfinishedDetails = unfinished
+    .map(({ detail }) => detail)
+    .filter((detail): detail is string => typeof detail === "string");
+  const pendingEdgeDetails = pendingEdge
+    .map(({ detail }) => detail)
+    .filter((detail): detail is string => typeof detail === "string");
+  const completedDetails = completed
+    .map(({ detail }) => detail)
+    .filter((detail): detail is string => typeof detail === "string");
+
+  assert.ok(
+    unfinishedDetails.some((detail) => detail.includes("INDEX pending_r2_tombstones_r2_pending")),
+    JSON.stringify(unfinished),
+  );
+  assert.ok(
+    pendingEdgeDetails.some((detail) =>
+      detail.includes("INDEX pending_r2_tombstones_edge_pending"),
+    ),
+    JSON.stringify(pendingEdge),
+  );
+  assert.ok(
+    completedDetails.some((detail) => detail.includes("PRIMARY KEY (key_hash=?)")),
+    JSON.stringify(completed),
   );
 });
 
