@@ -106,12 +106,14 @@ type WriteReservation = CacheKey & {
 };
 
 type StoreResult = {
+  edgePurgeRequired: boolean;
   published: boolean;
   entry: StoredEntry | null;
   response?: Response;
 };
 
 type PublicationResult = {
+  edgePurgeRequired: boolean;
   entry: StoredEntry | null;
   published: boolean;
 };
@@ -907,6 +909,7 @@ export class ResponseStoreBinding extends WorkerEntrypoint<
 
     if (!publication.published) {
       return {
+        edgePurgeRequired: false,
         published: false,
         entry: this.readableEntry(publication.entry),
       };
@@ -963,6 +966,7 @@ export class ResponseStoreBinding extends WorkerEntrypoint<
 
     const entry = this.readableEntry(publication.entry);
     return {
+      edgePurgeRequired: publication.edgePurgeRequired,
       published: true,
       entry,
       ...(stored && entry
@@ -1200,9 +1204,10 @@ export class ResponseStoreBinding extends WorkerEntrypoint<
           void response.body?.cancel().catch(() => {});
           return {
             backingStoreUpdated: true,
-            edgePurgeAccepted: options.purgeExisting
-              ? await this.purgeEdgeCacheByTags([purgeTagForEntry(result.entry)])
-              : true,
+            edgePurgeAccepted:
+              options.purgeExisting && result.edgePurgeRequired
+                ? await this.purgeEdgeCacheByTags([purgeTagForEntry(result.entry)])
+                : true,
           };
         }
         if (pendingPuts.get(pendingPutKey) === pending) {
@@ -1230,9 +1235,10 @@ export class ResponseStoreBinding extends WorkerEntrypoint<
       }
       return {
         backingStoreUpdated: true,
-        edgePurgeAccepted: options.purgeExisting
-          ? await this.purgeEdgeCacheByTags([purgeTagForEntry(result.entry)])
-          : true,
+        edgePurgeAccepted:
+          options.purgeExisting && result.edgePurgeRequired
+            ? await this.purgeEdgeCacheByTags([purgeTagForEntry(result.entry)])
+            : true,
       };
     } finally {
       if (options.coalesce && pendingPuts.get(pendingPutKey) === write) {

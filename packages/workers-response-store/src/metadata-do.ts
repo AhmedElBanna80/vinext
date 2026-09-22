@@ -18,6 +18,7 @@ type RevalidationClaim = {
 };
 
 type PublicationResult = {
+  edgePurgeRequired: boolean;
   entry: StoredEntry | null;
   published: boolean;
 };
@@ -924,7 +925,11 @@ export class CacheMetadata extends DurableObject<CacheMetadataEnv> {
           "DELETE FROM pending_objects WHERE object_key = ?",
           reservationObjectKey,
         );
-        return { entry: current ? storedEntryFromRow(current) : null, published: false };
+        return {
+          edgePurgeRequired: false,
+          entry: current ? storedEntryFromRow(current) : null,
+          published: false,
+        };
       }
 
       const update = this.ctx.storage.sql.exec<{ key_hash: string }>(
@@ -980,6 +985,7 @@ export class CacheMetadata extends DurableObject<CacheMetadataEnv> {
       };
 
       return {
+        edgePurgeRequired: published && current.active_revision !== null,
         entry: published ? entry : null,
         published,
       };
