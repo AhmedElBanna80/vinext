@@ -251,6 +251,7 @@ const MISS_HEADERS = {
 const BACKGROUND_REVALIDATION_LEASE_MS = 30_000;
 const CACHE_PURGE_BATCH_SIZE = 100;
 const PURGE_TOMBSTONE_BATCH_SIZE = 400;
+const REFRESH_CONCURRENCY = 6;
 const ISOLATE_MISS_CACHE_CAPACITY = 1_024;
 const ISOLATE_MISS_CACHE_TTL_MS = 1_000;
 const MAX_R2_CAS_ATTEMPTS = 3;
@@ -277,6 +278,29 @@ function* batches<T>(values: readonly T[], size: number): Generator<T[], void> {
   for (let offset = 0; offset < values.length; offset += size) {
     yield values.slice(offset, offset + size);
   }
+}
+
+async function settleWithConcurrency<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  operation: (value: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results = Array.from<PromiseSettledResult<R>>({ length: values.length });
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < values.length) {
+      const index = nextIndex++;
+      try {
+        results[index] = { status: "fulfilled", value: await operation(values[index]) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, () => worker()));
+  return results;
 }
 
 function metadataInteger(value: string | undefined): number | undefined {
@@ -1260,7 +1284,7 @@ export class ResponseStoreBinding extends WorkerEntrypoint<
 
     const reserved = await Promise.allSettled(
       this.getMetadataShards().map(async (metadata) => ({
-        candidates: await metadata.reserveRefresh(options, this.objectKeyRoot(), Date.now()),
+        candidates: await metadata.findRefreshCandidates(options),
         metadata,
       })),
     );
@@ -1271,7 +1295,7 @@ export class ResponseStoreBinding extends WorkerEntrypoint<
       result.status === "fulfilled" ? [result.value] : [],
     );
     const candidates = groups.flatMap(({ candidates, metadata }) =>
-      candidates.map((candidate) => ({ ...candidate, metadata })),
+      candidates.map((entry) => ({ entry, metadata })),
     );
     if (candidates.length === 0) {
       if (failures.length) {
@@ -1280,23 +1304,31 @@ export class ResponseStoreBinding extends WorkerEntrypoint<
       return { backingStoreUpdated: false, edgePurgeAccepted: false };
     }
 
-    const settled = await Promise.allSettled(
-      candidates.map(async ({ entry, metadata, reservation }) => {
-        const result = await this.regenerateEntry(
-          metadata,
-          entry,
-          "manual",
-          reservation
-            ? {
-                cacheKey: entry.cacheKey,
-                fenceTags: entry.cacheTags,
-                keyHash: entry.keyHash,
-                ...reservation,
-              }
-            : undefined,
+    const settled = await settleWithConcurrency(
+      candidates,
+      REFRESH_CONCURRENCY,
+      async ({ entry, metadata }) => {
+        if (!entry.revalidator) {
+          throw new Error("Cache entry has no configured revalidator");
+        }
+        const regeneration = await metadata.reserveRegeneration(
+          entry.keyHash,
+          entry.cacheKey,
+          this.objectKeyPrefix(entry.keyHash),
+          Date.now(),
+          entry.activeRevision,
+          entry.latestRevision,
         );
+        if (!regeneration?.reservation) return null;
+
+        const result = await this.regenerateEntry(metadata, regeneration.entry, "manual", {
+          cacheKey: regeneration.entry.cacheKey,
+          fenceTags: regeneration.entry.cacheTags,
+          keyHash: regeneration.entry.keyHash,
+          ...regeneration.reservation,
+        });
         return result.published ? result.entry : null;
-      }),
+      },
     );
 
     const refreshed: StoredEntry[] = [];
