@@ -852,6 +852,57 @@ function isAppServerActionFunction(action: unknown): action is AppServerActionFu
   return typeof action === "function";
 }
 
+function normalizeDevServerReferenceId(id: string): string {
+  const exportSeparator = id.indexOf("#");
+  if (exportSeparator === -1) return id;
+  const moduleId = id.slice(0, exportSeparator);
+  // plugin-rsc's dev createServerManifest() appends this HMR-busting tag to
+  // serialized module ids. loadServerAction() removes it before importing, so
+  // compare the registered and requested identities on that same basis.
+  const cacheTag = moduleId.indexOf("$$cache=");
+  return (cacheTag === -1 ? moduleId : moduleId.slice(0, cacheTag)) + id.slice(exportSeparator);
+}
+
+function requiresRegisteredServerReferenceMatch(actionId: string): boolean {
+  const exportSeparator = actionId.indexOf("#");
+  if (exportSeparator === -1) return true;
+  // Production requests are authorized by the generated action-owner manifest
+  // before execution. Dev has no manifest, so its path-based references need
+  // the runtime registration check to prevent arbitrary named-export loading.
+  return !/^[0-9a-f]{12}$/.test(actionId.slice(0, exportSeparator));
+}
+
+function matchesRegisteredServerReference(
+  action: AppServerActionFunction,
+  actionId: string,
+): boolean {
+  const registeredId = Reflect.get(action, "$$id");
+  if (typeof registeredId !== "string") return false;
+
+  const normalizedRegisteredId = normalizeDevServerReferenceId(registeredId);
+  const normalizedActionId = normalizeDevServerReferenceId(actionId);
+  if (normalizedRegisteredId === normalizedActionId) return true;
+
+  // React stores only the most recently registered ID on a function. When one
+  // ordinary Server Action is exported under multiple names, plugin-rsc
+  // registers every alias on the same function object, so `$$id` alone cannot
+  // tell which aliases are valid. Loading any same-module alias still proves
+  // that it resolves to that registered Server Action. Cache references are the
+  // exception: their opaque export deliberately must not authorize a source
+  // export name that happens to resolve to the same wrapper.
+  const registeredSeparator = normalizedRegisteredId.indexOf("#");
+  const actionSeparator = normalizedActionId.indexOf("#");
+  if (registeredSeparator === -1 || actionSeparator === -1) return false;
+  if (
+    normalizedRegisteredId.slice(0, registeredSeparator) !==
+    normalizedActionId.slice(0, actionSeparator)
+  ) {
+    return false;
+  }
+  const registeredExport = normalizedRegisteredId.slice(registeredSeparator + 1);
+  return !/^\$\$vinext_cache_[0-9a-f]{64}$/.test(registeredExport);
+}
+
 function getServerActionFailureMessage(error: unknown): string {
   return error instanceof Error && error.message ? error.message : String(error);
 }
@@ -1222,6 +1273,17 @@ export async function handleProgressiveServerActionRequest(
       return null;
     }
 
+    if (
+      directActionId &&
+      requiresRegisteredServerReferenceMatch(directActionId) &&
+      !matchesRegisteredServerReference(action, directActionId)
+    ) {
+      return createActionNotFoundResponse(directActionId, {
+        clearRequestContext: options.clearRequestContext,
+        getAndClearPendingCookies: options.getAndClearPendingCookies,
+      });
+    }
+
     const decodedActionId = Reflect.get(action, "$$id");
     if (
       typeof decodedActionId === "string" &&
@@ -1515,7 +1577,11 @@ export async function handleServerActionRscRequest<
         throw error;
       }
 
-      if (!isAppServerActionFunction(loadedAction)) {
+      if (
+        !isAppServerActionFunction(loadedAction) ||
+        (requiresRegisteredServerReferenceMatch(options.actionId) &&
+          !matchesRegisteredServerReference(loadedAction, options.actionId))
+      ) {
         return createActionNotFoundResponse(options.actionId, {
           clearRequestContext: options.clearRequestContext,
           getAndClearPendingCookies: options.getAndClearPendingCookies,
@@ -1558,7 +1624,11 @@ export async function handleServerActionRscRequest<
         throw error;
       }
 
-      if (!isAppServerActionFunction(loadedAction)) {
+      if (
+        !isAppServerActionFunction(loadedAction) ||
+        (requiresRegisteredServerReferenceMatch(options.actionId) &&
+          !matchesRegisteredServerReference(loadedAction, options.actionId))
+      ) {
         return createActionNotFoundResponse(options.actionId, {
           clearRequestContext: options.clearRequestContext,
           getAndClearPendingCookies: options.getAndClearPendingCookies,
