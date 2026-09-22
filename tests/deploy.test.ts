@@ -1098,6 +1098,20 @@ describe("detectProject", () => {
     expect(info.hasWranglerConfig).toBe(true);
   });
 
+  it("detects Wrangler independently of its executable shim", () => {
+    mkdir(tmpDir, "app");
+    writeWranglerPackageForTest(tmpDir);
+    expect(detectProject(tmpDir).hasWrangler).toBe(true);
+  });
+
+  it("does not mistake the separate cf package for Wrangler", () => {
+    mkdir(tmpDir, "app");
+    writeFile(tmpDir, "node_modules/cf/package.json", JSON.stringify({ name: "cf" }));
+    writeFile(tmpDir, "node_modules/.bin/cf.exe", "");
+    writeFile(tmpDir, "node_modules/.bin/cf.bunx", "");
+    expect(detectProject(tmpDir).hasWrangler).toBe(false);
+  });
+
   it("detects cloudflare.config.ts", () => {
     mkdir(tmpDir, "app");
     writeFile(tmpDir, "cloudflare.config.ts", "export default {};");
