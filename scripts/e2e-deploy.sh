@@ -19,6 +19,8 @@ if [ -z "${VINEXT_DIR}" ]; then
   exit 1
 fi
 VINEXT_DIR="$(cd "${VINEXT_DIR}" && pwd)"
+VINEXT_HARNESS_DIR="${VINEXT_HARNESS_DIR:-${VINEXT_DIR}}"
+VINEXT_HARNESS_DIR="$(cd "${VINEXT_HARNESS_DIR}" && pwd)"
 VINEXT_PKG_DIR="${VINEXT_PKG_DIR:-${VINEXT_DIR}/packages/vinext}"
 VINEXT_PKG_DIR="$(cd "${VINEXT_PKG_DIR}" && pwd)"
 
@@ -200,6 +202,10 @@ const match =
   code.match(/get buildId\(\)\s*\{\s*return "([^"]+)"/) ||
   code.match(/\bbuildId\s*=\s*"([^"]+)"/)
 if (!match) {
+  if (process.env.VINEXT_FALLBACK_BUILD_ID) {
+    console.log(process.env.VINEXT_FALLBACK_BUILD_ID)
+    process.exit(0)
+  }
   console.error(`Failed to extract build ID from ${bundlePath}`)
   process.exit(1)
 }
@@ -294,18 +300,23 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const vinextDir = process.env.VINEXT_DIR
+const historicalHarness =
+  process.env.VINEXT_HARNESS_DIR &&
+  path.resolve(process.env.VINEXT_HARNESS_DIR) !== path.resolve(vinextDir)
 const pkgPath = path.join(process.cwd(), 'package.json')
 const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
 const rootPkg = JSON.parse(fs.readFileSync(path.join(vinextDir, 'package.json'), 'utf8'))
 const vinextPkg = JSON.parse(
   fs.readFileSync(path.join(vinextDir, 'packages', 'vinext', 'package.json'), 'utf8'),
 )
-const cloudflarePkg = JSON.parse(
-  fs.readFileSync(path.join(vinextDir, 'packages', 'cloudflare', 'package.json'), 'utf8'),
-)
-const typesPkg = JSON.parse(
-  fs.readFileSync(path.join(vinextDir, 'packages', 'types', 'package.json'), 'utf8'),
-)
+function readWorkspacePackage(name) {
+  const manifest = path.join(vinextDir, 'packages', name, 'package.json')
+  if (fs.existsSync(manifest)) return JSON.parse(fs.readFileSync(manifest, 'utf8'))
+  if (historicalHarness) return null
+  throw new Error(`Missing workspace package: ${manifest}`)
+}
+const cloudflarePkg = readWorkspacePackage('cloudflare')
+const typesPkg = readWorkspacePackage('types')
 const workspaceConfig = fs.readFileSync(
   path.join(vinextDir, 'pnpm-workspace.yaml'),
   'utf8',
@@ -366,11 +377,9 @@ const catalog = parseCatalog(workspaceConfig)
 const localVinextPkgDir = path.join(process.cwd(), '.vinext-local-package')
 const localCloudflarePkgDir = path.join(process.cwd(), '.vinext-local-cloudflare-package')
 const localTypesPkgDir = path.join(process.cwd(), '.vinext-local-types-package')
-const localWorkspacePackages = new Map([
-  [vinextPkg.name, localVinextPkgDir],
-  [cloudflarePkg.name, localCloudflarePkgDir],
-  [typesPkg.name, localTypesPkgDir],
-])
+const localWorkspacePackages = new Map([[vinextPkg.name, localVinextPkgDir]])
+if (cloudflarePkg) localWorkspacePackages.set(cloudflarePkg.name, localCloudflarePkgDir)
+if (typesPkg) localWorkspacePackages.set(typesPkg.name, localTypesPkgDir)
 
 function workspaceDependencySpecFor(name, fromPackageDir) {
   const targetPackageDir = localWorkspacePackages.get(name)
@@ -388,7 +397,22 @@ function manifestDependencySpecFor(name, spec, fromPackageDir) {
   throw new Error(`Unable to resolve dependency spec for ${name}`)
 }
 
+const reactRuntimePackages = new Set(['react', 'react-dom', 'react-server-dom-webpack'])
+
 function dependencySpecFor(name) {
+  // Deploy fixtures have no lockfile, so open peer ranges can silently mix
+  // incompatible React releases between nightly runs. Reuse the exact trio
+  // that built vinext in the already-frozen workspace install.
+  if (reactRuntimePackages.has(name)) {
+    for (const parent of [path.join(vinextDir, 'packages', 'vinext'), vinextDir]) {
+      const manifestPath = path.join(parent, 'node_modules', name, 'package.json')
+      if (fs.existsSync(manifestPath)) {
+        return JSON.parse(fs.readFileSync(manifestPath, 'utf8')).version
+      }
+    }
+    throw new Error(`Unable to find installed ${name} version`)
+  }
+
   for (const deps of [
     vinextPkg.peerDependencies,
     vinextPkg.dependencies,
@@ -406,6 +430,21 @@ function dependencySpecFor(name) {
   throw new Error(`Unable to resolve dependency spec for ${name}`)
 }
 
+function historicalDependencySpecFor(name) {
+  const declared = [
+    vinextPkg.peerDependencies,
+    vinextPkg.dependencies,
+    vinextPkg.devDependencies,
+    rootPkg.dependencies,
+    rootPkg.devDependencies,
+  ].some((dependencies) => dependencies?.[name]) || catalog[name]
+  if (historicalHarness && !declared) {
+    console.log(`Skipped ${name}; it was not part of the historical vinext workspace`)
+    return null
+  }
+  return dependencySpecFor(name)
+}
+
 function resolveManifestDeps(deps, packageDir) {
   if (!deps) return undefined
 
@@ -421,63 +460,65 @@ fs.rmSync(localVinextPkgDir, { recursive: true, force: true })
 fs.rmSync(localCloudflarePkgDir, { recursive: true, force: true })
 fs.rmSync(localTypesPkgDir, { recursive: true, force: true })
 fs.mkdirSync(localVinextPkgDir, { recursive: true })
-fs.mkdirSync(localCloudflarePkgDir, { recursive: true })
-fs.mkdirSync(localTypesPkgDir, { recursive: true })
-fs.cpSync(
-  path.join(vinextDir, 'packages', 'cloudflare', 'dist'),
-  path.join(localCloudflarePkgDir, 'dist'),
-  {
-    recursive: true,
-  },
-)
-fs.writeFileSync(
-  path.join(localCloudflarePkgDir, 'package.json'),
-  JSON.stringify(
-    {
-      name: cloudflarePkg.name,
-      version: cloudflarePkg.version,
-      description: cloudflarePkg.description,
-      license: cloudflarePkg.license,
-      repository: cloudflarePkg.repository,
-      type: cloudflarePkg.type,
-      files: ['dist'],
-      exports: cloudflarePkg.exports,
-      peerDependencies: resolveManifestDeps(cloudflarePkg.peerDependencies, localCloudflarePkgDir),
-      engines: cloudflarePkg.engines,
-    },
-    null,
-    2,
-  ) + '\n',
-)
-for (const entry of typesPkg.files ?? []) {
-  const source = path.join(vinextDir, 'packages', 'types', entry)
-  if (!fs.existsSync(source)) {
-    throw new Error(`Missing @vinext/types package file: ${source}`)
-  }
-  fs.cpSync(source, path.join(localTypesPkgDir, entry), { recursive: true })
+if (cloudflarePkg) {
+  fs.mkdirSync(localCloudflarePkgDir, { recursive: true })
+  fs.cpSync(
+    path.join(vinextDir, 'packages', 'cloudflare', 'dist'),
+    path.join(localCloudflarePkgDir, 'dist'),
+    { recursive: true },
+  )
+  fs.writeFileSync(
+    path.join(localCloudflarePkgDir, 'package.json'),
+    JSON.stringify(
+      {
+        name: cloudflarePkg.name,
+        version: cloudflarePkg.version,
+        description: cloudflarePkg.description,
+        license: cloudflarePkg.license,
+        repository: cloudflarePkg.repository,
+        type: cloudflarePkg.type,
+        files: ['dist'],
+        exports: cloudflarePkg.exports,
+        peerDependencies: resolveManifestDeps(cloudflarePkg.peerDependencies, localCloudflarePkgDir),
+        engines: cloudflarePkg.engines,
+      },
+      null,
+      2,
+    ) + '\n',
+  )
 }
-fs.writeFileSync(
-  path.join(localTypesPkgDir, 'package.json'),
-  JSON.stringify(
-    {
-      name: typesPkg.name,
-      version: typesPkg.version,
-      description: typesPkg.description,
-      license: typesPkg.license,
-      repository: typesPkg.repository,
-      files: typesPkg.files,
-      type: typesPkg.type,
-      sideEffects: typesPkg.sideEffects,
-      exports: typesPkg.exports,
-      dependencies: resolveManifestDeps(typesPkg.dependencies, localTypesPkgDir),
-      peerDependencies: resolveManifestDeps(typesPkg.peerDependencies, localTypesPkgDir),
-      peerDependenciesMeta: typesPkg.peerDependenciesMeta,
-      engines: typesPkg.engines,
-    },
-    null,
-    2,
-  ) + '\n',
-)
+if (typesPkg) {
+  fs.mkdirSync(localTypesPkgDir, { recursive: true })
+  for (const entry of typesPkg.files ?? []) {
+    const source = path.join(vinextDir, 'packages', 'types', entry)
+    if (!fs.existsSync(source)) {
+      throw new Error(`Missing @vinext/types package file: ${source}`)
+    }
+    fs.cpSync(source, path.join(localTypesPkgDir, entry), { recursive: true })
+  }
+  fs.writeFileSync(
+    path.join(localTypesPkgDir, 'package.json'),
+    JSON.stringify(
+      {
+        name: typesPkg.name,
+        version: typesPkg.version,
+        description: typesPkg.description,
+        license: typesPkg.license,
+        repository: typesPkg.repository,
+        files: typesPkg.files,
+        type: typesPkg.type,
+        sideEffects: typesPkg.sideEffects,
+        exports: typesPkg.exports,
+        dependencies: resolveManifestDeps(typesPkg.dependencies, localTypesPkgDir),
+        peerDependencies: resolveManifestDeps(typesPkg.peerDependencies, localTypesPkgDir),
+        peerDependenciesMeta: typesPkg.peerDependenciesMeta,
+        engines: typesPkg.engines,
+      },
+      null,
+      2,
+    ) + '\n',
+  )
+}
 fs.cpSync(path.join(vinextDir, 'packages', 'vinext', 'dist'), path.join(localVinextPkgDir, 'dist'), {
   recursive: true,
 })
@@ -509,29 +550,11 @@ fs.writeFileSync(
 pkg.devDependencies = pkg.devDependencies || {}
 pkg.devDependencies.vinext = 'file:.vinext-local-package'
 
-// App Router fixtures need React to satisfy the same peer range as the
-// injected react-server-dom-webpack. If they install an older React pair first,
-// `vinext build` runs its RSC compatibility upgrade and pays for a second
-// package-manager install inside every throwaway test app. Normalize the temp
-// manifest before the first install so the final dependency graph is unchanged
-// but setup is single-pass.
+// App Router fixtures need the same React trio that built vinext. Pinning the
+// throwaway manifest keeps nightly results tied to the frozen workspace install
+// and avoids a second compatibility install during `vinext build`.
 function hasAppRouterDir(root) {
   return fs.existsSync(path.join(root, 'app')) || fs.existsSync(path.join(root, 'src', 'app'))
-}
-
-function compareSemver(a, b) {
-  for (let index = 0; index < 3; index += 1) {
-    if (a[index] < b[index]) return -1
-    if (a[index] > b[index]) return 1
-  }
-
-  return 0
-}
-
-function parseSemverSpec(spec) {
-  const match = /(\d+)\.(\d+)\.(\d+)/.exec(spec)
-  if (!match) return null
-  return [Number(match[1]), Number(match[2]), Number(match[3])]
 }
 
 function dependencyBucketFor(name) {
@@ -545,25 +568,18 @@ function dependencyBucketFor(name) {
 function normalizeAppRouterReactDeps() {
   if (!hasAppRouterDir(process.cwd())) return
 
-  for (const dep of ['react', 'react-dom']) {
-    const bucket = dependencyBucketFor(dep)
-    if (!bucket) continue
-
+  for (const dep of reactRuntimePackages) {
+    const bucket = dependencyBucketFor(dep) || 'devDependencies'
     const current = pkg[bucket][dep]
-    const version = parseSemverSpec(current)
     const replacement = dependencySpecFor(dep)
-    const minimumVersion = parseSemverSpec(replacement)
-    if (!minimumVersion) continue
-    if (!version || compareSemver(version, minimumVersion) >= 0) continue
+    if (current === replacement) continue
 
     pkg[bucket][dep] = replacement
     console.log(
-      `Bumped ${bucket}.${dep} from ${current} to ${replacement} for RSC compatibility`,
+      `Pinned ${bucket}.${dep} from ${current || '(missing)'} to ${replacement} for RSC compatibility`,
     )
   }
 }
-
-normalizeAppRouterReactDeps()
 
 // Catalog-tracked deps: spec sourced from vinext or workspace root package.json.
 // Includes the Vite/RSC peers that vinext consumers must install, plus runtime
@@ -581,9 +597,12 @@ for (const dep of [
   'ipaddr.js',
 ]) {
   if (!pkg.devDependencies[dep] && !pkg.dependencies?.[dep]) {
-    pkg.devDependencies[dep] = dependencySpecFor(dep)
+    const spec = historicalDependencySpecFor(dep)
+    if (spec) pkg.devDependencies[dep] = spec
   }
 }
+
+normalizeAppRouterReactDeps()
 
 // Some Next.js scss test fixtures pin sass to an old version (e.g. 1.54.0)
 // that predates `sass.initAsyncCompiler`. Vite 8's built-in vite:css preprocessor
@@ -702,7 +721,7 @@ run_pnpm install --strict-peer-dependencies=false --no-frozen-lockfile > "${INST
 # transitive dependencies, not the application under test. Keep the rest of
 # the install output available for diagnostics without polluting cliOutput
 # assertions that specifically inspect application deprecation warnings.
-"${VINEXT_DIR}/scripts/filter-e2e-install-log.sh" < "${INSTALL_LOG}" >> "${BUILD_LOG}"
+"${VINEXT_HARNESS_DIR}/scripts/filter-e2e-install-log.sh" < "${INSTALL_LOG}" >> "${BUILD_LOG}"
 rm -f "${INSTALL_LOG}"
 if [ ! -d "node_modules/vinext" ]; then
   echo "pnpm install failed: node_modules/vinext not found" >&2

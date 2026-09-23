@@ -183,8 +183,6 @@ import {
 } from "../client/app-nav-failure-handler.js";
 import { createClientReuseManifestHeaderFromVisibleAppState } from "./app-browser-client-reuse-manifest.js";
 import {
-  canonicalizePrewarmableRscRequestHeaders,
-  createCanonicalRscRequestUrl,
   createRscRequestHeaders,
   createRscRequestUrl,
   getVinextRscCompatibilityId,
@@ -1297,6 +1295,7 @@ function BrowserRoot({
   // avoid a stale-read window between commit and layout effects. This mirrors
   // the same render-phase ref update pattern used by Next.js's own router.
   const stateRef = useRef(treeState);
+  // oxlint-disable-next-line react/refs -- navigation from child layout effects needs this render's state
   stateRef.current = treeState;
 
   // Publish the stable ref object and dispatch during layout commit. This keeps
@@ -1704,6 +1703,12 @@ function registerServerActionCallback(): void {
           performHardNavigation: (url, historyMode) =>
             browserNavigationController.performHardNavigation(url, historyMode),
           renderRedirectPayload(elements, target, actionInitiation, revalidation) {
+            // Action redirects bypass navigateClientSide. Reset the previous
+            // link's pending indicator when this action still owns navigation;
+            // a stale action must not clear a newer link's pending state.
+            if (browserNavigationController.isCurrentNavigation(actionInitiation.navigationId)) {
+              getNavigationRuntime()?.functions.notifyLinkNavigationStart?.();
+            }
             const hashIdx = target.href.indexOf("#");
             const hash = hashIdx !== -1 ? target.href.slice(hashIdx) : "";
             const actionScrollIntent = beginAppRouterScrollIntent(hash || null);
@@ -2120,16 +2125,6 @@ function bootstrapHydration(
           navigationKind,
           targetPathAndSearch,
         });
-        const canUseCanonicalSharedRequest =
-          !IS_STATIC_EXPORT &&
-          process.env.__VINEXT_CANONICAL_RSC_REQUESTS === "1" &&
-          navigationKind === "navigate" &&
-          settledPrefetchedResponse === null &&
-          requestInterceptionContext === null &&
-          mountedSlotsHeader === null &&
-          (rewrittenNavigationHref === null || rewrittenNavigationHref === currentHref);
-        const usesCanonicalPrewarmedRequest =
-          canUseCanonicalSharedRequest && canonicalizePrewarmableRscRequestHeaders(requestHeaders);
         const rscUrl = settledPrefetchedResponse
           ? resolvePrefetchNavigationResponseUrl({
               additionalRscUrls: additionalPrefetchPathAndSearch,
@@ -2137,9 +2132,7 @@ function bootstrapHydration(
               responseUrl: settledPrefetchedResponse.url,
               visibleRscUrl: targetPathAndSearch,
             })
-          : usesCanonicalPrewarmedRequest
-            ? createCanonicalRscRequestUrl(targetPathAndSearch)
-            : await createRscRequestUrl(targetPathAndSearch, requestHeaders);
+          : await createRscRequestUrl(targetPathAndSearch, requestHeaders);
         const additionalPrefetchRscUrls = settledPrefetchedResponse
           ? additionalPrefetchPathAndSearch
           : await Promise.all(
@@ -2429,7 +2422,7 @@ function bootstrapHydration(
           // paths did not satisfy the navigation and a real request is required.
           // Computed from the nav-start router state so it matches the snapshot
           // the request would have carried if produced earlier.
-          if (navigationKind === "navigate" && !usesCanonicalPrewarmedRequest) {
+          if (navigationKind === "navigate") {
             const clientReuseManifestHeader =
               createClientReuseManifestHeaderFromVisibleAppState(navigationInitiationState);
             if (clientReuseManifestHeader !== null) {
