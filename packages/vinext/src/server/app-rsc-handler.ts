@@ -1454,19 +1454,20 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     return composeResponseStageResponse(metadataRouteResponse);
   }
 
-  const publicFileResponse = filesystemRouteEligible
-    ? resolvePublicFileRoute({
-        cleanPathname,
-        middlewareContext,
-        pathname,
-        publicFiles: options.publicFiles,
-        request,
-      })
-    : null;
-  if (publicFileResponse) {
-    options.clearRequestContext();
-    return publicFileResponse;
-  }
+  const resolveFilesystemPublicFile = (): Response | null => {
+    const response = resolvePublicFileRoute({
+      cleanPathname,
+      middlewareContext,
+      pathname,
+      publicFiles: options.publicFiles,
+      request,
+    });
+    if (response) options.clearRequestContext();
+    return response;
+  };
+
+  const publicFileResponse = filesystemRouteEligible ? resolveFilesystemPublicFile() : null;
+  if (publicFileResponse) return publicFileResponse;
 
   stripRscCacheBustingSearchParam(url);
   const resolved = new URL(resolvedUrl, url);
@@ -1990,6 +1991,10 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       if (rewrittenMetadataResponse) {
         return composeResponseStageResponse(rewrittenMetadataResponse);
       }
+      // Next.js checks the filesystem again after afterFiles and fallback
+      // rewrites, so a destination that is a public file is served as one.
+      const rewrittenPublicFileResponse = resolveFilesystemPublicFile();
+      if (rewrittenPublicFileResponse) return rewrittenPublicFileResponse;
       match = matchCleanPathname();
       const rewrittenStaticPagesResponse = await renderPagesForMatchKind("static");
       if (rewrittenStaticPagesResponse) {
@@ -2049,6 +2054,10 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       if (rewrittenMetadataResponse) {
         return composeResponseStageResponse(rewrittenMetadataResponse);
       }
+      // Next.js checks the filesystem again after afterFiles and fallback
+      // rewrites, so a destination that is a public file is served as one.
+      const rewrittenPublicFileResponse = resolveFilesystemPublicFile();
+      if (rewrittenPublicFileResponse) return rewrittenPublicFileResponse;
       match = matchCleanPathname();
       const rewrittenStaticPagesResponse = await renderPagesForMatchKind("static");
       if (rewrittenStaticPagesResponse) {

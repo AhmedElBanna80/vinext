@@ -7470,6 +7470,60 @@ describe("createAppRscHandler", () => {
     expect(matchRoute).not.toHaveBeenCalled();
   });
 
+  // Ported from Next.js: test/e2e/i18n-ignore-rewrite-source-locale/rewrites.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/i18n-ignore-rewrite-source-locale/rewrites.test.ts
+  // Next.js re-checks the filesystem (public files first) after every afterFiles
+  // and fallback rewrite, not only for the original request path.
+  it.each(["afterFiles", "fallback"] as const)(
+    "serves public files reached through %s rewrites",
+    async (phase) => {
+      const clearRequestContext = vi.fn();
+      const rewrite = { source: "/alias/:path*", destination: "/:path*" };
+      const handler = createHandler({
+        clearRequestContext,
+        configHeaders: [],
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: phase === "afterFiles" ? [rewrite] : [],
+          fallback: phase === "fallback" ? [rewrite] : [],
+        },
+        matchRoute: () => null,
+        publicFiles: new Set(["/logo.svg"]),
+      });
+
+      const response = await handler(new Request("https://example.test/docs/alias/logo.svg"), null);
+
+      expect(response.status).toBe(200);
+      expect(readStaticFileSignal(response)).toBe("%2Flogo.svg");
+      expect(clearRequestContext).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["afterFiles", "fallback"] as const)(
+    "rejects non-GET requests to public files reached through %s rewrites",
+    async (phase) => {
+      const rewrite = { source: "/alias/:path*", destination: "/:path*" };
+      const handler = createHandler({
+        configHeaders: [],
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: phase === "afterFiles" ? [rewrite] : [],
+          fallback: phase === "fallback" ? [rewrite] : [],
+        },
+        matchRoute: () => null,
+        publicFiles: new Set(["/logo.svg"]),
+      });
+
+      const response = await handler(
+        new Request("https://example.test/docs/alias/logo.svg", { method: "DELETE" }),
+        null,
+      );
+
+      expect(response.status).toBe(405);
+      expect(readStaticFileSignal(response)).toBeNull();
+    },
+  );
+
   it.each([
     {
       name: "public files",
