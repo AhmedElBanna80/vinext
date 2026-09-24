@@ -7470,10 +7470,10 @@ describe("createAppRscHandler", () => {
     expect(matchRoute).not.toHaveBeenCalled();
   });
 
-  // Ported from Next.js: test/e2e/i18n-ignore-rewrite-source-locale/rewrites.test.ts
-  // https://github.com/vercel/next.js/blob/canary/test/e2e/i18n-ignore-rewrite-source-locale/rewrites.test.ts
-  // Next.js re-checks the filesystem (public files first) after every afterFiles
-  // and fallback rewrite, not only for the original request path.
+  // Next.js re-checks the filesystem (/_next/image, public files, then app
+  // routes) after every afterFiles and fallback rewrite, not only for the
+  // original request path:
+  // packages/next/src/server/lib/router-utils/resolve-routes.ts
   it.each(["afterFiles", "fallback"] as const)(
     "serves public files reached through %s rewrites",
     async (phase) => {
@@ -7521,6 +7521,165 @@ describe("createAppRscHandler", () => {
 
       expect(response.status).toBe(405);
       expect(readStaticFileSignal(response)).toBeNull();
+    },
+  );
+
+  it("falls through when an afterFiles rewrite destination is not a public file", async () => {
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [],
+        afterFiles: [{ source: "/alias/:path*", destination: "/:path*" }],
+        fallback: [],
+      },
+      matchRoute: () => null,
+      publicFiles: new Set(["/logo.svg"]),
+    });
+
+    const response = await handler(
+      new Request("https://example.test/docs/alias/missing.svg"),
+      null,
+    );
+
+    expect(response.status).toBe(404);
+    expect(readStaticFileSignal(response)).toBeNull();
+  });
+
+  it("keeps applying afterFiles rewrites until a destination is a public file", async () => {
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [],
+        afterFiles: [
+          { source: "/chain/:path*", destination: "/missing/:path*" },
+          { source: "/missing/:path*", destination: "/:path*" },
+        ],
+        fallback: [],
+      },
+      matchRoute: () => null,
+      publicFiles: new Set(["/logo.svg"]),
+    });
+
+    const response = await handler(new Request("https://example.test/docs/chain/logo.svg"), null);
+
+    expect(response.status).toBe(200);
+    expect(readStaticFileSignal(response)).toBe("%2Flogo.svg");
+  });
+
+  it("stops applying afterFiles rewrites once a destination is a public file", async () => {
+    const dispatchMatchedPage = vi.fn(async () => new Response("page"));
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [],
+        afterFiles: [
+          { source: "/alias/:path*", destination: "/:path*" },
+          { source: "/logo.svg", destination: "/about" },
+        ],
+        fallback: [],
+      },
+      dispatchMatchedPage,
+      publicFiles: new Set(["/logo.svg"]),
+    });
+
+    const response = await handler(new Request("https://example.test/docs/alias/logo.svg"), null);
+
+    expect(response.status).toBe(200);
+    expect(readStaticFileSignal(response)).toBe("%2Flogo.svg");
+    expect(dispatchMatchedPage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "the request query",
+      rewrite: { source: "/img-alias", destination: "/_next/image" },
+      path: "/docs/img-alias?url=%2Fimg.jpg&w=640&q=75",
+      location: "https://example.test/img.jpg",
+    },
+    {
+      name: "the rewrite destination query",
+      rewrite: { source: "/hero", destination: "/_next/image?url=%2Fhero.jpg&w=640&q=75" },
+      path: "/docs/hero",
+      location: "https://example.test/hero.jpg",
+    },
+  ])(
+    "handles image optimization reached through afterFiles rewrites with $name",
+    async ({ rewrite, path, location }) => {
+      const handler = createHandler({
+        configHeaders: [],
+        configRewrites: { beforeFiles: [], afterFiles: [rewrite], fallback: [] },
+        matchRoute: () => null,
+      });
+
+      const response = await handler(new Request(`https://example.test${path}`), null);
+
+      expect(response.status).toBe(302);
+      expect(response.headers.get("location")).toBe(location);
+    },
+  );
+
+  it.each([
+    { name: "the request path", path: "/docs/favicon.ico", rewrites: [] },
+    {
+      name: "an afterFiles rewrite",
+      path: "/docs/icon-alias",
+      rewrites: [{ source: "/icon-alias", destination: "/favicon.ico" }],
+    },
+  ])("checks public files before metadata routes for $name", async ({ path, rewrites }) => {
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: { beforeFiles: [], afterFiles: rewrites, fallback: [] },
+      matchRoute: () => null,
+      metadataRoutes: [
+        {
+          type: "favicon",
+          isDynamic: false,
+          filePath: "/tmp/app/favicon.ico",
+          routePrefix: "",
+          routeSegments: [],
+          servedUrl: "/favicon.ico",
+          contentType: "image/x-icon",
+          fileDataBase64: btoa("icon-bytes"),
+        },
+      ],
+      publicFiles: new Set(["/favicon.ico"]),
+    });
+
+    const response = await handler(new Request(`https://example.test${path}`), null);
+
+    expect(response.status).toBe(200);
+    expect(readStaticFileSignal(response)).toBe("%2Ffavicon.ico");
+  });
+
+  it.each(["afterFiles", "fallback"] as const)(
+    "stops out-of-basePath Server Action %s rewrites at public files",
+    async (phase) => {
+      const handleServerActionRequest = vi.fn(async () => new Response("action"));
+      const rewrites = [
+        { source: "/outside/:path*", destination: "/:path*", basePath: false as const },
+        { source: "/:path*", destination: "/about", basePath: false as const },
+      ];
+      const handler = createHandler({
+        configHeaders: [],
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: phase === "afterFiles" ? rewrites : [],
+          fallback: phase === "fallback" ? rewrites : [],
+        },
+        handleServerActionRequest,
+        publicFiles: new Set(["/logo.svg"]),
+      });
+
+      const response = await handler(
+        new Request("https://example.test/outside/logo.svg", {
+          method: "POST",
+          headers: { "next-action": "action-id", "content-type": "text/plain" },
+        }),
+        null,
+      );
+
+      expect(response.status).toBe(405);
+      expect(handleServerActionRequest).not.toHaveBeenCalled();
     },
   );
 
