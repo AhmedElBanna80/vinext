@@ -48,7 +48,6 @@ import {
 import {
   createStaticAssetRequest,
   finalizeMissingStaticAssetResponse,
-  resolveImageOptimizationSignal,
   resolveStaticAssetSignal,
 } from "./worker-utils.js";
 import {
@@ -295,21 +294,6 @@ async function handleRequest(
           Promise.resolve(assetFetcher.fetch(createStaticAssetRequest(path, request))),
       });
       if (assetResponse) response = assetResponse;
-      // Rewritten image paths use the same optimizer gate as direct requests.
-      const imageResponse = getImageOptimizer()
-        ? await resolveImageOptimizationSignal(response, request, (imageRequest) =>
-            handleConfiguredImageOptimization(
-              imageRequest,
-              (assetPath) =>
-                Promise.resolve(
-                  assetFetcher.fetch(new Request(new URL(assetPath, imageRequest.url))),
-                ),
-              __rscImageAllowedWidths,
-              __rscImageConfig,
-            ),
-          )
-        : null;
-      if (imageResponse) response = imageResponse;
     }
     response = finalizeMissingStaticAssetResponse(response, missingBuildAsset);
     return finalizeCacheabilityResponse ? finalizeCacheabilityResponse(response, ctx) : response;

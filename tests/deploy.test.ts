@@ -66,11 +66,9 @@ import {
   createStaticAssetRequest,
   finalizeMissingStaticAssetResponse,
   mergeHeaders,
-  resolveImageOptimizationSignal,
   resolveStaticAssetSignal,
 } from "../packages/vinext/src/server/worker-utils.js";
 import { createStaticFileSignal } from "../packages/vinext/src/server/request-pipeline.js";
-import { createImageOptimizationSignal } from "../packages/vinext/src/server/static-file-signal.js";
 import { domainCandidates, parseWranglerConfig } from "../packages/cloudflare/src/tpr.js";
 import {
   parseCdnWarmupDeploymentUrl,
@@ -2030,48 +2028,6 @@ describe("readPagesRouterEntrySource", () => {
     expect(resolved!.headers.get("x-vinext-static-file")).toBe("/application-value.txt");
     expect(resolved!.headers.get("x-asset-path")).toBe("/logo/logo.svg");
     expect(await resolved!.text()).toBe("<svg />");
-  });
-
-  it("resolveImageOptimizationSignal optimizes the signalled image query", async () => {
-    const signalResponse = createImageOptimizationSignal(
-      Response.redirect("https://example.com/hero.jpg", 302),
-      "?url=%2Fhero.jpg&w=640&q=75",
-    );
-    const sourceRequest = new Request("https://example.com/docs/hero?ignored=1", {
-      headers: { accept: "image/avif" },
-      method: "HEAD",
-    });
-    let imageRequest: Request | undefined;
-
-    const resolved = await resolveImageOptimizationSignal(
-      signalResponse,
-      sourceRequest,
-      async (request) => {
-        imageRequest = request;
-        return new Response("optimized");
-      },
-    );
-
-    await expect(resolved!.text()).resolves.toBe("optimized");
-    expect(imageRequest!.url).toBe("https://example.com/docs/hero?url=%2Fhero.jpg&w=640&q=75");
-    expect(imageRequest!.method).toBe("HEAD");
-    expect(imageRequest!.headers.get("accept")).toBe("image/avif");
-  });
-
-  it("resolveImageOptimizationSignal ignores unmarked responses", async () => {
-    let optimized = false;
-
-    const resolved = await resolveImageOptimizationSignal(
-      Response.redirect("https://example.com/hero.jpg", 302),
-      new Request("https://example.com/docs/hero"),
-      async () => {
-        optimized = true;
-        return new Response("optimized");
-      },
-    );
-
-    expect(resolved).toBeNull();
-    expect(optimized).toBe(false);
   });
 
   it("does not trust an unmarked response carrying a forged static-file header", async () => {

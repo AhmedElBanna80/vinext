@@ -43,10 +43,7 @@ async function assertPublicFile(baseUrl: string, pathname: string): Promise<void
   await expect(response.text(), pathname).resolves.toContain("hello from file.txt");
 }
 
-function definePublicRewriteTests(
-  getBaseUrl: () => string,
-  assertRewrittenImage: (response: Response) => Promise<void>,
-): void {
+function definePublicRewriteTests(getBaseUrl: () => string): void {
   it("serves public files reached through beforeFiles, afterFiles, and fallback rewrites", async () => {
     await assertPublicFile(getBaseUrl(), "/before-files/file.txt");
     await assertPublicFile(getBaseUrl(), "/after-files/file.txt");
@@ -67,10 +64,6 @@ function definePublicRewriteTests(
     expect(response.status).toBe(405);
     expect(response.headers.get("allow")).toBe("GET, HEAD");
   });
-
-  it("handles image optimization reached through an afterFiles rewrite", async () => {
-    await assertRewrittenImage(await fetch(`${getBaseUrl()}/img-alias`, { redirect: "manual" }));
-  });
 }
 
 // Next.js checks the filesystem (public files first) after beforeFiles and
@@ -89,14 +82,7 @@ describe("App Router public files reached through rewrites", () => {
       await server?.close();
     });
 
-    // Dev has no optimizer and redirects to the original image, like /_next/image.
-    definePublicRewriteTests(
-      () => baseUrl,
-      async (response) => {
-        expect(response.status).toBe(302);
-        expect(new URL(response.headers.get("location")!, baseUrl).pathname).toBe("/pixel.png");
-      },
-    );
+    definePublicRewriteTests(() => baseUrl);
   });
 
   describe("production", () => {
@@ -113,15 +99,6 @@ describe("App Router public files reached through rewrites", () => {
       if (tmpDir) await fsp.rm(tmpDir, { recursive: true, force: true });
     });
 
-    // The Node production server serves the original image with security headers.
-    definePublicRewriteTests(
-      () => baseUrl,
-      async (response) => {
-        expect(response.status).toBe(200);
-        expect(response.headers.get("content-type")).toBe("image/png");
-        expect(response.headers.get("content-security-policy")).toContain("sandbox");
-        expect(response.headers.get("x-content-type-options")).toBe("nosniff");
-      },
-    );
+    definePublicRewriteTests(() => baseUrl);
   });
 });

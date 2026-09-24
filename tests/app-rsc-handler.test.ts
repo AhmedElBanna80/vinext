@@ -52,10 +52,7 @@ import {
   getHeadersContext,
   headers as requestHeaders,
 } from "../packages/vinext/src/shims/headers.js";
-import {
-  readImageOptimizationSignal,
-  readStaticFileSignal,
-} from "../packages/vinext/src/server/static-file-signal.js";
+import { readStaticFileSignal } from "../packages/vinext/src/server/static-file-signal.js";
 import {
   runWithExecutionContext,
   type ExecutionContextLike,
@@ -7473,9 +7470,9 @@ describe("createAppRscHandler", () => {
     expect(matchRoute).not.toHaveBeenCalled();
   });
 
-  // Next.js re-checks the filesystem (/_next/image, public files, then app
-  // routes) after every afterFiles and fallback rewrite, not only for the
-  // original request path:
+  // Next.js re-checks the filesystem (public files, then app routes) after
+  // every afterFiles and fallback rewrite, not only for the original request
+  // path:
   // packages/next/src/server/lib/router-utils/resolve-routes.ts
   it.each(["afterFiles", "fallback"] as const)(
     "serves public files reached through %s rewrites",
@@ -7591,39 +7588,6 @@ describe("createAppRscHandler", () => {
     expect(readStaticFileSignal(response)).toBe("%2Flogo.svg");
     expect(dispatchMatchedPage).not.toHaveBeenCalled();
   });
-
-  it.each([
-    {
-      name: "the request query",
-      rewrite: { source: "/img-alias", destination: "/_next/image" },
-      path: "/docs/img-alias?url=%2Fimg.jpg&w=640&q=75",
-      location: "https://example.test/img.jpg",
-      search: "?url=%2Fimg.jpg&w=640&q=75",
-    },
-    {
-      name: "the rewrite destination query",
-      rewrite: { source: "/hero", destination: "/_next/image?url=%2Fhero.jpg&w=640&q=75" },
-      path: "/docs/hero",
-      location: "https://example.test/hero.jpg",
-      search: "?url=%2Fhero.jpg&w=640&q=75",
-    },
-  ])(
-    "handles image optimization reached through afterFiles rewrites with $name",
-    async ({ rewrite, path, location, search }) => {
-      const handler = createHandler({
-        configHeaders: [],
-        configRewrites: { beforeFiles: [], afterFiles: [rewrite], fallback: [] },
-        matchRoute: () => null,
-      });
-
-      const response = await handler(new Request(`https://example.test${path}`), null);
-
-      expect(response.status).toBe(302);
-      expect(response.headers.get("location")).toBe(location);
-      // Hosts with an image optimizer replace the unoptimized redirect.
-      expect(readImageOptimizationSignal(response)).toBe(search);
-    },
-  );
 
   it.each([
     { name: "the request path", path: "/docs/favicon.ico", rewrites: [] },

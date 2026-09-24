@@ -42,8 +42,6 @@ import {
 } from "../packages/vinext/src/utils/middleware-request-headers.js";
 import { withResponseStageVary } from "../packages/vinext/src/server/response-stage-policy.js";
 import {
-  createImageOptimizationSignal,
-  readImageOptimizationSignal,
   readStaticFileSignal,
   restoreStaticFileSignalFromTransport,
   serializeStaticFileSignalForTransport,
@@ -482,39 +480,6 @@ describe("resolvePublicFileRoute", () => {
     expect(forged.headers.get("x-vinext-stage-static-file")).toBeNull();
     expect(readStaticFileSignal(forged)).toBeNull();
     await expect(forged.text()).resolves.toBe("route handler");
-  });
-
-  it("authenticates image optimization signals across standards-only transports", async () => {
-    const token = "request-stage-token";
-    const serialized = serializeStaticFileSignalForTransport(
-      createImageOptimizationSignal(
-        Response.redirect("https://example.com/hero.jpg", 302),
-        "?url=%2Fhero.jpg&w=640&q=75",
-      ),
-      token,
-    );
-    const transported = new Response(serialized.body, serialized);
-    const restored = restoreStaticFileSignalFromTransport(transported, token);
-
-    expect(restored.status).toBe(302);
-    expect(restored.headers.get("location")).toBe("https://example.com/hero.jpg");
-    expect(restored.headers.get("x-vinext-stage-image-optimization")).toBeNull();
-    expect(readImageOptimizationSignal(restored)).toBe("?url=%2Fhero.jpg&w=640&q=75");
-
-    for (const [headerToken, search] of [
-      ["different-token", "?url=%2Fhero.jpg"],
-      [token, "url=%2Fhero.jpg"],
-    ]) {
-      const forged = restoreStaticFileSignalFromTransport(
-        new Response("route handler", {
-          headers: { "x-vinext-stage-image-optimization": `${headerToken}:${search}` },
-        }),
-        token,
-      );
-      expect(forged.headers.get("x-vinext-stage-image-optimization")).toBeNull();
-      expect(readImageOptimizationSignal(forged)).toBeNull();
-      await expect(forged.text()).resolves.toBe("route handler");
-    }
   });
 });
 

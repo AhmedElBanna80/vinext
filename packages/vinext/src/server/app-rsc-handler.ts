@@ -10,7 +10,6 @@ import { normalizePathnameForRouteMatchStrict } from "../routing/utils.js";
 import { patternToNextFormat } from "../routing/route-validation.js";
 import { traceFindPageComponents } from "./pages-execution-tracing.js";
 import { resolveDevStaticFileSignal } from "./dev-static-file-signal.js";
-import { createImageOptimizationSignal } from "./static-file-signal.js";
 import { isExternalUrl } from "../utils/external-url.js";
 import {
   getEffectiveRequestCookieHeader,
@@ -1367,33 +1366,11 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   const contentType = request.headers.get("content-type") || "";
   const isProgressiveActionRequest =
     isPostRequest && !actionId && contentType.startsWith("multipart/form-data");
-  // Next.js checks the filesystem in order: /_next/image, public files, then
-  // app routes (metadata routes are app routes). It repeats the check after
-  // every afterFiles and fallback rewrite:
+  // Next.js checks public files before app routes (metadata routes are app
+  // routes). It repeats the check after every afterFiles and fallback rewrite:
   // packages/next/src/server/lib/router-utils/resolve-routes.ts
   const resolveFilesystemRoute = async (): Promise<Response | null> => {
     if (!filesystemRouteEligible) return null;
-    if (isImageOptimizationPath(cleanPathname)) {
-      // Rewrites may supply the image parameters, so read the resolved query.
-      const imageUrl = new URL(resolvedUrl, url);
-      const imageRedirect = resolveDevImageRedirect(
-        imageUrl,
-        [
-          ...(options.imageConfig?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
-          ...(options.imageConfig?.imageSizes ?? DEFAULT_IMAGE_SIZES),
-        ],
-        options.imageConfig?.qualities,
-        { isDev: options.isDev },
-      );
-      if (!imageRedirect)
-        return new Response("Invalid image optimization parameters", { status: 400 });
-      // Hosts only dispatch their image optimizer for an original /_next/image
-      // pathname. Hosts with an optimizer replace this unoptimized redirect.
-      return createImageOptimizationSignal(
-        Response.redirect(new URL(imageRedirect, url.origin).href, 302),
-        imageUrl.search,
-      );
-    }
     const publicFileResponse = resolvePublicFileRoute({
       cleanPathname,
       middlewareContext,
@@ -1485,6 +1462,21 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
 
   const lateActionRscCacheBustingRedirect = await validateClaimedOutsideBasePathRsc();
   if (lateActionRscCacheBustingRedirect) return lateActionRscCacheBustingRedirect;
+
+  if (filesystemRouteEligible && isImageOptimizationPath(cleanPathname)) {
+    const imageRedirect = resolveDevImageRedirect(
+      url,
+      [
+        ...(options.imageConfig?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
+        ...(options.imageConfig?.imageSizes ?? DEFAULT_IMAGE_SIZES),
+      ],
+      options.imageConfig?.qualities,
+      { isDev: options.isDev },
+    );
+    if (!imageRedirect)
+      return new Response("Invalid image optimization parameters", { status: 400 });
+    return Response.redirect(new URL(imageRedirect, url.origin).href, 302);
+  }
 
   const filesystemRouteResponse = await resolveFilesystemRoute();
   if (filesystemRouteResponse) return filesystemRouteResponse;

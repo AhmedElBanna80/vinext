@@ -5,7 +5,7 @@
  * Router worker entry through "vinext/server/worker-utils".
  */
 import { notFoundStaticAssetResponse } from "./http-error-responses.js";
-import { readImageOptimizationSignal, readStaticFileSignal } from "./static-file-signal.js";
+import { readStaticFileSignal } from "./static-file-signal.js";
 
 /**
  * Merge middleware/config headers into a response.
@@ -155,29 +155,6 @@ export async function resolveStaticAssetSignal(
       ? signalResponse.status
       : undefined;
   return mergeHeaders(assetResponse, extraHeaders, statusOverride);
-}
-
-/**
- * Run a host image optimizer for an image path the App Router reached through
- * a rewrite. Returns null when the response is not an image optimization signal.
- */
-export async function resolveImageOptimizationSignal(
-  signalResponse: Response,
-  sourceRequest: Request,
-  optimize: (imageRequest: Request) => Promise<Response>,
-): Promise<Response | null> {
-  const search = readImageOptimizationSignal(signalResponse);
-  if (search === null) return null;
-
-  cancelResponseBody(signalResponse);
-  const imageUrl = new URL(sourceRequest.url);
-  imageUrl.search = search;
-  return optimize(
-    new Request(imageUrl, {
-      headers: sourceRequest.headers,
-      method: sourceRequest.method === "HEAD" ? "HEAD" : "GET",
-    }),
-  );
 }
 
 /** Retarget a Worker asset request without dropping its conditional/range fields. */
