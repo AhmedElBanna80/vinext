@@ -17,6 +17,8 @@ beforeAll(async () => {
   await fsp.writeFile(path.join(publicDir, "..dotted.txt"), "dotted");
   await fsp.writeFile(path.join(publicDir, "script.ts"), "export {};");
   await fsp.writeFile(path.join(publicDir, "page.html"), "<p>hi</p>");
+  await fsp.writeFile(path.join(publicDir, "hello copy.txt"), "spaced");
+  await fsp.writeFile(path.join(publicDir, "logo%2Fdark.txt"), "percent");
   await fsp.mkdir(path.join(publicDir, "dir"));
   await fsp.writeFile(path.join(path.dirname(publicDir), "outside.txt"), "outside");
 });
@@ -68,6 +70,16 @@ describe("serveDevPublicFile", () => {
 
     expect(response.status).toBe(200);
     await expect(response.text()).resolves.toBe("dotted");
+  });
+
+  it.each([
+    ["/hello%20copy.txt", "spaced"],
+    ["/logo%252Fdark.txt", "percent"],
+  ])("decodes the encoded route %s once like Vite", async (pathname, body) => {
+    const response = await serveDevPublicFile(publicDir, pathname, request());
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe(body);
   });
 
   it("omits the body for HEAD requests", async () => {
@@ -123,7 +135,7 @@ describe("serveDevPublicFile", () => {
     expect(response.headers.get("content-range")).toBe("bytes */19");
   });
 
-  it.each(["/missing.txt", "/dir", "/../outside.txt", "/.."])(
+  it.each(["/missing.txt", "/dir", "/../outside.txt", "/..", "/%E0%A4%A.txt"])(
     "returns 404 for %s",
     async (pathname) => {
       const response = await serveDevPublicFile(publicDir, pathname, request());

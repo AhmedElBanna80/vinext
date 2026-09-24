@@ -45,8 +45,16 @@ export async function serveDevPublicFile(
   request: Request,
   configuredHeaders?: OutgoingHttpHeaders,
 ): Promise<Response> {
+  // Public-file routes are URL-encoded; sirv decodes them once with decodeURI
+  // and keeps the raw pathname when it is malformed.
+  let filePathname = pathname;
+  if (filePathname.includes("%")) {
+    try {
+      filePathname = decodeURI(filePathname);
+    } catch {}
+  }
   const root = path.resolve(publicDir);
-  const filePath = path.resolve(root, `.${pathname}`);
+  const filePath = path.resolve(root, `.${filePathname}`);
   const relativePath = path.relative(root, filePath);
   if (
     !relativePath ||
