@@ -52,7 +52,10 @@ import {
   getHeadersContext,
   headers as requestHeaders,
 } from "../packages/vinext/src/shims/headers.js";
-import { readStaticFileSignal } from "../packages/vinext/src/server/static-file-signal.js";
+import {
+  readImageOptimizationSignal,
+  readStaticFileSignal,
+} from "../packages/vinext/src/server/static-file-signal.js";
 import {
   runWithExecutionContext,
   type ExecutionContextLike,
@@ -7595,16 +7598,18 @@ describe("createAppRscHandler", () => {
       rewrite: { source: "/img-alias", destination: "/_next/image" },
       path: "/docs/img-alias?url=%2Fimg.jpg&w=640&q=75",
       location: "https://example.test/img.jpg",
+      search: "?url=%2Fimg.jpg&w=640&q=75",
     },
     {
       name: "the rewrite destination query",
       rewrite: { source: "/hero", destination: "/_next/image?url=%2Fhero.jpg&w=640&q=75" },
       path: "/docs/hero",
       location: "https://example.test/hero.jpg",
+      search: "?url=%2Fhero.jpg&w=640&q=75",
     },
   ])(
     "handles image optimization reached through afterFiles rewrites with $name",
-    async ({ rewrite, path, location }) => {
+    async ({ rewrite, path, location, search }) => {
       const handler = createHandler({
         configHeaders: [],
         configRewrites: { beforeFiles: [], afterFiles: [rewrite], fallback: [] },
@@ -7615,6 +7620,8 @@ describe("createAppRscHandler", () => {
 
       expect(response.status).toBe(302);
       expect(response.headers.get("location")).toBe(location);
+      // Hosts with an image optimizer replace the unoptimized redirect.
+      expect(readImageOptimizationSignal(response)).toBe(search);
     },
   );
 

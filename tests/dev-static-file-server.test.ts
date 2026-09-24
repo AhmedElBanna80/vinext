@@ -14,6 +14,9 @@ let publicDir: string;
 beforeAll(async () => {
   publicDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-dev-static-file-"));
   await fsp.writeFile(path.join(publicDir, "file.txt"), "hello from file.txt");
+  await fsp.writeFile(path.join(publicDir, "..dotted.txt"), "dotted");
+  await fsp.writeFile(path.join(publicDir, "script.ts"), "export {};");
+  await fsp.writeFile(path.join(publicDir, "page.html"), "<p>hi</p>");
   await fsp.mkdir(path.join(publicDir, "dir"));
   await fsp.writeFile(path.join(path.dirname(publicDir), "outside.txt"), "outside");
 });
@@ -32,11 +35,39 @@ describe("serveDevPublicFile", () => {
     const response = await serveDevPublicFile(publicDir, "/file.txt", request());
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(response.headers.get("content-type")).toBe("text/plain");
     expect(response.headers.get("content-length")).toBe("19");
     expect(response.headers.get("cache-control")).toBe("no-cache");
     expect(response.headers.get("etag")).toMatch(/^W\/"19-\d+"$/);
     await expect(response.text()).resolves.toBe("hello from file.txt");
+  });
+
+  it.each([
+    ["/script.ts", "text/javascript"],
+    ["/page.html", "text/html;charset=utf-8"],
+  ])("uses Vite's public-file content type for %s", async (pathname, contentType) => {
+    const response = await serveDevPublicFile(publicDir, pathname, request());
+
+    expect(response.headers.get("content-type")).toBe(contentType);
+  });
+
+  it("applies Vite server.headers over generated headers", async () => {
+    const response = await serveDevPublicFile(publicDir, "/file.txt", request(), {
+      "Cache-Control": "max-age=60",
+      "Content-Security-Policy": "default-src 'none'",
+      "X-Multi": ["a", "b"],
+    });
+
+    expect(response.headers.get("cache-control")).toBe("max-age=60");
+    expect(response.headers.get("content-security-policy")).toBe("default-src 'none'");
+    expect(response.headers.get("x-multi")).toBe("a, b");
+  });
+
+  it("serves in-root names that begin with two dots", async () => {
+    const response = await serveDevPublicFile(publicDir, "/..dotted.txt", request());
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe("dotted");
   });
 
   it("omits the body for HEAD requests", async () => {
@@ -71,6 +102,14 @@ describe("serveDevPublicFile", () => {
     expect(response.status).toBe(206);
     expect(response.headers.get("content-range")).toBe("bytes 0-4/19");
     await expect(response.text()).resolves.toBe("hello");
+
+    const suffix = await serveDevPublicFile(
+      publicDir,
+      "/file.txt",
+      request({ headers: { range: "bytes=-3" } }),
+    );
+    expect(suffix.headers.get("content-range")).toBe("bytes 16-18/19");
+    await expect(suffix.text()).resolves.toBe("txt");
   });
 
   it("rejects unsatisfiable byte ranges", async () => {
@@ -84,11 +123,14 @@ describe("serveDevPublicFile", () => {
     expect(response.headers.get("content-range")).toBe("bytes */19");
   });
 
-  it.each(["/missing.txt", "/dir", "/../outside.txt"])("returns 404 for %s", async (pathname) => {
-    const response = await serveDevPublicFile(publicDir, pathname, request());
+  it.each(["/missing.txt", "/dir", "/../outside.txt", "/.."])(
+    "returns 404 for %s",
+    async (pathname) => {
+      const response = await serveDevPublicFile(publicDir, pathname, request());
 
-    expect(response.status).toBe(404);
-  });
+      expect(response.status).toBe(404);
+    },
+  );
 });
 
 describe("resolveDevStaticFileSignal", () => {

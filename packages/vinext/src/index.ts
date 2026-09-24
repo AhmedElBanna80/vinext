@@ -5678,7 +5678,7 @@ export const loadServerActionClient = ${
           ) {
             const devStaticFileServerStorage = getDevStaticFileServerStorage();
             const serveStaticFile: DevStaticFileServer = (pathname, request) =>
-              serveDevPublicFile(devPublicDir, pathname, request);
+              serveDevPublicFile(devPublicDir, pathname, request, server.config.server.headers);
             server.middlewares.use((_req, _res, next) => {
               devStaticFileServerStorage.run(serveStaticFile, () => next());
             });

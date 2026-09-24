@@ -100,7 +100,7 @@ import { evaluateStaticPreconditions } from "./http-conditional.js";
 import { parseHttpDate } from "./http-date.js";
 import type { NextI18nConfig } from "../config/next-config.js";
 import { readTrustedRevalidationHostname } from "./revalidation-host.js";
-import { readStaticFileSignal } from "./static-file-signal.js";
+import { readImageOptimizationSignal, readStaticFileSignal } from "./static-file-signal.js";
 import { traceFrameworkRequest } from "./request-tracing.js";
 
 /**
@@ -1779,8 +1779,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
 
     // Image optimization passthrough (Node.js prod server has no Images binding;
     // serves the original file with cache headers and security headers)
-    if (isImageOptimizationPath(pathname)) {
-      const parsedUrl = new URL(rawUrl, "http://localhost");
+    const serveImageOptimization = async (parsedUrl: URL): Promise<void> => {
       const params = parseImageParams(parsedUrl, appImageAllowedWidths, imageConfig?.qualities);
       if (!params) {
         res.writeHead(400);
@@ -1818,6 +1817,9 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
       }
       res.writeHead(404);
       res.end("Image not found");
+    };
+    if (isImageOptimizationPath(pathname)) {
+      await serveImageOptimization(new URL(rawUrl, "http://localhost"));
       return;
     }
 
@@ -1848,6 +1850,16 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
           res,
           compress,
         );
+        return;
+      }
+
+      // Rewrites can reach /_next/image after the pathname check above.
+      const imageOptimizationSearch = readImageOptimizationSignal(response);
+      if (imageOptimizationSearch !== null) {
+        cancelResponseBody(response);
+        const imageUrl = new URL(rawUrl, "http://localhost");
+        imageUrl.search = imageOptimizationSearch;
+        await serveImageOptimization(imageUrl);
         return;
       }
 

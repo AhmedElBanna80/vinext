@@ -3,15 +3,19 @@
  *
  * See dev-static-file-signal.ts for the runner side. The response mirrors
  * Vite's dev public middleware (sirv in dev mode): weak size/mtime ETag,
- * `Cache-Control: no-cache`, conditional GETs, and single byte ranges.
+ * `Cache-Control: no-cache`, mrmime content types with Vite's JavaScript
+ * override, `server.headers`, conditional GETs, and single byte ranges.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
+import fs from "node:fs";
 import fsp from "node:fs/promises";
+import type { OutgoingHttpHeaders } from "node:http";
+import { Readable } from "node:stream";
+import { lookup as lookupMimeType } from "mrmime";
 import path from "pathslash";
 import { matchesIfNoneMatch } from "./http-conditional.js";
 import { ifRangeAllowsRange, parseByteRange, type ByteRange } from "./http-range.js";
 import { notFoundResponse } from "./http-error-responses.js";
-import { contentTypeForPath } from "./static-file-cache.js";
 import {
   DEV_STATIC_FILE_SERVER_STORAGE_KEY,
   type DevStaticFileServer,
@@ -26,15 +30,30 @@ export function getDevStaticFileServerStorage(): AsyncLocalStorage<DevStaticFile
   return storage;
 }
 
+// Vite serves public scripts, including TypeScript sources, as JavaScript.
+const KNOWN_JAVASCRIPT_EXTENSION_RE = /\.(?:[tj]sx?|[cm][tj]s)$/;
+
+function contentTypeForDevPublicFile(filePath: string): string | undefined {
+  if (KNOWN_JAVASCRIPT_EXTENSION_RE.test(filePath)) return "text/javascript";
+  const contentType = lookupMimeType(filePath);
+  return contentType === "text/html" ? `${contentType};charset=utf-8` : contentType;
+}
+
 export async function serveDevPublicFile(
   publicDir: string,
   pathname: string,
   request: Request,
+  configuredHeaders?: OutgoingHttpHeaders,
 ): Promise<Response> {
   const root = path.resolve(publicDir);
   const filePath = path.resolve(root, `.${pathname}`);
   const relativePath = path.relative(root, filePath);
-  if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+  if (
+    !relativePath ||
+    relativePath === ".." ||
+    relativePath.startsWith("../") ||
+    path.isAbsolute(relativePath)
+  ) {
     return notFoundResponse();
   }
 
@@ -50,10 +69,17 @@ export async function serveDevPublicFile(
   const headers = new Headers({
     "Accept-Ranges": "bytes",
     "Cache-Control": "no-cache",
-    "Content-Type": contentTypeForPath(filePath),
     ETag: etag,
     "Last-Modified": stat.mtime.toUTCString(),
   });
+  const contentType = contentTypeForDevPublicFile(filePath);
+  if (contentType) headers.set("Content-Type", contentType);
+  // Vite applies `server.headers` after sirv's own headers.
+  for (const [name, value] of Object.entries(configuredHeaders ?? {})) {
+    if (value === undefined) continue;
+    headers.delete(name);
+    for (const item of Array.isArray(value) ? value : [value]) headers.append(name, String(item));
+  }
 
   if (matchesIfNoneMatch(request.headers.get("if-none-match") ?? undefined, etag)) {
     return new Response(null, { status: 304, headers });
@@ -81,6 +107,8 @@ export async function serveDevPublicFile(
 
   // Match Vite/sirv: HEAD evaluates validators and ranges like GET, then omits the body.
   const body =
-    request.method === "HEAD" ? null : (await fsp.readFile(filePath)).subarray(start, end + 1);
+    request.method === "HEAD" || end < start
+      ? null
+      : (Readable.toWeb(fs.createReadStream(filePath, { start, end })) as ReadableStream);
   return new Response(body, { status: range.kind === "range" ? 206 : 200, headers });
 }

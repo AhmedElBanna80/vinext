@@ -10,6 +10,7 @@ import { normalizePathnameForRouteMatchStrict } from "../routing/utils.js";
 import { patternToNextFormat } from "../routing/route-validation.js";
 import { traceFindPageComponents } from "./pages-execution-tracing.js";
 import { resolveDevStaticFileSignal } from "./dev-static-file-signal.js";
+import { createImageOptimizationSignal } from "./static-file-signal.js";
 import { isExternalUrl } from "../utils/external-url.js";
 import {
   getEffectiveRequestCookieHeader,
@@ -1374,8 +1375,9 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     if (!filesystemRouteEligible) return null;
     if (isImageOptimizationPath(cleanPathname)) {
       // Rewrites may supply the image parameters, so read the resolved query.
+      const imageUrl = new URL(resolvedUrl, url);
       const imageRedirect = resolveDevImageRedirect(
-        new URL(resolvedUrl, url),
+        imageUrl,
         [
           ...(options.imageConfig?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
           ...(options.imageConfig?.imageSizes ?? DEFAULT_IMAGE_SIZES),
@@ -1385,7 +1387,12 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       );
       if (!imageRedirect)
         return new Response("Invalid image optimization parameters", { status: 400 });
-      return Response.redirect(new URL(imageRedirect, url.origin).href, 302);
+      // Hosts only dispatch their image optimizer for an original /_next/image
+      // pathname. Hosts with an optimizer replace this unoptimized redirect.
+      return createImageOptimizationSignal(
+        Response.redirect(new URL(imageRedirect, url.origin).href, 302),
+        imageUrl.search,
+      );
     }
     const publicFileResponse = resolvePublicFileRoute({
       cleanPathname,
