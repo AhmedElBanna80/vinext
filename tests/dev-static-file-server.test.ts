@@ -1,4 +1,5 @@
-import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vite-plus/test";
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -133,6 +134,41 @@ describe("serveDevPublicFile", () => {
 
     expect(response.status).toBe(416);
     expect(response.headers.get("content-range")).toBe("bytes */19");
+  });
+
+  it("streams the requested range instead of reading the whole file into memory", async () => {
+    const largeFile = path.join(publicDir, "large.bin");
+    const size = 5 * 1024 * 1024;
+    await fsp.writeFile(largeFile, Buffer.alloc(size, "a"));
+
+    const readFileSpy = vi.spyOn(fs.promises, "readFile");
+    const createReadStreamSpy = vi.spyOn(fs, "createReadStream");
+
+    try {
+      const response = await serveDevPublicFile(
+        publicDir,
+        "/large.bin",
+        request({ headers: { range: "bytes=0-9" } }),
+      );
+
+      expect(response.status).toBe(206);
+      expect(response.headers.get("content-range")).toBe(`bytes 0-9/${size}`);
+      await expect(response.text()).resolves.toBe("a".repeat(10));
+
+      // The fix: a single byte range must be served through a bounded
+      // fs.createReadStream({ start, end }), never fsp.readFile(filePath),
+      // which would load the whole (potentially huge) asset into memory
+      // before slicing it.
+      expect(createReadStreamSpy).toHaveBeenCalledWith(
+        expect.stringContaining("large.bin"),
+        expect.objectContaining({ start: 0, end: 9 }),
+      );
+      expect(readFileSpy).not.toHaveBeenCalled();
+    } finally {
+      readFileSpy.mockRestore();
+      createReadStreamSpy.mockRestore();
+      await fsp.rm(largeFile, { force: true });
+    }
   });
 
   it.each(["/missing.txt", "/dir", "/../outside.txt", "/..", "/%E0%A4%A.txt"])(
