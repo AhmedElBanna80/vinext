@@ -165,7 +165,8 @@ describe("paired performance benchmarks", () => {
     expect(runner).toContain("await runUntrusted(\n    profiler[0]");
     expect(coldStart).toContain('name.startsWith("VINEXT_PERF_")');
     expect(coldStart).toContain('const profiling = process.env.VINEXT_PERF_PROFILE === "true"');
-    expect(coldStart).toContain('join(projectDir, "node_modules/vite-plus/bin/vp")');
+    expect(coldStart).toContain('join(projectDir, "node_modules/vite-plus/dist/bin.js")');
+    expect(coldStart).not.toContain('execFileSync("which", ["vp"]');
     expect(coldStart).toContain('VINEXT_NO_DEV_LOCK: "1"');
     expect(coldStart).toContain("detached: true");
     expect(coldStart).toContain("return targetUser && !profiling");
@@ -174,7 +175,8 @@ describe("paired performance benchmarks", () => {
     expect(buildTime).toContain('name.startsWith("VINEXT_PERF_")');
     expect(buildTime).toContain("const entries = await readdir(outputDirectory)");
     expect(buildTime).toContain('const profiling = process.env.VINEXT_PERF_PROFILE === "true"');
-    expect(buildTime).toContain('join(projectDir, "node_modules/vite-plus/bin/vp")');
+    expect(buildTime).toContain('join(projectDir, "node_modules/vite-plus/dist/bin.js")');
+    expect(buildTime).not.toContain('execFileSync("which", ["vp"]');
     expect(buildTime).toContain(
       "globalThis.process.execve(command, [command, ...args], targetEnvironment())",
     );

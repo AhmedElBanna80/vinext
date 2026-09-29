@@ -35,11 +35,11 @@ vinext({
 Add the bindings to your Worker's `env` in `cloudflare.config.ts`:
 
 ```ts
-import { bindings } from "@cloudflare/vite-plugin/experimental-config";
+import { bindings } from "cf/config";
 
 env: {
   // ...existing bindings
-  VINEXT_KV_CACHE: bindings.kv({ id: "<your-namespace-id>" }),
+  VINEXT_KV_CACHE: bindings.kv(),
   IMAGES: bindings.images(),
 },
 ```
@@ -87,8 +87,14 @@ only when you want an opt-in second, header-only request that must prove every
 planned entry reusable before promotion.
 
 The response entrypoint hashes the complete transport identity into its
-Workers Cache URL, independently of zone Cache Rules, so distinct query and
-representation variants cannot collide.
+Workers Cache URL, independently of zone Cache Rules, so distinct
+representation, rewrite and interception variants cannot collide. For App
+Router pages that the cacheability manifest of a staged
+`--warm-cache` deploy marks `static-candidate`, the identity
+leaves out the query string, so every query of the page shares one entry, as in
+Next.js. Other requests, and responses that a `next.config` `headers()` rule
+makes cacheable, keep the query in their identity. See
+[the caching guide](https://vinext.dev/docs/guides/caching#query-strings).
 
 ### Workers Response Store
 
@@ -112,7 +118,7 @@ npx @vinext/cloudflare deploy
 `vinext-cloudflare deploy` never creates, rewrites, or deploys the Response
 Store Worker.
 
-Create the named R2 bucket before the first deployment. `create-vinext-app`
+`cf deploy` creates the named R2 bucket if it does not already exist. `create-vinext-app`
 uses `build` instead of `build:vinext`. The source config uses the shared helper:
 
 ```ts
@@ -144,13 +150,13 @@ defineWorker({
 ```
 
 `worker.observability` accepts the full observability configuration supported by
-your installed Cloudflare Vite plugin, including logs and traces settings.
+your installed `cf` package, including logs and traces settings.
 The optional `accountId` is returned as `responseStore.accountId`: pass it to `defineConfig`,
 not to either Worker. It applies to both Workers in the project.
 
 The async config helpers import bindings and exports from your installed
-`@cloudflare/vite-plugin/experimental-config`. The plugin is an optional peer
-dependency of `@vinext/cloudflare`; these helpers require v2.
+`cf/config`. The `cf` package is an optional peer dependency of `@vinext/cloudflare`;
+install it when using these helpers.
 
 Add the exported auxiliary Worker to your existing Cloudflare Vite plugin options:
 

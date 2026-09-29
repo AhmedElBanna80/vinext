@@ -2044,13 +2044,13 @@ describe("next/navigation shim", () => {
 });
 
 // ---------------------------------------------------------------------------
-// next/error shim — unstable_catchError
+// next/error shim — catchError / unstable_catchError
 //
 // Ported from Next.js:
 //   https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/catch-error.tsx
 //   https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/catch-error/
 // ---------------------------------------------------------------------------
-describe("next/error shim — unstable_catchError", () => {
+describe("next/error shim — catchError / unstable_catchError", () => {
   // Ported from Next.js:
   // packages/next/src/api/error.react-server.ts
   // https://github.com/vercel/next.js/blob/v16.2.6/packages/next/src/api/error.react-server.ts
@@ -2066,6 +2066,18 @@ describe("next/error shim — unstable_catchError", () => {
   it("exports unstable_catchError as a function", async () => {
     const mod = await import("../packages/vinext/src/shims/error.js");
     expect(typeof mod.unstable_catchError).toBe("function");
+  });
+
+  // Ported from Next.js 16.3:
+  // https://github.com/vercel/next.js/blob/v16.3.6/packages/next/error.d.ts
+  it("exports catchError as the stable name in both module conditions", async () => {
+    const client = await import("../packages/vinext/src/shims/error.js");
+    const reactServer = await import("../packages/vinext/src/shims/error.react-server.js");
+
+    expect(client.catchError).toBe(client.unstable_catchError);
+    expect(() => reactServer.catchError()).toThrow(
+      "`catchError` can only be used in Client Components.",
+    );
   });
 
   it("returns a Component that renders children when no error occurs", async () => {
@@ -2128,14 +2140,14 @@ describe("next/error shim — unstable_catchError", () => {
     }
   });
 
-  it("exposes the displayName matching Next.js (`unstable_catchError(...)`)", async () => {
+  it("exposes the stable catchError displayName", async () => {
     const { unstable_catchError } = await import("../packages/vinext/src/shims/error.js");
     const Fallback = function MyFallback() {
       return null;
     };
     const Boundary = unstable_catchError(Fallback);
     // Wrapper component carries the user fallback name for DevTools.
-    expect(Boundary.displayName).toBe("unstable_catchError(MyFallback)");
+    expect(Boundary.displayName).toBe("catchError(MyFallback)");
   });
 
   // Ported from Next.js:
@@ -2187,8 +2199,15 @@ describe("next/error shim — unstable_catchError", () => {
     });
   });
 
-  // class-component lifecycle catches non-router errors and renders the fallback
-  it("class-component lifecycle catches non-router errors and renders the fallback", async () => {
+  // Ported from Next.js 16.3.6, including null/undefined thrown-value cases:
+  // https://github.com/vercel/next.js/blob/v16.3.6/test/e2e/app-dir/catch-error/catch-error.test.ts
+  it.each([
+    [new Error("boom"), "boom"],
+    ["thrown string", "thrown string"],
+    [{ message: "thrown object" }, "[object Object]"],
+    [null, "null"],
+    [undefined, "undefined"],
+  ])("passes the original thrown value %j to the fallback", async (thrown, message) => {
     // React 19's renderToStaticMarkup does NOT invoke error boundaries during
     // SSR — errors propagate up by design (boundaries only run during client
     // commit). To validate behavior without spinning up a real browser, we
@@ -2198,7 +2217,7 @@ describe("next/error shim — unstable_catchError", () => {
     // next render.
     const React = (await import("react")).default;
     const { renderToStaticMarkup } = await import("react-dom/server");
-    const { unstable_catchError } = await import("../packages/vinext/src/shims/error.js");
+    const { catchError } = await import("../packages/vinext/src/shims/error.js");
 
     const seenErrors: unknown[] = [];
     function Fallback({
@@ -2225,7 +2244,7 @@ describe("next/error shim — unstable_catchError", () => {
     // single props object per React.createElement semantics), matching
     // the internal wrapper shape rather than the public API signature
     // `(props: P, errorInfo: ErrorInfo) => React.ReactNode`.
-    const Boundary = unstable_catchError<{ title: string }>(Fallback as any);
+    const Boundary = catchError<{ title: string }>(Fallback as any);
 
     // The Boundary wrapper is a function component that calls hooks.
     // We must call it inside a React render so React's dispatcher is active.
@@ -2268,15 +2287,14 @@ describe("next/error shim — unstable_catchError", () => {
     // Before an error: children render untouched.
     expect(renderToStaticMarkup(instance.render() as React.ReactElement)).toContain("child");
 
-    // Simulate React calling getDerivedStateFromError with a thrown Error.
-    const thrown = new Error("boom");
+    // Simulate React capturing the thrown value, including non-Error objects.
     const derived = InnerCatchError.getDerivedStateFromError(thrown);
     expect(derived).toEqual({ error: { thrownValue: thrown } });
 
     // Feed the derived state into the instance and render the fallback.
     instance.state = derived as { error: { thrownValue: unknown } | null };
     const fallbackOutput = renderToStaticMarkup(instance.render() as React.ReactElement);
-    expect(fallbackOutput).toContain("boom");
+    expect(fallbackOutput).toContain(message);
     expect(fallbackOutput).toContain("hello-title");
     expect(seenErrors[seenErrors.length - 1]).toBe(thrown);
   });
@@ -2320,51 +2338,121 @@ describe("next/error shim — unstable_catchError", () => {
     }
   });
 
-  it("unstable_retry on the client calls appRouterInstance.refresh and resets the boundary", async () => {
-    // Stub `window` with the minimum surface navigation.ts needs at
-    // module-load time (location, history, addEventListener). This must be
-    // installed BEFORE re-importing the shims, otherwise navigation.ts will
-    // initialize its client navigation state against a bare `{}` and crash.
-    // Mutable view over globalThis that allows assigning/deleting `window`.
-    const globalAny = globalThis as unknown as { window?: unknown };
-    const previousWindow = globalAny.window;
-    const win = {
-      location: {
-        pathname: "/",
-        search: "",
-        hash: "",
-        href: "http://localhost/",
-        origin: "http://localhost",
-      },
-      history: {
-        state: null,
-        pushState() {},
-        replaceState() {},
-      },
-      addEventListener() {},
-      dispatchEvent() {
-        return true;
-      },
-      removeEventListener() {},
-      scrollTo() {},
-      scrollX: 0,
-      scrollY: 0,
-    };
-    globalAny.window = win;
+  it.each(["retry", "unstable_retry"] as const)(
+    "%s refreshes and resets through the fallback ErrorInfo",
+    async (retry) => {
+      // Stub `window` with the minimum surface navigation.ts needs at
+      // module-load time (location, history, addEventListener). This must be
+      // installed BEFORE re-importing the shims, otherwise navigation.ts will
+      // initialize its client navigation state against a bare `{}` and crash.
+      // Mutable view over globalThis that allows assigning/deleting `window`.
+      const globalAny = globalThis as unknown as { window?: unknown };
+      const previousWindow = globalAny.window;
+      const win = {
+        location: {
+          pathname: "/",
+          search: "",
+          hash: "",
+          href: "http://localhost/",
+          origin: "http://localhost",
+        },
+        history: {
+          state: null,
+          pushState() {},
+          replaceState() {},
+        },
+        addEventListener() {},
+        dispatchEvent() {
+          return true;
+        },
+        removeEventListener() {},
+        scrollTo() {},
+        scrollX: 0,
+        scrollY: 0,
+      };
+      globalAny.window = win;
 
-    try {
-      vi.resetModules();
+      try {
+        vi.resetModules();
 
+        const React = (await import("react")).default;
+        const { renderToStaticMarkup } = await import("react-dom/server");
+        const { catchError } = await import("../packages/vinext/src/shims/error.js");
+
+        const refreshSpy = vi.fn();
+
+        function Fallback() {
+          return null;
+        }
+        const Boundary = catchError(Fallback);
+        // The Boundary wrapper is a function component that calls hooks.
+        // We must call it inside a React render so React's dispatcher is active.
+        let wrapperResult: React.ReactElement | null = null;
+        function Capture() {
+          wrapperResult = (Boundary as unknown as (p: Record<string, never>) => React.ReactElement)(
+            {},
+          );
+          return React.createElement("span");
+        }
+        renderToStaticMarkup(React.createElement(Capture));
+
+        const InnerCatchError = wrapperResult!.type as unknown as new (props: object) => {
+          state: { error: { thrownValue: unknown } | null };
+          render(): React.ReactElement<{
+            errorInfo: import("../packages/vinext/src/shims/error.js").ErrorInfo & {
+              unstable_retry(): void;
+            };
+          }>;
+        };
+        const instance = new InnerCatchError({
+          fallback: Fallback,
+          props: {},
+        });
+        // Manually instantiating the class skips React's context machinery.
+        // Seed `this.context` with a mock App Router instance so the App Router
+        // branch in `unstable_retry` fires and calls `context.refresh()`.
+        (instance as unknown as { context: { refresh: typeof refreshSpy } }).context = {
+          refresh: refreshSpy,
+        };
+
+        // Seed an error so reset has something to clear, and replace setState
+        // with a spy so we can confirm the boundary self-resets.
+        instance.state = { error: { thrownValue: new Error("boom") } };
+        const setStateCalls: Array<{ error: { thrownValue: unknown } | null }> = [];
+        (instance as unknown as { setState: (partial: object) => void }).setState = (partial) => {
+          setStateCalls.push(partial as { error: { thrownValue: unknown } | null });
+          instance.state = { ...instance.state, ...(partial as object) } as typeof instance.state;
+        };
+
+        // startTransition runs synchronously here because there's no
+        // concurrent renderer in the test environment.
+        void React.startTransition;
+        instance.render().props.errorInfo[retry]();
+
+        expect(refreshSpy).toHaveBeenCalledTimes(1);
+        expect(setStateCalls).toHaveLength(1);
+        expect(setStateCalls[0]).toEqual({ error: null });
+      } finally {
+        globalAny.window = previousWindow;
+        vi.resetModules();
+      }
+    },
+  );
+
+  // class component's `contextType`). When a non-null Pages Router instance
+  // is in context, `unstable_retry()` must throw the verbatim Next.js
+  // message instead of calling App Router's `refresh()`.
+  it.each(["retry", "unstable_retry"] as const)(
+    "%s under Pages Router throws the matching diagnostic",
+    async (retry) => {
       const React = (await import("react")).default;
       const { renderToStaticMarkup } = await import("react-dom/server");
-      const { unstable_catchError } = await import("../packages/vinext/src/shims/error.js");
-
-      const refreshSpy = vi.fn();
+      const { catchError } = await import("../packages/vinext/src/shims/error.js");
 
       function Fallback() {
         return null;
       }
-      const Boundary = unstable_catchError(Fallback);
+      const Boundary = catchError(Fallback);
       // The Boundary wrapper is a function component that calls hooks.
       // We must call it inside a React render so React's dispatcher is active.
       let wrapperResult: React.ReactElement | null = null;
@@ -2378,80 +2466,26 @@ describe("next/error shim — unstable_catchError", () => {
 
       const InnerCatchError = wrapperResult!.type as unknown as new (props: object) => {
         state: { error: { thrownValue: unknown } | null };
-        unstable_retry: () => void;
+        render(): React.ReactElement<{
+          errorInfo: import("../packages/vinext/src/shims/error.js").ErrorInfo & {
+            unstable_retry(): void;
+          };
+        }>;
       };
       const instance = new InnerCatchError({
         fallback: Fallback,
+        isPagesRouter: true,
         props: {},
       });
-      // Manually instantiating the class skips React's context machinery.
-      // Seed `this.context` with a mock App Router instance so the App Router
-      // branch in `unstable_retry` fires and calls `context.refresh()`.
-      (instance as unknown as { context: { refresh: typeof refreshSpy } }).context = {
-        refresh: refreshSpy,
-      };
-
-      // Seed an error so reset has something to clear, and replace setState
-      // with a spy so we can confirm the boundary self-resets.
       instance.state = { error: { thrownValue: new Error("boom") } };
-      const setStateCalls: Array<{ error: { thrownValue: unknown } | null }> = [];
-      (instance as unknown as { setState: (partial: object) => void }).setState = (partial) => {
-        setStateCalls.push(partial as { error: { thrownValue: unknown } | null });
-        instance.state = { ...instance.state, ...(partial as object) } as typeof instance.state;
-      };
 
-      // startTransition runs synchronously here because there's no
-      // concurrent renderer in the test environment.
-      void React.startTransition;
-      instance.unstable_retry();
+      void React; // keep React import for parity with sibling tests
 
-      expect(refreshSpy).toHaveBeenCalledTimes(1);
-      expect(setStateCalls).toHaveLength(1);
-      expect(setStateCalls[0]).toEqual({ error: null });
-    } finally {
-      globalAny.window = previousWindow;
-      vi.resetModules();
-    }
-  });
-
-  // class component's `contextType`). When a non-null Pages Router instance
-  // is in context, `unstable_retry()` must throw the verbatim Next.js
-  // message instead of calling App Router's `refresh()`.
-  it("unstable_retry under Pages Router throws Next.js parity error message", async () => {
-    const React = (await import("react")).default;
-    const { renderToStaticMarkup } = await import("react-dom/server");
-    const { unstable_catchError } = await import("../packages/vinext/src/shims/error.js");
-
-    function Fallback() {
-      return null;
-    }
-    const Boundary = unstable_catchError(Fallback);
-    // The Boundary wrapper is a function component that calls hooks.
-    // We must call it inside a React render so React's dispatcher is active.
-    let wrapperResult: React.ReactElement | null = null;
-    function Capture() {
-      wrapperResult = (Boundary as unknown as (p: Record<string, never>) => React.ReactElement)({});
-      return React.createElement("span");
-    }
-    renderToStaticMarkup(React.createElement(Capture));
-
-    const InnerCatchError = wrapperResult!.type as unknown as new (props: object) => {
-      state: { error: { thrownValue: unknown } | null };
-      unstable_retry: () => void;
-    };
-    const instance = new InnerCatchError({
-      fallback: Fallback,
-      isPagesRouter: true,
-      props: {},
-    });
-    instance.state = { error: { thrownValue: new Error("boom") } };
-
-    void React; // keep React import for parity with sibling tests
-
-    expect(() => instance.unstable_retry()).toThrow(
-      "`unstable_retry()` can only be used in the App Router. Use `reset()` in the Pages Router.",
-    );
-  });
+      expect(() => instance.render().props.errorInfo[retry]()).toThrow(
+        `\`${retry}()\` can only be used in the App Router. Use \`reset()\` in the Pages Router.`,
+      );
+    },
+  );
 
   // Integration test: the boundary contract that useUntrackedPathname protects.
   // The error boundary must clear its captured error when the pathname changes

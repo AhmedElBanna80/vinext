@@ -1863,7 +1863,7 @@ describe("readPagesRouterEntrySource", () => {
     // The worker returns result.response directly from the pipeline result.
     expect(content).toContain("runPagesRequest(request, deps)");
     expect(content).toContain('result.type === "response"');
-    expect(content).toContain("finalizeMissingStaticAssetResponse(result.response");
+    expect(content).toContain("let response = result.response;");
   });
 
   it("mergeHeaders preserves multiple Set-Cookie headers from both middleware and response", () => {
@@ -2015,9 +2015,7 @@ describe("readPagesRouterEntrySource", () => {
     // now called inside runPagesRequest. The worker delegates to the pipeline.
     expect(content).toContain("runPagesRequest(request, deps)");
     expect(content).toContain('result.type === "response"');
-    expect(content).toContain(
-      "finalizeMissingStaticAssetResponse(result.response, missingBuildAsset)",
-    );
+    expect(content).toContain("let response = result.response;");
   });
 
   it("finalizes only missing build-asset 404 responses", async () => {
@@ -2056,15 +2054,6 @@ describe("readPagesRouterEntrySource", () => {
 
     const regular404 = new Response("rendered 404", { status: 404 });
     expect(finalizeMissingStaticAssetResponse(regular404, false)).toBe(regular404);
-  });
-
-  it("finalizes missing build-asset 404s in both Node production routers", () => {
-    const content = fs.readFileSync(
-      path.join(import.meta.dirname, "../packages/vinext/src/server/prod-server.ts"),
-      "utf8",
-    );
-
-    expect(content.match(/finalizeMissingStaticAssetResponse\(/g)).toHaveLength(2);
   });
 
   it("resolveStaticAssetSignal fetches and merges static asset responses with middleware status", async () => {
@@ -2239,28 +2228,12 @@ describe("readPagesRouterEntrySource", () => {
 
   // Ported from Next.js: test/e2e/middleware-general/test/index.test.ts
   // https://github.com/vercel/next.js/blob/canary/test/e2e/middleware-general/test/index.test.ts
-  it("runs middleware before finalizing missing `_next/static/*` responses", () => {
+  it("delegates missing static-asset classification to the shared router", () => {
     const content = readPagesRouterEntrySource();
-    expect(content).toContain('from "./http-error-responses.js"');
-    expect(content).toContain('from "../utils/asset-prefix.js"');
-    expect(content).toContain("assetPrefixPathname(vinextConfig?.assetPrefix");
-    expect(content).toContain(
-      "const missingBuildAsset = isNextStaticPath(pathname, basePath, assetPathPrefix)",
-    );
-    expect(content).toContain(
-      "finalizeMissingStaticAssetResponse(result.response, missingBuildAsset)",
-    );
-
-    // Detection happens before routing, but the response is finalized only
-    // after runPagesRequest has given middleware a chance to handle the miss.
-    const staticPos = content.indexOf("isNextStaticPath(pathname, basePath, assetPathPrefix)");
-    const pipelinePos = content.indexOf("runPagesRequest(request, deps)");
-    const finalizePos = content.indexOf(
-      "finalizeMissingStaticAssetResponse(result.response, missingBuildAsset)",
-    );
-    expect(staticPos).toBeGreaterThan(-1);
-    expect(pipelinePos).toBeGreaterThan(staticPos);
-    expect(finalizePos).toBeGreaterThan(pipelinePos);
+    expect(content).toContain("assetPrefix: vinextConfig?.assetPrefix");
+    expect(content).toContain("runPagesRequest(request, deps)");
+    expect(content).toContain("let response = result.response;");
+    expect(content).not.toContain("finalizeMissingStaticAssetResponse");
   });
 });
 

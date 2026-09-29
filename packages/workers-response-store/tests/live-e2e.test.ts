@@ -214,53 +214,72 @@ test("live hard expiry never serves the expired R2 body", async () => {
   assert.equal(response.headers.get("X-Workers-Response-Store-Revision"), "2");
 });
 
-test("live purge applies tag, path-prefix, and purge-everything selectors", async () => {
-  const id = key("purge");
-  const tag = `tag-${id}`;
-  // Keep tag/path-purged entries short-lived so the test can observe their
-  // durable tombstones when edge purges are disabled or propagation is delayed.
-  await put(`/${id}/tagged`, "tagged", {
-    tags: [tag],
-    cacheControl: PURGE_OBSERVATION_POLICY,
-  });
-  await put(`/${id}/prefix/a`, "prefix", {
-    tags: ["unrelated"],
-    cacheControl: PURGE_OBSERVATION_POLICY,
-  });
-  await put(`/${id}/keep`, "keep", { cacheControl: "public, max-age=120" });
-  await put(`/${id}/uncached`, "uncached", { cacheControl: "public, max-age=120" });
-  await Promise.all([
-    read(`/${id}/tagged`).then((response) => response.arrayBuffer()),
-    read(`/${id}/prefix/a`).then((response) => response.arrayBuffer()),
-    read(`/${id}/keep`).then((response) => response.arrayBuffer()),
-  ]);
+// An already-expired seed exercises setup-time regeneration without sleeps.
+test.each([PURGE_OBSERVATION_POLICY, "public, max-age=0"])(
+  "live purge applies tag, path-prefix, and purge-everything selectors (%s)",
+  async (cacheControl) => {
+    const id = key("purge");
+    const tag = `tag-${id}`;
+    // Keep tag/path-purged entries short-lived so the test can observe their
+    // durable tombstones when edge purges are disabled or propagation is delayed.
+    // Setup can outlast the seed TTL, so regeneration must preserve the test data
+    // and short cache policy before the selectors run.
+    await put(`/${id}/tagged`, "tagged", {
+      tags: [tag],
+      cacheControl,
+      revalidator: {
+        body: "tagged",
+        cacheTags: [tag],
+        cacheControl: PURGE_OBSERVATION_POLICY,
+      },
+    });
+    await put(`/${id}/prefix/a`, "prefix", {
+      tags: ["unrelated"],
+      cacheControl,
+      revalidator: {
+        body: "prefix",
+        cacheTags: ["unrelated"],
+        cacheControl: PURGE_OBSERVATION_POLICY,
+      },
+    });
+    await put(`/${id}/keep`, "keep", { cacheControl: "public, max-age=120" });
+    await put(`/${id}/uncached`, "uncached", { cacheControl: "public, max-age=120" });
+    assert.deepEqual(
+      await Promise.all([
+        read(`/${id}/tagged`).then((response) => response.text()),
+        read(`/${id}/prefix/a`).then((response) => response.text()),
+        read(`/${id}/keep`).then((response) => response.text()),
+      ]),
+      ["tagged", "prefix", "keep"],
+    );
 
-  assert.deepEqual(await purge({ tags: [tag] }), {
-    backingStoreUpdated: true,
-    edgePurgeAccepted: EDGE_PURGE_ACCEPTED,
-  });
-  await eventually(async () => {
-    const response = await read(`/${id}/tagged`);
-    return response.status === 404
-      ? { ok: true, value: response }
-      : { ok: false, message: `tagged entry still returned ${response.status}` };
-  });
+    assert.deepEqual(await purge({ tags: [tag] }), {
+      backingStoreUpdated: true,
+      edgePurgeAccepted: EDGE_PURGE_ACCEPTED,
+    });
+    await eventually(async () => {
+      const response = await read(`/${id}/tagged`);
+      return response.status === 404
+        ? { ok: true, value: response }
+        : { ok: false, message: `tagged entry still returned ${response.status}` };
+    });
 
-  await purge({ pathPrefixes: [`/${id}/prefix`] });
-  await eventually(async () => {
-    const response = await read(`/${id}/prefix/a`);
-    return response.status === 404
-      ? { ok: true, value: response }
-      : { ok: false, message: `prefix entry still returned ${response.status}` };
-  });
-  assert.equal(await (await read(`/${id}/keep`)).text(), "keep");
+    await purge({ pathPrefixes: [`/${id}/prefix`] });
+    await eventually(async () => {
+      const response = await read(`/${id}/prefix/a`);
+      return response.status === 404
+        ? { ok: true, value: response }
+        : { ok: false, message: `prefix entry still returned ${response.status}` };
+    });
+    assert.equal(await (await read(`/${id}/keep`)).text(), "keep");
 
-  assert.deepEqual(await purge({ purgeEverything: true }), {
-    backingStoreUpdated: true,
-    edgePurgeAccepted: EDGE_PURGE_ACCEPTED,
-  });
-  assert.equal((await read(`/${id}/uncached`)).status, 404);
-});
+    assert.deepEqual(await purge({ purgeEverything: true }), {
+      backingStoreUpdated: true,
+      edgePurgeAccepted: EDGE_PURGE_ACCEPTED,
+    });
+    assert.equal((await read(`/${id}/uncached`)).status, 404);
+  },
+);
 
 test("live loopback failure preserves the last usable R2 and edge response", async () => {
   const id = key("failure");

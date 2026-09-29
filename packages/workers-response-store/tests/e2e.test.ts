@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,8 +54,58 @@ beforeEach(async () => {
         name: "user-worker",
         compatibilityDate: "2026-04-08",
         compatibilityFlags: ["nodejs_compat"],
-        modules: true,
-        scriptPath: workerScript,
+        modules: [
+          {
+            type: "ESModule",
+            path: "edge-purge-fixture.js",
+            contents: `
+              import worker, { ResponseStoreBinding as BaseBinding } from "./worker.js";
+              export { CacheMetadata, ResponseStoreRevalidator } from "./worker.js";
+              let purgeMode;
+              let failR2Write = false;
+              export class ResponseStoreBinding extends BaseBinding {
+                constructor(ctx, env) {
+                  super(ctx, {
+                    ...env,
+                    CACHE_BODIES: new Proxy(env.CACHE_BODIES, {
+                      get(bucket, key) {
+                        if (key === "put" && failR2Write) return () => {
+                          failR2Write = false;
+                          throw new Error("R2 publication failed");
+                        };
+                        const value = Reflect.get(bucket, key);
+                        return typeof value === "function" ? value.bind(bucket) : value;
+                      },
+                    }),
+                  });
+                  if (purgeMode) {
+                    Object.defineProperty(ctx, "cache", { value: {
+                      purge() {
+                        if (purgeMode === "throw") throw new Error("Purge unavailable");
+                        if (purgeMode === "reject") return Promise.reject(new Error("Purge unavailable"));
+                        return Promise.resolve({
+                          success: purgeMode === "success",
+                          errors: [{ code: 1134, message: "Rate limited" }],
+                        });
+                      },
+                    } });
+                  }
+                }
+              }
+              export default {
+                fetch(request) {
+                  if (new URL(request.url).pathname === "/admin/edge-purge") {
+                    purgeMode = new URL(request.url).searchParams.get("mode");
+                    failR2Write = new URL(request.url).searchParams.has("fail-r2");
+                    return new Response("ok");
+                  }
+                  return worker.fetch(request);
+                },
+              };
+            `,
+          },
+          { type: "ESModule", path: "worker.js", contents: await readFile(workerScript, "utf8") },
+        ],
         durableObjects: {
           CACHE_METADATA: { className: "CacheMetadata", useSQLite: true },
         },
@@ -305,6 +355,77 @@ test("put clears a miss cached while the write is in flight", async () => {
   const stored = await read("/miss-during-put");
   assert.equal(stored.status, 200);
   assert.equal(await stored.text(), "stored-after-delayed-put");
+});
+
+// Cloudflare-specific regression for #3433: retain real R2/DO storage and RPC,
+// replacing only ctx.cache.purge to exercise rate limits and transport failures.
+test.each(["rate-limit", "throw", "reject"])(
+  "put preserves its committed body when edge purge fails: %s",
+  async (mode) => {
+    await worker.fetch(`https://user.test/admin/edge-purge?mode=${mode}`);
+    await put("/purge-failure", "original");
+    const result = await put("/purge-failure", "replacement", { purgeExisting: true });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.json, { backingStoreUpdated: true, edgePurgeAccepted: false });
+    assert.equal(await (await read("/purge-failure")).text(), "replacement");
+  },
+);
+
+test.each(["rate-limit", "throw", "reject"])(
+  "refresh preserves its regenerated body when edge purge fails: %s",
+  async (mode) => {
+    await worker.fetch(`https://user.test/admin/edge-purge?mode=${mode}`);
+    await put("/refresh-purge-failure", "original", {
+      revalidator: { body: "regenerated" },
+    });
+    const result = await refreshSelectors({ pathPrefixes: ["/refresh-purge-failure"] });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.json, { backingStoreUpdated: true, edgePurgeAccepted: false });
+    assert.equal(await (await read("/refresh-purge-failure")).text(), "regenerated");
+  },
+);
+
+test.each(["rate-limit", "throw", "reject"])(
+  "purge retains tombstones for a later edge purge retry: %s",
+  async (mode) => {
+    await worker.fetch(`https://user.test/admin/edge-purge?mode=${mode}`);
+    await put("/tombstone-purge-failure", "original", { tags: ["purge-failure"] });
+    const options = { tags: ["purge-failure"] };
+    const result = await purge(options);
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.json, { backingStoreUpdated: true, edgePurgeAccepted: false });
+    assert.equal((await read("/tombstone-purge-failure")).status, 404);
+    const storage = await mf.unsafeGetDurableObjectStorage("user-worker", "CacheMetadata", {
+      name: metadataName,
+    });
+    assert.deepEqual(
+      await storage.exec("SELECT r2_complete, edge_purge_complete FROM pending_r2_tombstones"),
+      [{ r2_complete: 1, edge_purge_complete: 0 }],
+    );
+    await worker.fetch("https://user.test/admin/edge-purge?mode=success");
+    assert.equal(await (await metadataStub()).retryPendingTombstones(), false);
+    assert.equal(await metadataRowCount("pending_r2_tombstones"), 0);
+  },
+);
+
+test("failed R2 publication retains its tombstone when edge purge fails", async () => {
+  await put("/publication-purge-failure", "original");
+  await worker.fetch("https://user.test/admin/edge-purge?mode=rate-limit&fail-r2");
+  await assert.rejects(
+    put("/publication-purge-failure", "replacement", { purgeExisting: true }),
+    /R2 response publication failed/,
+  );
+  const storage = await mf.unsafeGetDurableObjectStorage("user-worker", "CacheMetadata", {
+    name: metadataName,
+  });
+  assert.deepEqual(
+    await storage.exec("SELECT r2_complete, edge_purge_complete FROM pending_r2_tombstones"),
+    [{ r2_complete: 1, edge_purge_complete: 0 }],
+  );
+  assert.equal((await read("/publication-purge-failure")).status, 404);
+  await worker.fetch("https://user.test/admin/edge-purge?mode=success");
+  assert.equal(await (await metadataStub()).retryPendingTombstones(), false);
+  assert.equal(await metadataRowCount("pending_r2_tombstones"), 0);
 });
 
 test("put and fetch use pathname plus query, excluding host", async () => {

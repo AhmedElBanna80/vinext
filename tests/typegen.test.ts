@@ -136,6 +136,47 @@ const invalidLink: LinkProps = {};
 void [metadata, config, image, link, font];
 `,
   );
+  if (!withNext) {
+    // Next.js 16.3 stable API, consumed through vinext/types without Next installed.
+    // https://github.com/vercel/next.js/blob/v16.3.6/packages/next/src/client/components/catch-error.tsx
+    await writeProjectFile(
+      root,
+      "app/error-boundary.ts",
+      `
+import ErrorPage, { catchError, unstable_catchError, type ErrorInfo, type ErrorProps } from "next/error";
+interface Props { title: string }
+const Boundary = catchError((props: Props, info: ErrorInfo) => {
+  info.retry();
+  info.reset();
+  return props.title;
+});
+const LegacyBoundary = unstable_catchError((props: Props, info) => {
+  info.unstable_retry();
+  return props.title;
+});
+const InferredBoundary = catchError((props: Props, info) => {
+  info.retry();
+  // @ts-expect-error retry does not accept arguments.
+  info.retry("unexpected");
+  return props.title;
+});
+// Next.js ErrorInfo can be constructed without the former unstable field.
+const info: ErrorInfo = { error: null, reset() {}, retry() {} };
+// The stable public shape must have exactly the upstream keys.
+type Assert<T extends true> = T;
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+type UpstreamErrorInfo = { error: unknown; reset: () => void; retry: () => void };
+type UpstreamCatchError = <P extends Record<string, any>>(
+  fallback: (props: P, errorInfo: UpstreamErrorInfo) => import("react").ReactNode,
+) => import("react").ComponentType<P & { children?: import("react").ReactNode }>;
+type ErrorInfoContract = Assert<Equal<ErrorInfo, UpstreamErrorInfo>>;
+type CatchErrorContract = Assert<Equal<typeof catchError, UpstreamCatchError>>;
+const errorProps: ErrorProps = { statusCode: 500 };
+void [Boundary, LegacyBoundary, InferredBoundary, ErrorPage, errorProps, info];
+`,
+    );
+  }
   await writeProjectFile(root, "app/icon.png", "not-an-image");
   await generateRouteTypes({ root });
 
@@ -157,6 +198,7 @@ void [metadata, config, image, link, font];
       "es2022",
       path.join(root, "next-env.d.ts"),
       path.join(root, "app/page.ts"),
+      ...(!withNext ? [path.join(root, "app/error-boundary.ts")] : []),
     ],
     { cwd: root, encoding: "utf-8" },
   );

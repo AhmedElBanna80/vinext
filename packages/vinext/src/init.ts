@@ -704,10 +704,12 @@ export async function init(options: InitOptions): Promise<InitResult> {
 
   // ── Step 3: Add scripts ────────────────────────────────────────────────
 
+  const deployResponseStore =
+    platform === "cloudflare" &&
+    options.cloudflare?.cdnCache === "response-store" &&
+    (options.cloudflare.responseStoreMode ?? "service-binding") === "service-binding";
   const addedScripts = addScripts(root, options.port, platform, {
-    deployResponseStore:
-      options.cloudflare?.cdnCache === "response-store" &&
-      (options.cloudflare.responseStoreMode ?? "service-binding") === "service-binding",
+    deployResponseStore,
     warmCdnCache: options.cloudflare?.warmCdnCache ?? false,
     legacyWrangler: options.cloudflare?.legacyWrangler,
     scriptNames: options.scriptNames,
@@ -895,6 +897,9 @@ export async function init(options: InitOptions): Promise<InitResult> {
   }
   const scriptName = (name: string) =>
     options.scriptNames === "standard" ? name : `${name}:vinext`;
+  const deployResponseStoreCommandStep = deployResponseStore
+    ? `    ${pmName} run deploy:response-store  Deploy Workers Response Store before the application\n`
+    : "";
   const deployCommandStep =
     platform === "cloudflare"
       ? `    ${pmName} run ${scriptName("deploy")} Deploy to Cloudflare Workers\n`
@@ -912,7 +917,7 @@ ${nextSteps.map((step) => `    ${step}`).join("\n")}${nextSteps.length > 0 ? "\n
     ${pmName} run ${scriptName("dev")}    Start the vinext dev server
     ${pmName} run ${scriptName("build")}  Build production output
     ${pmName} run ${scriptName("start")}  ${startCommandDescription}
-${deployCommandStep}${options.scriptNames === "standard" ? "" : `    ${pmName} run dev           Start Next.js (still works as before)\n`}
+${deployResponseStoreCommandStep}${deployCommandStep}${options.scriptNames === "standard" ? "" : `    ${pmName} run dev           Start Next.js (still works as before)\n`}
 `);
 
   const installedDeps = [...new Set([...dependencyEntriesAdded, ...devDependencyEntriesAdded])];

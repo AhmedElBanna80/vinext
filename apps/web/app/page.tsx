@@ -6,13 +6,13 @@ import { Text } from "@cloudflare/kumo/components/text";
 import {
   ArrowSquareOutIcon,
   ArrowUpRightIcon,
+  BookOpenIcon,
   CloudIcon,
   DatabaseIcon,
   FileCodeIcon,
   GaugeIcon,
   GithubLogoIcon,
   LightningIcon,
-  NewspaperIcon,
   PackageIcon,
   PlugsIcon,
   SparkleIcon,
@@ -88,10 +88,10 @@ const STATS = [
     detail: "Measured against Next.js 16 with Turbopack on a 33-route App Router benchmark app.",
   },
   {
-    value: "~33%",
+    value: "~23%",
     label: "smaller client bundles",
     detail:
-      "185 KB → 125 KB gzipped on the same benchmark. Tree-shaking and a lighter client runtime do the work.",
+      "185 KB → 143 KB gzipped on the same benchmark. Tree-shaking and a lighter client runtime do the work.",
   },
   {
     value: "94%",
@@ -285,14 +285,8 @@ export default function Home() {
           >
             Get vinext on GitHub
           </LinkButton>
-          <LinkButton
-            variant="secondary"
-            size="lg"
-            icon={<NewspaperIcon />}
-            href="https://blog.cloudflare.com/vinext/"
-            external
-          >
-            Read the announcement
+          <LinkButton variant="secondary" size="lg" icon={<BookOpenIcon />} href="/docs">
+            Read the docs
           </LinkButton>
         </div>
       </section>

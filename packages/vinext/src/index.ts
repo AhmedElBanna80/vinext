@@ -55,7 +55,10 @@ import {
   isImageOptimizationPath,
   resolveDevImageRedirect,
 } from "./server/image-optimization.js";
-import { CACHEABILITY_MANIFEST_MODULE } from "./server/cacheability-manifest.js";
+import {
+  CACHEABILITY_MANIFEST_MODULE,
+  CACHEABILITY_REQUEST_PROJECTION_MODULE,
+} from "./server/cacheability-manifest.js";
 import { PREGENERATED_CONCRETE_PATHS_MODULE } from "./server/pregenerated-concrete-paths.js";
 
 import { installSocketErrorBackstop } from "./server/socket-error-backstop.js";
@@ -196,7 +199,12 @@ import {
 } from "./utils/react-compiler-support.js";
 import { isUnknownRecord as isRecord } from "./utils/record.js";
 import { VIRTUAL_MODULE_ID_RE, VIRTUAL_PREFIX } from "./utils/virtual-module.js";
-import { ASSET_PREFIX_URL_DIR, resolveAssetsDir } from "./utils/asset-prefix.js";
+import {
+  ASSET_PREFIX_URL_DIR,
+  resolveAssetsDir,
+  assetPrefixPathname,
+  isNextStaticPath,
+} from "./utils/asset-prefix.js";
 import {
   assertNoPublicDirAssetConflict,
   assertNoPublicNextRequestConflict,
@@ -319,7 +327,10 @@ import {
 import { hasMdxFiles } from "./utils/mdx-scan.js";
 import { scanPublicFileRoutes } from "./utils/public-routes.js";
 import { publicFilePathVariants } from "./utils/public-file-path.js";
-import { methodNotAllowedResponse } from "./server/http-error-responses.js";
+import {
+  methodNotAllowedResponse,
+  notFoundStaticAssetResponse,
+} from "./server/http-error-responses.js";
 import {
   getDevStaticFileServerStorage,
   serveDevPublicFile,
@@ -337,6 +348,7 @@ import { getPagesPreviewModeId } from "./server/pages-preview.js";
 import commonjs from "vite-plugin-commonjs";
 import { createIgnoreDynamicRequestsPlugin } from "./plugins/ignore-dynamic-requests.js";
 import { createTransformCache } from "./plugins/transform-cache.js";
+import { omitUnusedBuildSourcemap } from "./plugins/transform-result.js";
 import { isServerEnvironment } from "./plugins/environment.js";
 import {
   claimViteCliBuildInvocation,
@@ -373,14 +385,25 @@ const PAGES_CLOUDFLARE_WORKER_OPTIMIZE_DEPS_INCLUDE = Object.freeze([
   "react-dom/server.edge",
   "react/jsx-runtime",
   "react/jsx-dev-runtime",
-  "use-sync-external-store/with-selector",
 ]);
 
-const OPTIONAL_OPTIMIZE_DEPS_WARNING_RE =
-  /Failed to resolve dependency: .*use-sync-external-store\/with-selector.*present in .* 'optimizeDeps\.include'/;
-const VINEXT_FILTERED_OPTIMIZE_DEPS_WARN = Symbol.for("vinext.filteredOptimizeDepsWarn");
+// In dev, @vitejs/plugin-rsc can serve "use client" modules nested inside a
+// package straight from node_modules, and Vite does not discover new deps from
+// imports in those files. ESM packages commonly import this CommonJS-only
+// package, which would then reach the browser without named exports. Vite
+// reuses pre-bundled deps by exact specifier, so list each published spelling.
+const APP_CLIENT_OPTIONAL_OPTIMIZE_DEPS_INCLUDE = Object.freeze([
+  "use-sync-external-store/shim",
+  "use-sync-external-store/shim/index.js",
+  "use-sync-external-store/shim/with-selector",
+  "use-sync-external-store/shim/with-selector.js",
+  "use-sync-external-store/with-selector",
+  "use-sync-external-store/with-selector.js",
+]);
+
 const ANSI_ESCAPE_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
 const RSC_ENVIRONMENTS = new Set(["rsc", "ssr", "client"]);
+const VINEXT_GENERATED_DIR_RE = /(?:^|[/\\])\.vinext(?:[/\\]|$)/;
 
 function scopeRscPlugin(plugin: Plugin): Plugin {
   const applyToEnvironment = plugin.applyToEnvironment;
@@ -1033,16 +1056,26 @@ function stripAnsi(value: string): string {
   return value.replace(ANSI_ESCAPE_RE, "");
 }
 
-function suppressOptionalOptimizeDepsWarnings(logger: Logger): void {
-  const marker = logger as Logger & { [VINEXT_FILTERED_OPTIMIZE_DEPS_WARN]?: true };
-  if (marker[VINEXT_FILTERED_OPTIMIZE_DEPS_WARN]) return;
-
-  const warn = logger.warn.bind(logger);
-  logger.warn = (msg, options) => {
-    if (OPTIONAL_OPTIMIZE_DEPS_WARNING_RE.test(stripAnsi(msg))) return;
-    warn(msg, options);
+function createOptionalOptimizeDepsLogger(logger: Logger, warnings: ReadonlySet<string>): Logger {
+  if (warnings.size === 0) return logger;
+  // Keep filtering local to this resolved config. The caller may reuse its
+  // custom logger for another server with different optimizer requirements.
+  return {
+    get hasWarned() {
+      return logger.hasWarned;
+    },
+    set hasWarned(value) {
+      logger.hasWarned = value;
+    },
+    info: logger.info.bind(logger),
+    warn(msg, options) {
+      if (!warnings.has(stripAnsi(msg))) logger.warn(msg, options);
+    },
+    warnOnce: logger.warnOnce.bind(logger),
+    error: logger.error.bind(logger),
+    clearScreen: logger.clearScreen.bind(logger),
+    hasErrorLogged: logger.hasErrorLogged.bind(logger),
   };
-  marker[VINEXT_FILTERED_OPTIMIZE_DEPS_WARN] = true;
 }
 
 // Cache materialized tsconfig/jsconfig aliases so Vite's glob and dynamic-import
@@ -1208,6 +1241,9 @@ const VIRTUAL_RSC_ENTRY = "virtual:vinext-rsc-entry";
 const RESOLVED_RSC_ENTRY = VIRTUAL_PREFIX + VIRTUAL_RSC_ENTRY;
 const VIRTUAL_CACHEABILITY_MANIFEST = "virtual:vinext-cacheability-manifest";
 const RESOLVED_CACHEABILITY_MANIFEST = VIRTUAL_PREFIX + VIRTUAL_CACHEABILITY_MANIFEST;
+const VIRTUAL_CACHEABILITY_REQUEST_PROJECTION = "virtual:vinext-cacheability-request-projection";
+const RESOLVED_CACHEABILITY_REQUEST_PROJECTION =
+  VIRTUAL_PREFIX + VIRTUAL_CACHEABILITY_REQUEST_PROJECTION;
 const VIRTUAL_PREGENERATED_CONCRETE_PATHS = "virtual:vinext-pregenerated-concrete-paths";
 const RESOLVED_PREGENERATED_CONCRETE_PATHS = VIRTUAL_PREFIX + VIRTUAL_PREGENERATED_CONCRETE_PATHS;
 const VIRTUAL_APP_REQUEST_ENTRY = "virtual:vinext-app-request-entry";
@@ -1611,6 +1647,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let nitroBuildDir: string | undefined;
   let fileMatcher: ReturnType<typeof createValidFileMatcher>;
   let middlewarePath: string | null = null;
+  let canonicalMiddlewarePath: string | null = null;
   let instrumentationPath: string | null = null;
   let instrumentationClientPath: string | null = null;
   let clientInjectModule: string | null = null;
@@ -1723,6 +1760,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   // which keeps backslashes on Windows. The shim files exist in the vinext
   // package before plugin init, so realpath is safe to evaluate eagerly.
   const canonicalize = (p: string): string => toSlash(tryRealpathSync(p) ?? p);
+  // Owned by this vinext() instance and cleared on each config resolution
+  // (an inline plugin survives server.restart()). Also used by the middleware
+  // export and server-only checks, which run on every module id.
   const pageTransformCanonicalPaths = new Map<string, string>();
   const canonicalizePageTransformPath = (modulePath: string): string => {
     const cached = pageTransformCanonicalPaths.get(modulePath);
@@ -2653,6 +2693,10 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             ? path.join(root, "src")
             : root;
         middlewarePath = findMiddlewareFile(root, fileMatcher, middlewareConventionDir);
+        // With resolve.preserveSymlinks the module id stays the logical path,
+        // so a realpath memoized before a restart can be stale.
+        pageTransformCanonicalPaths.clear();
+        canonicalMiddlewarePath = middlewarePath ? canonicalize(middlewarePath) : null;
         if (middlewarePath) {
           const staticMatcher = extractMiddlewareMatcherConfigValue(middlewarePath);
           if (staticMatcher !== undefined) {
@@ -3366,6 +3410,17 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           // setting it. Without the `origin` field, `preflightContinue: true`
           // would override Vite's default and allow any origin.
           server: {
+            // Generated caches and lockfiles are not HMR inputs. In particular,
+            // creating OG WASM modules here must not restart the Cloudflare Worker.
+            // Match independently of watch.cwd in both Chokidar and bundled dev.
+            // Vite merges it with the user's watch options and ignored patterns.
+            watch:
+              config.server?.watch === null
+                ? null
+                : {
+                    ignored: [VINEXT_GENERATED_DIR_RE],
+                    exclude: [VINEXT_GENERATED_DIR_RE],
+                  },
             cors: {
               preflightContinue: true,
               origin: /^https?:\/\/(?:(?:[^:]+\.)?localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/,
@@ -4196,8 +4251,40 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             if (!config.server.middlewareMode) applyDevServerDefaults(config.server, {});
           }
         }
-        if (isServeCommand && hasCloudflarePlugin && hasPagesDir && !hasAppDir) {
-          suppressOptionalOptimizeDepsWarnings(config.logger);
+        if (isServeCommand && (hasAppDir || (hasCloudflarePlugin && hasPagesDir))) {
+          // Wait for all config/configEnvironment hooks before adding optional
+          // defaults, so other plugins' explicit includes and opt-outs win.
+          // Optimizers are created afterward, so these are still startup includes.
+          const optionalWarnings = new Set<string>();
+          for (const [name, environment] of Object.entries(config.environments)) {
+            const optimizer = environment.optimizeDeps;
+            const optionalIncludes = hasAppDir
+              ? name === "client" && !optimizer.noDiscovery
+                ? APP_CLIENT_OPTIONAL_OPTIMIZE_DEPS_INCLUDE
+                : []
+              : name !== "client"
+                ? ["use-sync-external-store/with-selector"]
+                : [];
+            for (const id of optionalIncludes) {
+              if (
+                optimizer.include?.includes(id) ||
+                optimizer.exclude?.some(
+                  (excluded) => id === excluded || id.startsWith(`${excluded}/`),
+                )
+              ) {
+                continue;
+              }
+              (optimizer.include ??= []).push(id);
+              optionalWarnings.add(
+                `Failed to resolve dependency: ${id}, present in ${name} 'optimizeDeps.include'`,
+              );
+            }
+          }
+          // Vite's resolved top-level fields are typed readonly, but the config
+          // is mutable here and environment loggers delegate to this property.
+          Object.assign(config, {
+            logger: createOptionalOptimizeDepsLogger(config.logger, optionalWarnings),
+          });
         }
 
         // Keep worker entries and code-split chunks in a distinct output
@@ -4515,6 +4602,16 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             }
             return RESOLVED_CACHEABILITY_MANIFEST;
           }
+          if (cleanId === VIRTUAL_CACHEABILITY_REQUEST_PROJECTION) {
+            if (
+              hasAppDir &&
+              this.environment?.name === "rsc" &&
+              this.environment.config?.command === "build"
+            ) {
+              return { id: `./${CACHEABILITY_REQUEST_PROJECTION_MODULE}`, external: true };
+            }
+            return RESOLVED_CACHEABILITY_REQUEST_PROJECTION;
+          }
           if (cleanId === VIRTUAL_PREGENERATED_CONCRETE_PATHS) {
             const isWorkerBuildEnvironment = hasAppDir
               ? this.environment?.name === "rsc"
@@ -4680,7 +4777,10 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             return `export default ${JSON.stringify(metadata)};`;
           }
           // App Router virtual modules
-          if (id === RESOLVED_CACHEABILITY_MANIFEST) {
+          if (
+            id === RESOLVED_CACHEABILITY_MANIFEST ||
+            id === RESOLVED_CACHEABILITY_REQUEST_PROJECTION
+          ) {
             return "export default null;";
           }
           if (id === RESOLVED_PREGENERATED_CONCRETE_PATHS) {
@@ -5222,6 +5322,11 @@ export const loadServerActionClient = ${
           source: "export default null;\n",
         });
         if (hasAppDir) {
+          this.emitFile({
+            type: "asset",
+            fileName: CACHEABILITY_REQUEST_PROJECTION_MODULE,
+            source: "export default null;\n",
+          });
           this.emitFile({
             type: "asset",
             fileName: PREGENERATED_CONCRETE_PATHS_MODULE,
@@ -6491,6 +6596,11 @@ export const loadServerActionClient = ${
                 !isDataReq &&
                 !filePathMatchesRewrite &&
                 !filePathMatchesPagesRoute &&
+                !isNextStaticPath(
+                  pathname,
+                  "",
+                  assetPrefixPathname(nextConfig?.assetPrefix ?? ""),
+                ) &&
                 !isExistingPublicMutation
               ) {
                 return next();
@@ -6632,6 +6742,7 @@ export const loadServerActionClient = ${
               ): "static" | "server" | "none" => classifyDevPageFile(route.filePath);
 
               const pipelineDeps: PagesPipelineDeps = {
+                assetPrefix: nextConfig?.assetPrefix,
                 basePath: bp,
                 trailingSlash: nextConfig?.trailingSlash ?? false,
                 i18nConfig: nextConfig?.i18n ?? null,
@@ -6903,6 +7014,21 @@ export const loadServerActionClient = ${
                     return next();
                   }
                 }
+                // Hybrid requests have already been handed to App routing above.
+                // Only an unmatched resolved static path gets the canonical 404.
+                if (
+                  !renderMatch &&
+                  isNextStaticPath(
+                    resolvedPathname,
+                    "",
+                    assetPrefixPathname(nextConfig?.assetPrefix ?? ""),
+                  )
+                ) {
+                  const headers = new Headers();
+                  forEachStagedHeader((key, value) => headers.append(key, value));
+                  await writeWebResponseToNodeRes(res, notFoundStaticAssetResponse(headers));
+                  return;
+                }
                 if (!cachedSSRHandler || cachedSSRHandler.routes !== routes) {
                   cachedSSRHandler = {
                     routes,
@@ -7028,17 +7154,20 @@ export const loadServerActionClient = ${
     {
       name: "vinext:validate-middleware-exports",
       enforce: "pre",
-      transform(code, id) {
-        if (!middlewarePath) return null;
-        const modulePath = stripViteModuleQuery(id);
-        if (canonicalize(modulePath) !== canonicalize(middlewarePath)) return null;
-        validateMiddlewareModuleExports(
-          code,
-          modulePath,
-          middlewarePath,
-          isProxyFile(middlewarePath),
-        );
-        return null;
+      transform: {
+        filter: { id: { exclude: VIRTUAL_MODULE_ID_RE } },
+        handler(code, id) {
+          if (!middlewarePath) return null;
+          const modulePath = stripViteModuleQuery(id);
+          if (canonicalizePageTransformPath(modulePath) !== canonicalMiddlewarePath) return null;
+          validateMiddlewareModuleExports(
+            code,
+            modulePath,
+            middlewarePath,
+            isProxyFile(middlewarePath),
+          );
+          return null;
+        },
       },
     },
     // Next.js rejects `export * from "..."` when compiling Pages Router files
@@ -7215,15 +7344,18 @@ export const loadServerActionClient = ${
           const variant = `${replaceTypeofWindow ? typeofWindow : "-"}:${
             replaceProcessBrowser ? processBrowser : "-"
           }`;
-          return cachedConsumerConditionTransform(id, code, variant, () =>
-            replaceConsumerEnvironmentConditions(
-              code,
-              {
-                ...(replaceTypeofWindow ? { typeofWindow } : {}),
-                ...(replaceProcessBrowser ? { processBrowser } : {}),
-                pruneUnreachableImports: scansImports,
-              },
-              id,
+          return omitUnusedBuildSourcemap(
+            this.environment,
+            cachedConsumerConditionTransform(id, code, variant, () =>
+              replaceConsumerEnvironmentConditions(
+                code,
+                {
+                  ...(replaceTypeofWindow ? { typeofWindow } : {}),
+                  ...(replaceProcessBrowser ? { processBrowser } : {}),
+                  pruneUnreachableImports: scansImports,
+                },
+                id,
+              ),
             ),
           );
         },
