@@ -24,6 +24,7 @@ import {
   finalizeAppPageRscCacheResponse,
 } from "../packages/vinext/src/server/app-page-cache-finalizer.js";
 import { finalizeAppRscResponse } from "../packages/vinext/src/server/app-rsc-response-finalizer.js";
+import { queryInvariantObservationBuilders } from "./render-observation-test-helpers.js";
 import {
   applyCdnResponseHeaders,
   applyCdnResponseIdentityHeaders,
@@ -65,6 +66,8 @@ function finalizePendingDynamicRscResponse(): Response {
       },
     }),
     {
+      ...queryInvariantObservationBuilders,
+      isStaticEligible: true,
       capturedRscDataPromise: null,
       cleanPathname: "/dashboard",
       consumeDynamicUsage() {
@@ -237,7 +240,7 @@ describe("CloudflareCdnCacheAdapter", () => {
     expect(
       adapter.buildResponseHeaders({ cacheControl: "s-maxage=60, stale-while-revalidate" }),
     ).toEqual({
-      "Cache-Control": "public, max-age=0, must-revalidate",
+      "Cache-Control": "private, max-age=0, must-revalidate",
       "CDN-Cache-Control": null,
       "Cloudflare-CDN-Cache-Control": "public, max-age=60, stale-while-revalidate=31536000",
       "Cache-Tag": null,
@@ -257,6 +260,82 @@ describe("CloudflareCdnCacheAdapter", () => {
     });
   });
 
+  it.each([
+    "max-age=10",
+    'max-age="10"',
+    "public, max-age=300, s-maxage=600, stale-while-revalidate=60",
+    "private, max-age=10",
+    "no-store",
+    "no-cache",
+    "public, s-maxage=600",
+    "public, foo=bar, s-maxage=600",
+    "must-revalidate, s-maxage=600",
+    "immutable, s-maxage=600",
+    "max-age=invalid, s-maxage=600",
+  ])("keeps browser policy %s separate from the edge", (browserCacheControl) => {
+    const headers = adapter.buildResponseHeaders({
+      cacheControl: "max-age=3600",
+      browserCacheControl,
+    });
+    expect(headers["Cache-Control"]).toBe(browserCacheControl);
+    expect(headers["Cloudflare-CDN-Cache-Control"]).toBe("public, max-age=3600");
+    expect(headers["CDN-Cache-Control"]).toBeNull();
+  });
+
+  it("does not let a browser policy bypass failed edge admission", () => {
+    for (const input of [
+      { cacheControl: "" },
+      { cacheControl: "max-age=3600", pendingDynamicCheck: true },
+    ]) {
+      const headers = adapter.buildResponseHeaders({ ...input, browserCacheControl: "max-age=10" });
+      expect(headers["Cache-Control"]).toBe("no-store");
+      expect(headers["Cloudflare-CDN-Cache-Control"]).toBeNull();
+    }
+  });
+
+  it.each(["public, max-age=10", "private, max-age=300", "no-store"])(
+    "preserves browser policy %s while rejecting shared admission",
+    (browserCacheControl) => {
+      const headers = new Headers(
+        Object.entries(
+          adapter.buildResponseHeaders({ cacheControl: "no-store", browserCacheControl }),
+        ).filter((entry): entry is [string, string] => entry[1] !== null),
+      );
+      expect(headers.get("Cache-Control")).toBe(browserCacheControl);
+      expect(adapter.responsePolicy.hasExplicitNonCacheablePolicy(headers)).toBe(true);
+      expect(headers.get("Cache-Tag")).toBeNull();
+    },
+  );
+
+  it("uses s-maxage for the edge when an endpoint also sets browser max-age", () => {
+    const policy = "public, max-age=10, s-maxage=3600, stale-while-revalidate=60";
+    const headers = adapter.buildResponseHeaders({
+      cacheControl: policy,
+      browserCacheControl: policy,
+    });
+    expect(headers["Cache-Control"]).toBe(policy);
+    expect(headers["Cloudflare-CDN-Cache-Control"]).toBe(
+      "public, max-age=3600, stale-while-revalidate=60",
+    );
+  });
+
+  it.each([
+    'foo="a,max-age=5"',
+    'foo="a,s-maxage=5,stale-while-revalidate=10"',
+    'foo="a,public,b"',
+    'foo="a\\\",max-age=5"',
+  ])("preserves the quoted cache extension %s", (extension) => {
+    const policy = `${extension}, max-age=10, s-maxage=60, stale-while-revalidate`;
+    const headers = adapter.buildResponseHeaders({
+      cacheControl: policy,
+      browserCacheControl: policy,
+    });
+    expect(headers["Cache-Control"]).toBe(policy);
+    expect(headers["Cloudflare-CDN-Cache-Control"]).toBe(
+      `public, ${extension}, max-age=60, stale-while-revalidate=31536000`,
+    );
+  });
+
   it("adds a Cache-Tag header from the page tags", () => {
     const headers = adapter.buildResponseHeaders({
       cacheControl: "s-maxage=60",
@@ -265,7 +344,7 @@ describe("CloudflareCdnCacheAdapter", () => {
     expect(headers["Cache-Tag"]).toBe(
       ["/blog", "_N_T_/blog", "posts"].map(encodeCloudflareCacheTag).join(","),
     );
-    expect(headers["Cache-Control"]).toBe("public, max-age=0, must-revalidate");
+    expect(headers["Cache-Control"]).toBe("private, max-age=0, must-revalidate");
     expect(headers["CDN-Cache-Control"]).toBeNull();
     expect(headers["Cloudflare-CDN-Cache-Control"]).toBe("public, max-age=60");
   });
@@ -325,6 +404,7 @@ describe("CloudflareCdnCacheAdapter", () => {
       async (context) => {
         const state = Reflect.get(context, CACHEABILITY_REQUEST_STATE) as RouteCacheabilityState;
         state.route = { kind: "pages-page", pattern: "/posts" };
+        state.outcome = { cacheable: true, cacheControl: "s-maxage=60", tags: ["posts"] };
         const headers = new Headers();
         await runWithExecutionContext(context, () =>
           applyCdnResponseHeaders(headers, {
@@ -443,7 +523,8 @@ describe("CloudflareCdnCacheAdapter", () => {
       requestContext: makeRequestContext(),
     });
 
-    expect(response.headers.get("Cache-Control")).toBe("no-store, must-revalidate");
+    expect(response.headers.get("Cache-Control")).toBe("xprivate=1, s-maxage=60");
+    expect(response.headers.get("Cloudflare-CDN-Cache-Control")).toBe("no-store");
     expect(response.headers.get("CDN-Cache-Control")).toBeNull();
   });
 
@@ -463,6 +544,8 @@ describe("CloudflareCdnCacheAdapter", () => {
         },
       }),
       {
+        ...queryInvariantObservationBuilders,
+        isStaticEligible: true,
         capturedRscDataPromise: Promise.resolve(new TextEncoder().encode("flight").buffer),
         cleanPathname: "/dynamic-html",
         consumeDynamicUsage() {
@@ -511,6 +594,8 @@ describe("CloudflareCdnCacheAdapter", () => {
         },
       }),
       {
+        ...queryInvariantObservationBuilders,
+        isStaticEligible: true,
         bypassInterceptionContextCache: true,
         capturedRscDataPromise: Promise.resolve(new TextEncoder().encode("flight").buffer),
         cleanPathname: "/about",
@@ -551,6 +636,8 @@ describe("CloudflareCdnCacheAdapter", () => {
           },
         }),
         {
+          ...queryInvariantObservationBuilders,
+          isStaticEligible: true,
           capturedRscDataPromise: Promise.resolve(
             new TextEncoder().encode("slot-specific-flight").buffer,
           ),
@@ -593,6 +680,8 @@ describe("CloudflareCdnCacheAdapter", () => {
         },
       }),
       {
+        ...queryInvariantObservationBuilders,
+        isStaticEligible: true,
         capturedRscDataPromise: Promise.resolve(
           new TextEncoder().encode("slot-specific-flight").buffer,
         ),
@@ -633,6 +722,8 @@ describe("CloudflareCdnCacheAdapter", () => {
         },
       }),
       {
+        ...queryInvariantObservationBuilders,
+        isStaticEligible: true,
         capturedRscDataPromise: null,
         cleanPathname: "/dashboard",
         consumeDynamicUsage() {

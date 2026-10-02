@@ -13,11 +13,9 @@
  *   cache headers, so there is nothing to persist at the origin.
  * - `buildResponseHeaders` emits the SWR policy as `Cloudflare-CDN-Cache-Control`
  *   (`public, max-age=…, stale-while-revalidate=…`) so the edge caches and
- *   revalidates. The inner response's `Cache-Control` is
- *   `public, max-age=0, must-revalidate` so a browser never serves a stored copy
- *   without revalidating against the edge; the uncached gateway changes that to
- *   `private, max-age=0, must-revalidate` before public egress so personalized
- *   request-stage headers cannot enter another shared cache. A `Cache-Tag`
+ *   revalidates. Explicit endpoint Cache-Control is preserved for clients,
+ *   independently of shared admission. Framework-managed responses default to
+ *   `private, max-age=0, must-revalidate`. A `Cache-Tag`
  *   header lets entries be purged by tag. Note the edge directive uses `max-age`
  *   (not `s-maxage`):
  *   the framework computes the policy with `s-maxage` for shared caches, but
@@ -31,12 +29,13 @@
  *
  * The default export is the adapter factory the generated
  * `virtual:vinext-cache-adapters` registration imports; configure it from
- * vite.config via the {@link cdnAdapter} builder in `./cdn-adapter.ts` (which
+ * vite.config via the {@link workersCacheCdnAdapter} builder in `./workers-cache-cdn-adapter.ts` (which
  * `require.resolve`s this file).
  */
 
 import {
   isNonCacheableCacheControl,
+  splitCacheControlDirectives,
   type CdnCacheAdapter,
   type CdnCacheableHeaderInput,
   type CdnResponseHeaders,
@@ -88,13 +87,21 @@ function getBuildIdentityResponseHeader(): CdnResponseHeaders {
   return buildId ? { [VINEXT_CDN_BUILD_ID_HEADER]: buildId } : {};
 }
 
-/** Remove every response header whose cache semantics are owned by Cloudflare. */
-function clearCloudflareCdnResponseHeaders(cacheControl: string): CdnResponseHeaders {
+/** Disable shared caching while preserving an explicit client policy. */
+function clearCloudflareCdnResponseHeaders(
+  cacheControl: string,
+  browserCacheControl?: string,
+): CdnResponseHeaders {
   return {
     ...getBuildIdentityResponseHeader(),
-    "Cache-Control": cacheControl,
+    "Cache-Control": browserCacheControl ?? cacheControl,
     "CDN-Cache-Control": null,
-    "Cloudflare-CDN-Cache-Control": null,
+    // An explicit browser policy must never admit a rejected response through
+    // the cache's Cache-Control fallback.
+    "Cloudflare-CDN-Cache-Control":
+      browserCacheControl !== undefined && !isNonCacheableCacheControl(browserCacheControl)
+        ? "no-store"
+        : null,
     "Cache-Tag": null,
   };
 }
@@ -115,12 +122,21 @@ function hasExplicitCloudflareNonCacheableResponsePolicy(headers: Headers): bool
   );
 }
 
+/** Shared-cache policy headers in the order Cloudflare honors them. */
+const RESPONSE_POLICY_PRECEDENCE = [
+  "Cloudflare-CDN-Cache-Control",
+  "CDN-Cache-Control",
+  "Cache-Control",
+] as const;
+
+/** Name the highest-precedence policy header Cloudflare honors on a response. */
+function readCloudflareResponsePolicyHeaderName(headers: Headers): string | null {
+  return RESPONSE_POLICY_PRECEDENCE.find((name) => headers.has(name)) ?? null;
+}
+
 function readCloudflareResponseCacheControl(headers: Headers): string | null {
-  return (
-    headers.get("Cloudflare-CDN-Cache-Control") ??
-    headers.get("CDN-Cache-Control") ??
-    headers.get("Cache-Control")
-  );
+  const name = readCloudflareResponsePolicyHeaderName(headers);
+  return name ? headers.get(name) : null;
 }
 
 /** The request-context cache surface this adapter relies on (narrowed from `unknown`). */
@@ -147,7 +163,7 @@ const NO_STORE = "no-store";
  * revalidate (against the edge) rather than serving a stored copy — so the user
  * always sees edge-fresh content while still permitting conditional 304s.
  */
-const BROWSER_REVALIDATE = "public, max-age=0, must-revalidate";
+const BROWSER_REVALIDATE = "private, max-age=0, must-revalidate";
 
 /**
  * A concrete stale window (1 year) substituted for a value-less
@@ -169,11 +185,20 @@ const UNBOUNDED_SWR_SECONDS = 31_536_000; // 1 year
  * `public`.
  */
 function toEdgeCacheControl(cacheControl: string): string {
-  const withMaxAge = cacheControl
-    .replace(/\bs-maxage=/g, "max-age=")
-    // Bare `stale-while-revalidate` (not followed by `=`) → explicit window.
-    .replace(/\bstale-while-revalidate\b(?!=)/g, `stale-while-revalidate=${UNBOUNDED_SWR_SECONDS}`);
-  return /\bpublic\b/.test(withMaxAge) ? withMaxAge : `public, ${withMaxAge}`;
+  const directives = splitCacheControlDirectives(cacheControl);
+  const hasSharedMaxAge = directives.some((directive) => /^s-maxage\s*=/i.test(directive));
+  const withMaxAge = directives
+    .filter((directive) => !hasSharedMaxAge || !/^max-age\s*=/i.test(directive))
+    .map((directive) =>
+      directive
+        .replace(/^s-maxage\s*=/i, "max-age=")
+        // Bare `stale-while-revalidate` (not followed by `=`) → explicit window.
+        .replace(/^stale-while-revalidate$/i, `stale-while-revalidate=${UNBOUNDED_SWR_SECONDS}`),
+    )
+    .join(", ");
+  return directives.some((directive) => /^public$/i.test(directive))
+    ? withMaxAge
+    : `public, ${withMaxAge}`;
 }
 
 /**
@@ -210,6 +235,9 @@ export class CloudflareCdnCacheAdapter implements CdnCacheAdapter {
     },
     readCacheControl(headers: Headers): string | null {
       return readCloudflareResponseCacheControl(headers);
+    },
+    readCacheControlHeaderName(headers: Headers): string | null {
+      return readCloudflareResponsePolicyHeaderName(headers);
     },
     hasExplicitNonCacheablePolicy(headers: Headers, baseline?: Headers): boolean {
       if (baseline) {
@@ -305,22 +333,22 @@ export class CloudflareCdnCacheAdapter implements CdnCacheAdapter {
     // promoted to an edge cache. Clear any cacheable headers this adapter owns
     // in case middleware stamped them before the final policy was known.
     if (isNonCacheableCacheControl(input.cacheControl)) {
-      return clearCloudflareCdnResponseHeaders(input.cacheControl);
+      return clearCloudflareCdnResponseHeaders(input.cacheControl, input.browserCacheControl);
     }
 
     // Use Cloudflare's consumed edge-only header rather than CDN-Cache-Control.
     // The latter is forwarded to downstream CDNs, where the private inner
     // cache key and request-stage personalization are no longer available.
-    // The browser is told to revalidate every reuse so it never serves a stale
-    // stored copy.
+    // Keep an admitted endpoint's explicit browser policy, or require browser
+    // revalidation by default; explicitly authored client policy stays unchanged.
     const cacheTag = input.tags?.length ? formatCacheTag(input.tags) : null;
     if (input.tags?.length && !cacheTag) {
-      return clearCloudflareCdnResponseHeaders(NO_STORE);
+      return clearCloudflareCdnResponseHeaders(NO_STORE, input.browserCacheControl);
     }
 
     return {
       ...getBuildIdentityResponseHeader(),
-      "Cache-Control": BROWSER_REVALIDATE,
+      "Cache-Control": input.browserCacheControl ?? BROWSER_REVALIDATE,
       "CDN-Cache-Control": null,
       "Cloudflare-CDN-Cache-Control": toEdgeCacheControl(input.cacheControl),
       "Cache-Tag": cacheTag,
