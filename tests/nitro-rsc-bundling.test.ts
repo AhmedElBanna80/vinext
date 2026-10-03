@@ -42,6 +42,19 @@ describe("RSC environment dependency bundling under Nitro", () => {
     expect(rsc?.resolve?.noExternal).toBe(true);
   }, 15000);
 
+  // The RSC environment's blanket `noExternal: true` would otherwise also sweep
+  // Next's default server-external packages into the bundle -- breaking any
+  // package whose own code assumes it is still sitting inside node_modules (a
+  // native addon's path-discovery helper) or that is not safe to inline into a
+  // single compiled chunk (a bare top-level `import.meta`). `external` carves
+  // those packages back out, same as the non-Nitro branch below does.
+  it("keeps Next's default server-external packages external even while bundling everything else", async () => {
+    const rsc = await resolveRscEnvironment([{ name: "nitro" }]);
+    expect(rsc?.resolve?.noExternal).toBe(true);
+    expect(rsc?.resolve?.external).toContain("sqlite3");
+    expect(rsc?.resolve?.external).toContain("typescript");
+  }, 15000);
+
   // Nitro dev serve otherwise leaves the rsc environment with plugin-rsc's
   // own noExternal package list, externalizing `next` before vinext's
   // resolveId shim can intercept it (#3608). The full-bundling fix above
