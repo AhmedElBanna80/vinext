@@ -421,7 +421,10 @@ test.describe("production server action ownership", () => {
     const response = await postAction(page, "/ownership/report/public", app.actionIds.redirectTo, [
       "/ownership/report/admin/secret",
     ]);
-    expect(response.status).toBe(303);
+    // Client-handled (fetch) action redirects answer with 200, not 303 —
+    // see vercel/next.js#96310. A 303 is reserved for progressive
+    // enhancement (no-JS) form submissions.
+    expect(response.status).toBe(200);
     expect(response.headers["x-action-redirect"]).toBe("/ownership/report/admin/secret");
     expect(response.body).toBe("");
     expect(response.body).not.toContain("ADMIN_SECRET_MARKER_42");
@@ -431,7 +434,9 @@ test.describe("production server action ownership", () => {
     const response = await postAction(page, "/ownership/report/shared", app.actionIds.redirectTo, [
       "https://example.com/destination",
     ]);
-    expect(response.status).toBe(303);
+    // Client-handled (fetch) action redirects answer with 200, not 303 —
+    // see vercel/next.js#96310.
+    expect(response.status).toBe(200);
     expect(response.headers["x-action-redirect"]).toBe("https://example.com/destination");
     expect(response.body).toBe("");
   });
