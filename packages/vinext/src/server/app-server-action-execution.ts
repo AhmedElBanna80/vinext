@@ -770,6 +770,18 @@ function withoutRscBodyHeaders(headers: Headers): Headers {
   return nextHeaders;
 }
 
+/**
+ * A fetch-action redirect the client follows itself. `redirectHeaders` already
+ * carries the source path's config headers, so mark them applied: at 200,
+ * finalization would otherwise apply them again (duplicate Set-Cookie, or a
+ * Flight Content-Type restored onto the empty body).
+ */
+function createHeaderOnlyActionRedirectResponse(redirectHeaders: Headers): Response {
+  return markAppRscResponseConfigHeadersApplied(
+    new Response(null, { status: 200, headers: withoutRscBodyHeaders(redirectHeaders) }),
+  );
+}
+
 function isReadableStreamBody(body: BodyInit | null): body is ReadableStream<Uint8Array> {
   return typeof ReadableStream !== "undefined" && body instanceof ReadableStream;
 }
@@ -1658,10 +1670,7 @@ export async function handleServerActionRscRequest<
       );
       if (!redirectTarget) {
         options.clearRequestContext();
-        return new Response(null, {
-          status: 200,
-          headers: withoutRscBodyHeaders(redirectHeaders),
-        });
+        return createHeaderOnlyActionRedirectResponse(redirectHeaders);
       }
 
       let targetResponse: Response | null = null;
@@ -1698,10 +1707,7 @@ export async function handleServerActionRscRequest<
       ) {
         targetResponse?.body?.cancel().catch(() => {});
         options.clearRequestContext();
-        return new Response(null, {
-          status: 200,
-          headers: withoutRscBodyHeaders(redirectHeaders),
-        });
+        return createHeaderOnlyActionRedirectResponse(redirectHeaders);
       }
 
       mergeActionRedirectTargetHeaders(redirectHeaders, targetResponse.headers);

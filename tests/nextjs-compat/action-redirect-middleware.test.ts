@@ -40,6 +40,7 @@ const MIDDLEWARE_REDIRECT_ACTION_ID = `${ACTIONS}#redirectToMiddlewareRedirect`;
 async function postFetchAction(
   baseUrl: string,
   actionId: string,
+  extraHeaders: Record<string, string> = {},
 ): Promise<{ res: Response; text: string }> {
   const res = await fetch(`${baseUrl}${ACTION_PATH}`, {
     method: "POST",
@@ -48,6 +49,7 @@ async function postFetchAction(
       "next-action": actionId,
       rsc: "1",
       "x-rsc-action": actionId,
+      ...extraHeaders,
     },
     body: JSON.stringify([]),
     redirect: "manual",
@@ -182,6 +184,30 @@ describe("Next.js compat: server action redirect targets run middleware", () => 
       expect(res.headers.get("location")).toBeNull();
       expect(text).toBe("");
     });
+
+    // The source path's next.config headers are merged into header-only
+    // redirects up front; finalization must not apply them a second time.
+    it.each([
+      ["a middleware-blocked target", ACTION_ID],
+      ["an external URL", EXTERNAL_ACTION_ID],
+    ])(
+      "applies source config headers once to a header-only redirect to %s",
+      async (_label, actionId) => {
+        const { res, text } = await postFetchAction(baseUrl, actionId, {
+          "x-action-config-header-probe": "1",
+        });
+
+        expect(res.status).toBe(200);
+        expect(text).toBe("");
+        // A Flight Content-Type on the empty body would make the client decode
+        // it instead of taking the header-only navigation path.
+        expect(res.headers.get("content-type")).toBeNull();
+        expect(
+          res.headers.getSetCookie().filter((cookie) => cookie.startsWith("action-config-cookie=")),
+        ).toHaveLength(1);
+        expect(res.headers.get("x-action-source-only")).toBe("yes");
+      },
+    );
 
     it("answers a no-JS form action redirect with 303 and a Location", async () => {
       const res = await postProgressiveAction(baseUrl, ABOUT_ACTION_ID);
