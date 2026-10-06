@@ -381,13 +381,14 @@ describe("Image SSR rendering", () => {
   });
 
   // Next.js marks data:/blob: sources unoptimized before generateImgAttrs.
-  it("never passes data: or blob: sources to a custom loader", () => {
+  it("never passes data:, blob: or empty sources to a custom loader", () => {
     const loader = vi.fn(({ src, width }: { src: string; width: number }) => `${src}?w=${width}`);
-    for (const src of ["data:image/png;base64,iVBORw0KGgo=", "blob:https://example.com/uuid"]) {
+    for (const src of ["data:image/png;base64,iVBORw0KGgo=", "blob:https://example.com/uuid", ""]) {
       const imageProps = { alt: "inline", src, width: 100, height: 100, loader };
 
       const html = ReactDOMServer.renderToString(React.createElement(Image, imageProps));
-      expect(html).toContain(`src="${src}"`);
+      // React omits an empty src attribute entirely.
+      if (src) expect(html).toContain(`src="${src}"`);
       expect(html).not.toContain("srcSet");
 
       const { props } = getImageProps(imageProps);
@@ -395,6 +396,25 @@ describe("Image SSR rendering", () => {
       expect(props.srcSet).toBeUndefined();
     }
     expect(loader).not.toHaveBeenCalled();
+  });
+
+  // Next.js deletes a caller-provided srcSet before building the attributes.
+  it("ignores a caller-provided srcSet", () => {
+    const loader = ({ src, width }: { src: string; width: number }) => `${src}?w=${width}`;
+    const imageProps = {
+      alt: "srcset",
+      src: "/photo.jpg",
+      width: 100,
+      height: 100,
+      loader,
+      srcSet: "/evil.jpg 1x",
+    } as Parameters<typeof getImageProps>[0];
+    const srcSet = "/photo.jpg?w=128 1x, /photo.jpg?w=256 2x";
+
+    const html = ReactDOMServer.renderToString(React.createElement(Image, imageProps));
+    expect(html).toContain(`srcSet="${srcSet}"`);
+    expect(html).not.toContain("/evil.jpg");
+    expect(getImageProps(imageProps).props.srcSet).toBe(srcSet);
   });
 
   // Next.js applies these attributes regardless of which loader built the URL.

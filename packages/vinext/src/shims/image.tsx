@@ -469,8 +469,9 @@ function resolveImageLoader(
   return effectiveLoader;
 }
 
+/** Sources Next.js always treats as unoptimized (empty, data: and blob:). */
 function isInlineSrc(src: string): boolean {
-  return src.startsWith("data:") || src.startsWith("blob:");
+  return !src || src.startsWith("data:") || src.startsWith("blob:");
 }
 
 /** Internal: set by shims/legacy-image.tsx, which wraps this component. */
@@ -503,6 +504,9 @@ const Image = forwardRef<HTMLImageElement, InternalImageProps>(function Image(
   },
   ref,
 ) {
+  // Next.js drops a caller-provided srcSet (`delete rest.srcSet` in getImgProps)
+  // so it can't override the generated candidates.
+  delete (rest as { srcSet?: unknown }).srcSet;
   // Dedup refs: ensure onLoad and onError fire at most once per src per mount.
   // Matches Next.js behavior — prevents double-firing from React re-renders,
   // strict-mode double-invocation, or state updates inside the handler itself.
@@ -943,6 +947,7 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
     loading,
     ...rest
   } = props;
+  delete (rest as { srcSet?: unknown }).srcSet;
 
   const {
     src,
