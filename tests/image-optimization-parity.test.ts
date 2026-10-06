@@ -10,7 +10,10 @@ const PNG_1X1 = Buffer.from(
   "base64",
 );
 
-async function createImageFixture(router: "app" | "pages"): Promise<string> {
+async function createImageFixture(
+  router: "app" | "pages",
+  options: { nextConfig?: string; files?: Record<string, string> } = {},
+): Promise<string> {
   const baseFixtureDir = router === "app" ? APP_FIXTURE_DIR : PAGES_FIXTURE_DIR;
   const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), `vinext-${router}-image-parity-`));
   await fs.cp(baseFixtureDir, rootDir, { recursive: true });
@@ -63,7 +66,27 @@ export default function Page() {
     );
   }
 
+  if (options.nextConfig !== undefined) {
+    // next.config.ts takes priority over other extensions, so overwrite it.
+    await fs.writeFile(path.join(rootDir, "next.config.ts"), options.nextConfig);
+  }
+  for (const [file, contents] of Object.entries(options.files ?? {})) {
+    await fs.mkdir(path.dirname(path.join(rootDir, file)), { recursive: true });
+    await fs.writeFile(path.join(rootDir, file), contents);
+  }
+
   return rootDir;
+}
+
+function getImageSrcSetFromHtml(html: string, alt: string): string {
+  for (const match of html.matchAll(/<img\b[^>]*>/g)) {
+    const tag = match[0];
+    if (!tag.includes(`alt="${alt}"`)) continue;
+    const srcSetMatch = tag.match(/\ssrcSet="([^"]+)"/);
+    if (srcSetMatch) return srcSetMatch[1].replaceAll("&amp;", "&");
+  }
+
+  throw new Error(`Could not find srcSet on <img> tag for alt="${alt}"`);
 }
 
 function getImageSrcFromHtml(html: string, alt: string): string {
@@ -171,6 +194,107 @@ describe("image deployment query parity", () => {
       width: 828,
       quality: 85,
     });
+  });
+});
+
+// Ported from Next.js: test/e2e/next-image-new/trailing-slash/trailing-slash.test.ts
+// https://github.com/vercel/next.js/blob/canary/test/e2e/next-image-new/trailing-slash/trailing-slash.test.ts
+describe("App Router next/image with trailingSlash: true", () => {
+  let server: ViteDevServer;
+  let baseUrl: string;
+  let fixtureDir: string;
+
+  beforeAll(async () => {
+    fixtureDir = await createImageFixture("app", {
+      nextConfig: "export default { trailingSlash: true };\n",
+      files: {
+        "app/image-parity/loader-prop/page.tsx": `"use client";
+import Image from "next/image";
+
+export default function Page() {
+  return (
+    <Image
+      alt="loader-prop"
+      src="/hello world.png"
+      width={64}
+      height={64}
+      loader={({ src, width, quality }) => \`https://cdn.example.com\${src}?w=\${width}&q=\${quality ?? "auto"}\`}
+    />
+  );
+}
+`,
+      },
+    });
+    ({ server, baseUrl } = await startFixtureServer(fixtureDir, { appRouter: true }));
+  }, 30000);
+
+  afterAll(async () => {
+    await server?.close();
+    await fs.rm(fixtureDir, { recursive: true, force: true });
+  });
+
+  it("emits /_next/image/ URLs that reach the image endpoint directly", async () => {
+    const html = await fetchHtmlWithRetry(baseUrl, "/image-parity/");
+    const src = getImageSrcFromHtml(html, "space");
+
+    expect(src).toBe("/_next/image/?url=%2Fhello%20world.png&w=128&q=75");
+    expect(getImageSrcSetFromHtml(html, "space")).toBe(
+      "/_next/image/?url=%2Fhello%20world.png&w=64&q=75 1x, /_next/image/?url=%2Fhello%20world.png&w=128&q=75 2x",
+    );
+
+    // The dev image endpoint 302s to the source file; no trailing-slash 308 first.
+    const res = await fetch(new URL(src, baseUrl), { redirect: "manual" });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/hello%20world.png");
+  });
+
+  // Next.js runs a custom loader through the same generateImgAttrs as the
+  // default loader (shared/lib/get-img-props.ts), passing quality unchanged.
+  it("gives a custom loader prop every srcSet width and an unset quality", async () => {
+    const html = await fetchHtmlWithRetry(baseUrl, "/image-parity/loader-prop/");
+
+    expect(getImageSrcFromHtml(html, "loader-prop")).toBe(
+      "https://cdn.example.com/hello world.png?w=128&q=auto",
+    );
+    expect(getImageSrcSetFromHtml(html, "loader-prop")).toBe(
+      "https://cdn.example.com/hello world.png?w=64&q=auto 1x, https://cdn.example.com/hello world.png?w=128&q=auto 2x",
+    );
+  });
+});
+
+// Ported from Next.js: test/e2e/next-image-new/loader-config/loader-config.test.ts
+// https://github.com/vercel/next.js/blob/canary/test/e2e/next-image-new/loader-config/loader-config.test.ts
+describe("App Router next/image with images.loaderFile", () => {
+  let server: ViteDevServer;
+  let baseUrl: string;
+  let fixtureDir: string;
+
+  beforeAll(async () => {
+    fixtureDir = await createImageFixture("app", {
+      // Next.js applies loaderFile when images.loader is unset, "default" or "custom".
+      nextConfig: 'export default { images: { loaderFile: "./dummy-loader.mjs" } };\n',
+      files: {
+        "dummy-loader.mjs": `export default function dummyLoader({ src, width, quality }) {
+  return \`\${src}#w:\${width},q:\${quality || 50}\`;
+}
+`,
+      },
+    });
+    ({ server, baseUrl } = await startFixtureServer(fixtureDir, { appRouter: true }));
+  }, 30000);
+
+  afterAll(async () => {
+    await server?.close();
+    await fs.rm(fixtureDir, { recursive: true, force: true });
+  });
+
+  it("routes images without a loader prop through the configured loader file", async () => {
+    const html = await fetchHtmlWithRetry(baseUrl, "/image-parity");
+
+    expect(getImageSrcFromHtml(html, "space")).toBe("/hello world.png#w:128,q:50");
+    expect(getImageSrcSetFromHtml(html, "space")).toBe(
+      "/hello world.png#w:64,q:50 1x, /hello world.png#w:128,q:50 2x",
+    );
   });
 });
 

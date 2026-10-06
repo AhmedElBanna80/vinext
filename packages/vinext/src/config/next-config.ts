@@ -314,9 +314,9 @@ export type NextConfig = {
   headers?: () => Promise<NextHeader[]> | NextHeader[];
   /** Image optimization config */
   images?: {
-    /** "default" (built-in /_next/image endpoint) or "custom" (use `loaderFile`). Defaults to "default". */
-    loader?: "default" | "custom";
-    /** Path to a module exporting a custom image loader as its default export. Requires `loader: "custom"`. */
+    /** Image loader. Defaults to "default"; only "default" and "custom" can be combined with `loaderFile`. */
+    loader?: "default" | "imgix" | "cloudinary" | "akamai" | "custom";
+    /** Path (relative to the project root) to a module whose default export is the image loader. */
     loaderFile?: string;
     remotePatterns?: Array<
       | URL

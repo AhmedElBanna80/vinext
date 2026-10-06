@@ -1,59 +1,73 @@
 /**
  * `images.loaderFile` config wiring.
  *
- * Next.js's `images: { loader: "custom", loaderFile: "./my-loader.js" }`
- * points at a module whose default export is a custom ImageLoader, used by
- * every `next/image` instance that doesn't set its own `loader` prop.
- *
- * vinext wires this as a `resolve.alias` entry (not a generated virtual
- * module — there is nothing to generate, just a file swap): the bare
- * specifier `vinext:image-loader-file` resolves to the user's configured
- * file when set, or to shims/image-loader-file-default.ts (`undefined`,
- * a no-op) otherwise. shims/image.tsx imports that specifier unconditionally
- * and falls back to it when no per-image `loader` prop is given — see
- * tests/image-component.test.ts for the shim-side srcSet/quality behavior
- * once a loader (prop or loaderFile) is in play.
- *
- * Ported from Next.js: test/e2e/next-image-new/loader-config/loader-config.test.ts
- * https://github.com/vercel/next.js/blob/canary/test/e2e/next-image-new/loader-config/loader-config.test.ts
+ * shims/image.tsx imports `vinext/shims/image-loader-file`; the vinext plugin
+ * aliases that specifier to the configured loader file, mirroring how Next.js
+ * aliases `next/dist/shared/lib/image-loader` to it. The rules come from the
+ * `images.loaderFile` normalization in Next.js's server/config.ts. See
+ * tests/image-optimization-parity.test.ts for the end-to-end fixture coverage.
  */
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { describe, it, expect } from "vite-plus/test";
+import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import vinext from "../packages/vinext/src/index.js";
+import { APP_FIXTURE_DIR, aliasEntriesToRecord } from "./helpers.js";
 
-const APP_FIXTURE_DIR = path.resolve(import.meta.dirname, "./fixtures/app-basic");
+const SPECIFIER = "vinext/shims/image-loader-file";
+const DEFAULT_MODULE_RE = /[/\\]shims[/\\]image-loader-file\.(ts|js)$/;
 
 async function resolveAliasMap(images?: Record<string, unknown>) {
+  // oxlint-disable-next-line typescript/no-explicit-any
   const plugins = vinext({ nextConfig: () => ({ images }) }) as any[];
   const configPlugin = plugins.find((plugin) => plugin.name === "vinext:config");
   const config = await configPlugin.config(
     { root: APP_FIXTURE_DIR, plugins: [] },
     { command: "build", mode: "production" },
   );
-  const alias = config.resolve.alias as Array<{ find: string; replacement: string }>;
-  return Object.fromEntries(alias.map((entry) => [entry.find, entry.replacement]));
+  return aliasEntriesToRecord(config.resolve.alias);
 }
 
 describe("images.loaderFile resolve.alias wiring", () => {
-  it("aliases to the no-op default when images is unset", async () => {
-    const aliasMap = await resolveAliasMap(undefined);
-    expect(aliasMap["vinext:image-loader-file"]).toMatch(/image-loader-file-default\.(ts|js)$/);
+  let tmpDir: string;
+  let loaderFile: string;
+
+  beforeAll(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-image-loader-file-"));
+    loaderFile = path.join(tmpDir, "my-loader.js");
+    fs.writeFileSync(loaderFile, "export default ({ src }) => src;\n");
   });
 
-  it("aliases to the no-op default when loader is 'default' (or unset) even with loaderFile present", async () => {
-    const aliasMap = await resolveAliasMap({ loaderFile: "./my-loader.js" });
-    expect(aliasMap["vinext:image-loader-file"]).toMatch(/image-loader-file-default\.(ts|js)$/);
+  afterAll(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("aliases to the configured file, resolved against the project root, when loader is 'custom'", async () => {
-    const aliasMap = await resolveAliasMap({ loader: "custom", loaderFile: "./my-loader.js" });
-    expect(aliasMap["vinext:image-loader-file"]).toBe(
-      path.resolve(APP_FIXTURE_DIR, "./my-loader.js"),
+  it("keeps vinext's undefined default when loaderFile is unset", async () => {
+    expect((await resolveAliasMap(undefined))[SPECIFIER]).toMatch(DEFAULT_MODULE_RE);
+    expect((await resolveAliasMap({ loader: "custom" }))[SPECIFIER]).toMatch(DEFAULT_MODULE_RE);
+  });
+
+  it.each([undefined, "default", "custom"])(
+    "resolves loaderFile against the project root when loader is %s",
+    async (loader) => {
+      const aliasMap = await resolveAliasMap({
+        loader,
+        loaderFile: path.relative(APP_FIXTURE_DIR, loaderFile),
+      });
+      expect(aliasMap[SPECIFIER]).toBe(loaderFile);
+    },
+  );
+
+  it("rejects loaderFile combined with a built-in loader preset", async () => {
+    await expect(resolveAliasMap({ loader: "imgix", loaderFile })).rejects.toThrow(
+      'Specified images.loader property (imgix) cannot be used with images.loaderFile property. Please set images.loader to "custom".',
     );
   });
 
-  it("aliases to the no-op default when loader is 'custom' but loaderFile is missing", async () => {
-    const aliasMap = await resolveAliasMap({ loader: "custom" });
-    expect(aliasMap["vinext:image-loader-file"]).toMatch(/image-loader-file-default\.(ts|js)$/);
+  it("rejects a loaderFile that does not exist", async () => {
+    const missing = path.join(tmpDir, "missing-loader.js");
+    await expect(resolveAliasMap({ loaderFile: missing })).rejects.toThrow(
+      `Specified images.loaderFile does not exist at "${missing}".`,
+    );
   });
 });

@@ -1306,7 +1306,28 @@ const _appBrowserServerActionClientPath = resolveShimModulePath(
 const _appRscCombinedHandlerPath = resolveShimModulePath(_serverDir, "app-rsc-combined-handler");
 const _appRscHandlerPath = resolveShimModulePath(_serverDir, "app-rsc-handler");
 const _pagesClientAssetsPath = resolveShimModulePath(_serverDir, "pages-client-assets");
-const _imageLoaderFileDefaultPath = resolveShimModulePath(_shimsDir, "image-loader-file-default");
+const _imageLoaderFilePath = resolveShimModulePath(_shimsDir, "image-loader-file");
+
+/**
+ * Resolve the module behind `vinext/shims/image-loader-file`. Ported from
+ * Next.js's `images.loaderFile` normalization in server/config.ts: the file
+ * is used when `images.loader` is unset, "default" or "custom", and must exist.
+ */
+function resolveImageLoaderFile(images: NextConfig["images"], root: string): string {
+  const loaderFile = images?.loaderFile;
+  if (!loaderFile) return _imageLoaderFilePath;
+  const loader = images.loader ?? "default";
+  if (loader !== "default" && loader !== "custom") {
+    throw new Error(
+      `Specified images.loader property (${loader}) cannot be used with images.loaderFile property. Please set images.loader to "custom".`,
+    );
+  }
+  const absolutePath = path.resolve(root, loaderFile);
+  if (!fs.existsSync(absolutePath)) {
+    throw new Error(`Specified images.loaderFile does not exist at "${absolutePath}".`);
+  }
+  return absolutePath;
+}
 // Source checkouts resolve to TypeScript and must stay in Vite's graph so tests
 // do not execute a stale dist build. Published packages resolve to emitted JS,
 // which Node can load natively outside the RSC transform graph.
@@ -3519,16 +3540,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   ...nextConfig.aliases,
                   ...nextShimMap,
                   "vinext/server/pages-client-assets": _pagesClientAssetsPath,
-                  // `images.loaderFile` from next.config.js — an absolute
-                  // path when `images: { loader: "custom", loaderFile }` is
-                  // set, else the no-op default (shims/image.tsx imports
-                  // this unconditionally and treats `undefined` as "no
-                  // configured loader file").
-                  "vinext:image-loader-file":
-                    nextConfig.images?.loader === "custom" &&
-                    typeof nextConfig.images.loaderFile === "string"
-                      ? path.resolve(root, nextConfig.images.loaderFile)
-                      : _imageLoaderFileDefaultPath,
+                  // shims/image.tsx imports this slot for `images.loaderFile`.
+                  // Like Next.js (which aliases next/dist/shared/lib/image-loader
+                  // to the file), point it at the user's file, resolved against
+                  // the project root; otherwise keep vinext's `undefined` default.
+                  "vinext/shims/image-loader-file": resolveImageLoaderFile(nextConfig.images, root),
                 },
                 tsconfigPathAliases,
                 { ...nextConfig.aliases, ...nextShimMap },

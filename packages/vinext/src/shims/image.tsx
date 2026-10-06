@@ -26,11 +26,9 @@ import type {
 import { getDeploymentId } from "../utils/deployment-id.js";
 import { hasRemoteMatch, isPrivateIp, type RemotePattern } from "./image-config.js";
 import { useMergedRef } from "./use-merged-ref.js";
-// Resolves to the user's `images.loaderFile` (via a resolve.alias entry
-// the vinext plugin adds in index.ts) when next.config.js sets
-// `images: { loader: "custom", loaderFile: "..." }`; otherwise `undefined`
-// (shims/image-loader-file-default.ts) — a no-op, same as not importing it.
-import __imageLoaderFileDefault from "vinext:image-loader-file";
+// The user's `images.loaderFile` default export when next.config.js sets one
+// (the vinext plugin aliases this specifier to it), otherwise `undefined`.
+import configuredImageLoader from "vinext/shims/image-loader-file";
 
 export type { ImageLoader, StaticImageData, StaticRequire };
 export type ImageLoaderProps = Parameters<ImageLoader>[0];
@@ -309,8 +307,8 @@ export function imageOptimizationUrl(src: string, width: number, quality: number
     source.src.startsWith("/") && source.deploymentId ? `&dpl=${source.deploymentId}` : "";
   // Matches Next.js: when `trailingSlash` is set, the image optimizer's own
   // path gets a trailing slash too, same as every other route.
-  const basePath = __trailingSlash ? "/_next/image/" : "/_next/image";
-  return `${basePath}?url=${encodeURIComponent(source.src)}&w=${width}&q=${quality}${deploymentQuery}`;
+  const imagePath = __trailingSlash ? "/_next/image/" : "/_next/image";
+  return `${imagePath}?url=${encodeURIComponent(source.src)}&w=${width}&q=${quality}${deploymentQuery}`;
 }
 
 function preloadImageResource(input: {
@@ -623,7 +621,7 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
   // responsibility for the URL, bypassing remotePatterns validation and the
   // /_next/image endpoint. `quality` is passed through as given (possibly
   // undefined); only the built-in loader defaults it to 75.
-  const effectiveLoader = loader ?? (__imageLoaderFileDefault as ImageLoader | undefined);
+  const effectiveLoader = loader ?? configuredImageLoader;
   if (effectiveLoader) {
     const resolvedQuality = typeof quality === "string" ? Number(quality) : quality;
     const loaderAttributes =
@@ -900,9 +898,18 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
     return { props: Object.assign(imageProps, { "data-nimg": fill ? "fill" : "1" }) };
   }
 
-  // Validate remote URLs against configured patterns
+  // Resolve src through a custom loader if provided (the `loader` prop, or
+  // `images.loaderFile` from next.config.js when no per-image prop was
+  // given). `quality` is passed through as given, including `undefined` —
+  // only the built-in /_next/image loader below defaults it to 75.
+  const effectiveLoader = loader ?? configuredImageLoader;
+  const imgQuality = typeof _quality === "string" ? Number(_quality) : _quality;
+
+  // Validate remote URLs against configured patterns. As in the component
+  // path (and Next.js's default loader), a custom loader owns the URL, so
+  // remotePatterns don't apply to it.
   let blockedInProd = false;
-  if (isRemoteUrl(src)) {
+  if (!effectiveLoader && isRemoteUrl(src)) {
     const validation = validateRemoteUrl(src);
     if (!validation.allowed) {
       if (__isDev) {
@@ -913,13 +920,6 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
       }
     }
   }
-
-  // Resolve src through a custom loader if provided (the `loader` prop, or
-  // `images.loaderFile` from next.config.js when no per-image prop was
-  // given). `quality` is passed through as given, including `undefined` —
-  // only the built-in /_next/image loader below defaults it to 75.
-  const effectiveLoader = loader ?? (__imageLoaderFileDefault as ImageLoader | undefined);
-  const imgQuality = typeof _quality === "string" ? Number(_quality) : _quality;
 
   let optimizedSrc: string;
   let srcSet: string | undefined;
