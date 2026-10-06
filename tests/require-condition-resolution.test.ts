@@ -18,6 +18,8 @@ type TestResolve = (
 ) => Promise<string | undefined>;
 type TestFilter = (id: string) => boolean | undefined;
 
+const TEST_ENVIRONMENT = { config: { resolve: { external: [] } } };
+
 function createPlugin(
   resolve: TestResolve,
   filter: TestFilter = (id) => (isConditionalRequireScriptModuleId(id) ? true : undefined),
@@ -37,7 +39,7 @@ function createPlugin(
 function createTransform(resolve: TestResolve, filter?: TestFilter) {
   const hook = createPlugin(resolve, filter).transform;
   const handler = typeof hook === "function" ? hook : hook?.handler;
-  return handler!.bind({ environment: {} } as never) as (
+  return handler!.bind({ environment: TEST_ENVIRONMENT } as never) as (
     code: string,
     id: string,
   ) => Promise<{ code: string } | null>;
@@ -177,7 +179,7 @@ describe("vinext:require-condition-resolution", () => {
       const transformHandler =
         typeof transformHook === "function" ? transformHook : transformHook?.handler;
       if (!transformHandler) throw new Error("missing transform hook");
-      const transform = transformHandler.bind({ environment: {} } as never) as (
+      const transform = transformHandler.bind({ environment: TEST_ENVIRONMENT } as never) as (
         code: string,
         id: string,
       ) => Promise<{ code: string }>;
@@ -236,7 +238,7 @@ describe("vinext:require-condition-resolution", () => {
         typeof transformHook === "function" ? transformHook : transformHook?.handler;
       if (!transformHandler) throw new Error("missing transform hook");
       const transformed = await transformHandler.call(
-        { environment: {} } as never,
+        { environment: TEST_ENVIRONMENT } as never,
         `require("library");`,
         path.join(root, "page.tsx"),
       );
@@ -270,7 +272,7 @@ describe("vinext:require-condition-resolution", () => {
         typeof transformHook === "function" ? transformHook : transformHook?.handler;
       if (!transformHandler) throw new Error("missing transform hook");
       await transformHandler.call(
-        { environment: {} } as never,
+        { environment: TEST_ENVIRONMENT } as never,
         `require("library");`,
         path.join(root, "page.tsx"),
       );
@@ -288,7 +290,13 @@ describe("vinext:require-condition-resolution", () => {
     }
   });
 
-  it("resolves the require condition for packages a server environment would externalize", async () => {
+  // Server environments without `noExternal: true` (e.g. Nitro services)
+  // externalize node_modules packages by default; explicit externals still win.
+  it.each([
+    ["bundles the require target of a default-externalized package", {}, true],
+    ["keeps a package listed in resolve.external external", { external: ["lib-cjs"] }, false],
+    ["keeps packages external when resolve.external is true", { external: true as const }, false],
+  ])("%s", async (_name, resolve, rewritten) => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vinext-require-condition-")));
     try {
       const packageDir = path.join(root, "node_modules", "lib-cjs");
@@ -309,27 +317,29 @@ describe("vinext:require-condition-resolution", () => {
         root,
         configFile: false,
         logLevel: "silent",
-        environments: { ssr: {} },
+        environments: { ssr: { resolve } },
       });
-      const config = builder.config;
       const plugin = createRequireConditionResolutionPlugin(createIdResolver, () => undefined);
       const configResolved = plugin.configResolved;
       if (typeof configResolved !== "function") throw new Error("missing configResolved hook");
-      await configResolved.call({} as never, config);
+      await configResolved.call({} as never, builder.config);
       const hook = plugin.transform;
       const handler = typeof hook === "function" ? hook : hook?.handler;
 
-      const importer = path.join(root, "page.tsx");
       const result = (await handler!.call(
         { environment: builder.environments.ssr } as never,
         `const Library = require("lib-cjs");\nexport default Library;`,
-        importer,
+        path.join(root, "page.tsx"),
       )) as { code: string } | null;
 
-      expect(result).not.toBeNull();
-      expect(result?.code).toContain(
-        `require(${JSON.stringify(`${path.join(packageDir, "index.js")}.vinext-require.js`)})`,
-      );
+      if (rewritten) {
+        expect(result).not.toBeNull();
+        expect(result?.code).toContain(
+          `require(${JSON.stringify(`${path.join(packageDir, "index.js")}.vinext-require.js`)})`,
+        );
+      } else {
+        expect(result).toBeNull();
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
     }

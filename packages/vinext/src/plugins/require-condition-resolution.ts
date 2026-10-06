@@ -177,18 +177,32 @@ export function createRequireConditionResolutionPlugin(
   // Entries are keyed by the query-free resolved file path and are therefore
   // bounded by the distinct conditional package targets seen by the app.
   const virtualTargets = new Map<string, { file: string; moduleType: SyntheticModuleType }>();
-  let resolveImport: ReturnType<IdResolverFactory> | undefined;
-  let resolveRequire: ReturnType<IdResolverFactory> | undefined;
+  type ResolverPair = {
+    require: ReturnType<IdResolverFactory>;
+    import: ReturnType<IdResolverFactory>;
+  };
+  let defaultResolvers: ResolverPair | undefined;
+  let bundlingResolvers: ResolverPair | undefined;
 
   return {
     name: "vinext:require-condition-resolution",
     enforce: "pre",
     configResolved(config) {
-      // Resolve to the real file even for packages Vite would externalize in a
-      // server environment: the CommonJS transform turns the call into a static
-      // import that gets bundled, so the condition must be picked here.
-      resolveImport = createResolver(config, { isRequire: false, noExternal: true });
-      resolveRequire = createResolver(config, { isRequire: true, noExternal: true });
+      defaultResolvers = {
+        require: createResolver(config, { isRequire: true }),
+        import: createResolver(config, { isRequire: false }),
+      };
+      // Server environments without `noExternal: true` (e.g. Nitro services)
+      // externalize node_modules packages by default, and the id resolver then
+      // returns the bare specifier. The static import that vite-plugin-commonjs
+      // emits for it is later resolved with the `import` condition by the next
+      // bundler or Node's ESM loader, so resolve to the real file here and
+      // bundle the `require` target, as Next.js does for server dependencies.
+      // Packages listed in `resolve.external` still take precedence.
+      bundlingResolvers = {
+        require: createResolver(config, { isRequire: true, noExternal: true }),
+        import: createResolver(config, { isRequire: false, noExternal: true }),
+      };
     },
     resolveId(source) {
       if (virtualTargets.has(source)) return source;
@@ -230,7 +244,11 @@ export function createRequireConditionResolutionPlugin(
           return null;
         }
         const requires = collectLiteralRequires(code, id);
-        if (requires.length === 0 || !resolveImport || !resolveRequire) return null;
+        // `resolve.external: true` asks for every dependency to stay external,
+        // so don't pull require targets into the bundle there.
+        const resolvers =
+          this.environment.config.resolve.external === true ? defaultResolvers : bundlingResolvers;
+        if (requires.length === 0 || !resolvers) return null;
 
         const output = new MagicString(code);
         let changed = false;
@@ -238,8 +256,8 @@ export function createRequireConditionResolutionPlugin(
         // again so nested package require() calls retain their own conditions.
         for (const { argument, specifier } of requires) {
           const [requireResolution, importResolution] = await Promise.all([
-            resolveRequire(this.environment, specifier, id),
-            resolveImport(this.environment, specifier, id),
+            resolvers.require(this.environment, specifier, id),
+            resolvers.import(this.environment, specifier, id),
           ]);
           if (
             !requireResolution ||
