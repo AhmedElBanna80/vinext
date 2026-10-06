@@ -1,4 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import os from "node:os";
 import path from "node:path";
 import { parseAst } from "vite";
 import { describe, expect, it } from "vite-plus/test";
@@ -152,10 +154,11 @@ describe("commonJsEsmFacadeOptimizeDepsPlugin", () => {
 
 describe("commentOutDisplacedHashbang", () => {
   it("comments out the hashbang the plugin's prepended code displaced", async () => {
-    const transformed = await transformCommonJs("#!/usr/env node\n\nmodule.exports = 123\n", id);
+    const source = "#!/usr/env node\n\nmodule.exports = 123\n";
+    const transformed = await transformCommonJs(source, id);
     expect(transformed?.code).toMatch(/-E \*\/#!\/usr\/env node\n/);
 
-    const output = commentOutDisplacedHashbang(transformed!.code);
+    const output = commentOutDisplacedHashbang(source, transformed!.code);
     expect(output).toBe(transformed!.code.replace("*/#!/usr/env node", "*////usr/env node"));
     expect(() => parseAst(output!)).not.toThrow();
     // The plugin's source map still points `module.exports` at line 3.
@@ -168,36 +171,51 @@ describe("commentOutDisplacedHashbang", () => {
   });
 
   it("lets the facade check parse ESM that starts with a hashbang", async () => {
-    const transformed = await transformCommonJs(
-      `#!/usr/env node\nexports.named = "cjs";\nexport const named = "esm";`,
-      id,
-    );
+    const source = `#!/usr/env node\nexports.named = "cjs";\nexport const named = "esm";`;
+    const transformed = await transformCommonJs(source, id);
     expect(stripEsmCommonJsExportFacade(transformed!.code)).toBeUndefined();
 
-    const output = commentOutDisplacedHashbang(transformed!.code);
+    const output = commentOutDisplacedHashbang(source, transformed!.code);
     expect(stripEsmCommonJsExportFacade(output!)).not.toContain("__CJS__export_named__");
   });
 
-  it("leaves a hashbang on byte 0 and later `#!` text alone", () => {
-    expect(commentOutDisplacedHashbang(`#!/usr/env node\nmodule.exports = 1;`)).toBeUndefined();
-    expect(
-      commentOutDisplacedHashbang(
-        `/* [vite-plugin-commonjs] export-runtime-E */module.exports = 1;\n/* [vite-plugin-commonjs] export-runtime-E */#!`,
-      ),
-    ).toBeUndefined();
+  it("only rewrites the hashbang, not marker-shaped strings or specifiers", async () => {
+    const marker = "/* [vite-plugin-commonjs] import-hoist-E */#!";
+    const withoutHashbang = `module.exports = "${marker}payload";`;
+    const plain = await transformCommonJs(withoutHashbang, id);
+    expect(plain?.code.split("\n")[0]).toContain(`${marker}payload`);
+    expect(commentOutDisplacedHashbang(withoutHashbang, plain!.code)).toBeUndefined();
+
+    const withHashbang = `#!/usr/env node\nmodule.exports = require("${marker}/usr/env node");`;
+    const hoisted = await transformCommonJs(withHashbang, id);
+    const output = commentOutDisplacedHashbang(withHashbang, hoisted!.code);
+    expect(output).toContain(`from "${marker}/usr/env node"`);
+    expect(output).toBe(hoisted!.code.replace(/#!\/usr\/env node\n/, "///usr/env node\n"));
+  });
+
+  it("leaves a hashbang the plugin did not displace alone", () => {
+    const source = `#!/usr/env node\nmodule.exports = 1;`;
+    expect(commentOutDisplacedHashbang(source, source)).toBeUndefined();
   });
 });
 
 describe("commonJsHashbangOptimizeDepsPlugin", () => {
-  type TransformHandler = (code: string) => { code: string; map: null } | null;
+  type TransformHandler = (code: string, id: string) => Promise<{ code: string; map: null } | null>;
   const transform = commonJsHashbangOptimizeDepsPlugin.transform as { handler: TransformHandler };
 
-  it("comments out a displaced hashbang without moving code", () => {
-    const loaded = `/* [vite-plugin-commonjs] export-runtime-E */#!/usr/env node\nmodule.exports = 1;`;
+  it("comments out a displaced hashbang of the file on disk without moving code", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "vinext-cjs-hashbang-"));
+    const file = path.join(dir, "module.js");
+    try {
+      await writeFile(file, `#!/usr/env node\nmodule.exports = 1;`);
+      const loaded = `/* [vite-plugin-commonjs] export-runtime-E */#!/usr/env node\nmodule.exports = 1;`;
 
-    expect(transform.handler.call(undefined, loaded)).toEqual({
-      code: `/* [vite-plugin-commonjs] export-runtime-E *////usr/env node\nmodule.exports = 1;`,
-      map: null,
-    });
+      expect(await transform.handler.call(undefined, loaded, file)).toEqual({
+        code: `/* [vite-plugin-commonjs] export-runtime-E *////usr/env node\nmodule.exports = 1;`,
+        map: null,
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

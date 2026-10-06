@@ -2251,7 +2251,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           return transformed;
         }
         // Before the facade check, which has to parse the output.
-        const output = commentOutDisplacedHashbang(transformed.code) ?? transformed.code;
+        const output = commentOutDisplacedHashbang(code, transformed.code) ?? transformed.code;
         const stripped = stripEsmCommonJsExportFacade(output) ?? output;
         return stripped === transformed.code ? transformed : { ...transformed, code: stripped };
       });
