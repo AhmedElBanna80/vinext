@@ -5556,7 +5556,8 @@ describe("createAppRscHandler", () => {
       expect(response.status).toBe(200);
       expect(await response.text()).toBe("img");
       expect(response.headers.get("x-nextjs-cache")).toBe("MISS");
-      expect(response.headers.get("Cache-Control")).toBe("public, max-age=31536000, immutable");
+      // Like Next.js: revalidating, not immutable, for non-hashed public files.
+      expect(response.headers.get("Cache-Control")).toBe("public, max-age=14400, must-revalidate");
       expect(fetchAsset.mock.calls[0]?.[0].url).toBe("https://example.test/img.jpg");
 
       fetchAsset.mockResolvedValueOnce(new Response("", { status: 404 }));
@@ -5573,6 +5574,70 @@ describe("createAppRscHandler", () => {
         null,
       );
       expect(dev.status).toBe(302);
+    } finally {
+      nitroGlobal.__nitro__ = previous;
+    }
+  });
+
+  it("keeps client headers and source Set-Cookie out of the Nitro image path", async () => {
+    const nitroGlobal = globalThis as { __nitro__?: unknown };
+    const previous = nitroGlobal.__nitro__;
+    const fetchAsset = vi.fn(
+      async (_request: Request) =>
+        new Response("img", {
+          status: 200,
+          headers: {
+            "Content-Type": "image/jpeg",
+            "Set-Cookie": "session=abc",
+            "Cache-Control": "public, max-age=60000",
+            "X-Middleware": "1",
+          },
+        }),
+    );
+    nitroGlobal.__nitro__ = { default: { fetch: fetchAsset } };
+    try {
+      const handler = createHandler({ isDev: false });
+      const response = await handler(
+        new Request("https://example.test/docs/_next/image?url=%2Fimg.jpg&w=640&q=75", {
+          headers: { cookie: "user=1", authorization: "Bearer x" },
+        }),
+        null,
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.has("set-cookie")).toBe(false);
+      expect(response.headers.has("x-middleware")).toBe(false);
+      // The source's own max-age wins when it exceeds the minimum.
+      expect(response.headers.get("Cache-Control")).toBe("public, max-age=60000, must-revalidate");
+      const sourceRequest = fetchAsset.mock.calls[0]?.[0];
+      expect(sourceRequest?.headers.has("cookie")).toBe(false);
+      expect(sourceRequest?.headers.has("authorization")).toBe(false);
+
+      // A route that answers with a non-image is rejected, not proxied.
+      fetchAsset.mockResolvedValueOnce(
+        new Response('{"secret":1}', {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Set-Cookie": "s=1" },
+        }),
+      );
+      const route = await handler(
+        new Request("https://example.test/docs/_next/image?url=%2Fapi%2Fx&w=640&q=75"),
+        null,
+      );
+      expect(route.status).toBe(400);
+      expect(route.headers.has("set-cookie")).toBe(false);
+      expect(route.headers.has("x-nextjs-cache")).toBe(false);
+
+      // Hashed build media is content-addressed, so it stays immutable.
+      fetchAsset.mockResolvedValueOnce(
+        new Response("img", { status: 200, headers: { "Content-Type": "image/png" } }),
+      );
+      const hashed = await handler(
+        new Request(
+          "https://example.test/docs/_next/image?url=%2Fdocs%2F_next%2Fstatic%2Fmedia%2Fa.abc.png&w=640&q=75",
+        ),
+        null,
+      );
+      expect(hashed.headers.get("Cache-Control")).toBe("public, max-age=31536000, immutable");
     } finally {
       nitroGlobal.__nitro__ = previous;
     }

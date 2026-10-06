@@ -103,7 +103,7 @@ import { parseNextHttpErrorDigest } from "./next-error-digest.js";
 import {
   DEFAULT_DEVICE_SIZES,
   DEFAULT_IMAGE_SIZES,
-  handleConfiguredImageOptimization,
+  handleNitroImageOptimization,
   isImageOptimizationPath,
   resolveDevImageRedirect,
   type ImageConfig,
@@ -1561,14 +1561,15 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     const nitroFetch = options.isDev ? undefined : getNitroAppFetch();
     const assetUrl = new URL(imageRedirect, url.origin);
     if (nitroFetch && !isImageOptimizationPath(assetUrl.pathname)) {
-      return handleConfiguredImageOptimization(
+      return handleNitroImageOptimization(
         request,
-        (assetPath) => nitroFetch(new Request(new URL(assetPath, url.origin))),
+        nitroFetch,
         [
           ...(options.imageConfig?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
           ...(options.imageConfig?.imageSizes ?? DEFAULT_IMAGE_SIZES),
         ],
         options.imageConfig,
+        options.basePath,
       );
     }
     return Response.redirect(assetUrl.href, 302);
