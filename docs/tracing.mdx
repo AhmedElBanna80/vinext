@@ -46,7 +46,7 @@ const nextConfig: NextConfig = {
 export default nextConfig;
 ```
 
-A package listed in `transpilePackages` is removed from the automatic externals. Transpiling `@opentelemetry/instrumentation` also skips the automatic ESM loader registration described above, so ESM modules are not instrumented in that build.
+A package listed in `transpilePackages` is removed from the automatic externals. Transpiling `@opentelemetry/instrumentation` also skips the automatic ESM loader registration described above, so vinext no longer instruments ESM modules automatically in that build.
 
 ## Framework spans
 
