@@ -1601,6 +1601,9 @@ type NitroSetupContext = {
     buildDir?: string;
     dev?: boolean;
     exportConditions?: string[];
+    node?: boolean;
+    output?: { serverDir?: string };
+    preset?: string;
     routeRules?: Record<string, NitroRouteRuleConfig>;
     traceDeps?: string[];
     traceOpts?: {
@@ -1608,6 +1611,9 @@ type NitroSetupContext = {
         tracedPackages?: (tracedPackages: TracedPackages) => void | Promise<void>;
       };
     };
+  };
+  hooks?: {
+    hook(name: "compiled", handler: () => void | Promise<void>): unknown;
   };
   logger?: {
     warn?: (message: string) => void;
@@ -7953,21 +7959,30 @@ export const loadServerActionClient = ${
 
           if (nitro.options.dev) return;
 
-          const { createNitroTraceIncludesHook } = await import("./build/nitro-trace-includes.js");
-          const traceIncludesHook = createNitroTraceIncludesHook(
+          const { createNitroTraceIncludes } = await import("./build/nitro-trace-includes.js");
+          const traceIncludes = createNitroTraceIncludes(
             root,
             nextConfig.outputFileTracingIncludes,
             nextConfig.outputFileTracingExcludes,
             nitro.logger?.warn ?? console.warn,
           );
-          if (traceIncludesHook) {
+          if (traceIncludes) {
             const traceOpts = (nitro.options.traceOpts ??= {});
             const hooks = (traceOpts.hooks ??= {});
             const userTracedPackages = hooks.tracedPackages;
             hooks.tracedPackages = async (tracedPackages) => {
-              traceIncludesHook(tracedPackages);
+              traceIncludes.tracedPackages(tracedPackages);
               await userTracedPackages?.(tracedPackages);
             };
+            // Nitro skips the dependency trace, and so the hook above, when the
+            // server bundle has no traced externals. Worker presets have no
+            // node_modules output at all.
+            if (nitro.options.node !== false && nitro.options.preset !== "nitro-prerender") {
+              nitro.hooks?.hook("compiled", () => {
+                const serverDir = nitro.options.output?.serverDir;
+                if (serverDir) traceIncludes.writeUntraced(serverDir);
+              });
+            }
           }
 
           const { collectNitroRouteRules, mergeNitroRouteRules } =

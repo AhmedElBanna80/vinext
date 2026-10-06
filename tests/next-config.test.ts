@@ -1942,13 +1942,13 @@ describe("parseBodySizeLimit", () => {
 });
 
 describe("resolveNextConfig outputFileTracingIncludes/Excludes", () => {
-  it("defaults to empty arrays", async () => {
+  it("defaults to empty maps", async () => {
     const resolved = await resolveNextConfig({ env: {} });
-    expect(resolved.outputFileTracingIncludes).toEqual([]);
-    expect(resolved.outputFileTracingExcludes).toEqual([]);
+    expect(resolved.outputFileTracingIncludes).toEqual({});
+    expect(resolved.outputFileTracingExcludes).toEqual({});
   });
 
-  it("merges the globs of every route key and drops duplicates", async () => {
+  it("keeps the globs of each route key", async () => {
     const resolved = await resolveNextConfig({
       outputFileTracingIncludes: {
         "/": ["./node_modules/typescript/lib/lib.*.d.ts", "./data/**"],
@@ -1956,21 +1956,23 @@ describe("resolveNextConfig outputFileTracingIncludes/Excludes", () => {
       },
       outputFileTracingExcludes: { "/": ["./node_modules/@swc/core-*/**"] },
     });
-    expect(resolved.outputFileTracingIncludes).toEqual([
-      "./node_modules/typescript/lib/lib.*.d.ts",
-      "./data/**",
-      "./node_modules/@types/node/**",
-    ]);
-    expect(resolved.outputFileTracingExcludes).toEqual(["./node_modules/@swc/core-*/**"]);
+    expect(resolved.outputFileTracingIncludes).toEqual({
+      "/": ["./node_modules/typescript/lib/lib.*.d.ts", "./data/**"],
+      "/api/*": ["./data/**", "./node_modules/@types/node/**"],
+    });
+    expect(resolved.outputFileTracingExcludes).toEqual({ "/": ["./node_modules/@swc/core-*/**"] });
   });
 
   it("ignores values that are not a route-keyed map of string arrays", async () => {
     const resolved = await resolveNextConfig({
       outputFileTracingIncludes: ["./data/**"] as unknown as Record<string, string[]>,
-      outputFileTracingExcludes: { "/": [1, "./keep/**"] } as unknown as Record<string, string[]>,
+      outputFileTracingExcludes: { "/": [1, "./keep/**"], "/empty": "x" } as unknown as Record<
+        string,
+        string[]
+      >,
     });
-    expect(resolved.outputFileTracingIncludes).toEqual([]);
-    expect(resolved.outputFileTracingExcludes).toEqual(["./keep/**"]);
+    expect(resolved.outputFileTracingIncludes).toEqual({});
+    expect(resolved.outputFileTracingExcludes).toEqual({ "/": ["./keep/**"] });
   });
 });
 
@@ -2623,8 +2625,8 @@ describe("detectNextIntlConfig", () => {
       serverActionsBodySizeLimitLabel: "1 MB",
       htmlLimitedBots: undefined,
       serverExternalPackages: [],
-      outputFileTracingIncludes: [],
-      outputFileTracingExcludes: [],
+      outputFileTracingIncludes: {},
+      outputFileTracingExcludes: {},
       cacheHandler: undefined,
       cacheMaxMemorySize: undefined,
       hashSalt: "",

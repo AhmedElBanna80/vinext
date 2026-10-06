@@ -10,8 +10,15 @@ import path, { toSlash } from "pathslash";
  * TypeScript's `lib.*.d.ts`) are left out. Next.js lets apps add those files
  * with `outputFileTracingIncludes`. Nitro exposes the traced package list
  * through the `traceOpts.hooks.tracedPackages` hook before it writes the
- * output, so included files inside `node_modules` are added there and
- * excluded files are removed.
+ * output, so included files inside `node_modules` are added there. When the
+ * server bundle has no traced externals Nitro skips the trace (and the hook),
+ * so the included files are copied after the build instead.
+ *
+ * Next.js applies each route key to the routes it matches and subtracts that
+ * route's excludes from its own trace. vinext emits one server bundle shared
+ * by every route, so it cannot tell whether a traced file excluded for one
+ * route is needed by another. Excludes therefore only remove files selected by
+ * the includes of the same route key, and never remove Nitro's traced files.
  *
  * Files outside `node_modules` are not part of Nitro's traced output, so they
  * are reported through `warn` and otherwise ignored.
@@ -40,6 +47,16 @@ type PackageFiles = {
   files: string[];
 };
 
+export type NitroTraceIncludes = {
+  /** Nitro `traceOpts.hooks.tracedPackages` hook. */
+  tracedPackages(tracedPackages: TracedPackages): void;
+  /**
+   * Copy the included files into `<serverDir>/node_modules` when Nitro did
+   * not run its dependency trace for this build.
+   */
+  writeUntraced(serverDir: string): void;
+};
+
 // Nitro's tracer reports forward-slash real paths, so compare in that form.
 const NODE_MODULES_SEGMENT = "/node_modules/";
 
@@ -53,6 +70,24 @@ function globFiles(root: string, patterns: readonly string[]): string[] {
       files.add(toSlash(fs.realpathSync(absolute)));
     } catch {
       // Broken symlink or file removed during the build.
+    }
+  }
+  return [...files];
+}
+
+/** Files selected by each route key's includes, minus that key's excludes. */
+function collectIncludedFiles(
+  root: string,
+  includes: Readonly<Record<string, readonly string[]>>,
+  excludes: Readonly<Record<string, readonly string[]>>,
+): string[] {
+  const files = new Set<string>();
+  for (const [routeGlob, includeGlobs] of Object.entries(includes)) {
+    const excluded = new Set(
+      globFiles(root, Object.hasOwn(excludes, routeGlob) ? excludes[routeGlob] : []),
+    );
+    for (const file of globFiles(root, includeGlobs)) {
+      if (!excluded.has(file)) files.add(file);
     }
   }
   return [...files];
@@ -113,49 +148,82 @@ function samePath(a: string, b: string): boolean {
 }
 
 /**
- * Build a `tracedPackages` hook for Nitro's dependency trace, or `null` when
- * neither option selects a file.
+ * Build the Nitro hooks that apply `outputFileTracingIncludes` (filtered by
+ * `outputFileTracingExcludes`), or `null` when no include globs are set. Globs
+ * are expanded when the hooks run, after the server build.
  */
-export function createNitroTraceIncludesHook(
+export function createNitroTraceIncludes(
   root: string,
-  includes: readonly string[],
-  excludes: readonly string[],
+  includes: Readonly<Record<string, readonly string[]>>,
+  excludes: Readonly<Record<string, readonly string[]>>,
   warn: (message: string) => void,
-): ((tracedPackages: TracedPackages) => void) | null {
-  const { packages: included, outsideNodeModules } = groupByPackage(globFiles(root, includes));
-  const excluded = new Set(globFiles(root, excludes));
-  if (included.length === 0 && excluded.size === 0 && outsideNodeModules === 0) return null;
+): NitroTraceIncludes | null {
+  if (!Object.values(includes).some((globs) => globs.length > 0)) return null;
+  let applied = false;
 
-  return (tracedPackages) => {
+  const apply = (tracedPackages: TracedPackages): void => {
+    applied = true;
+    const { packages, outsideNodeModules } = groupByPackage(
+      collectIncludedFiles(root, includes, excludes),
+    );
     if (outsideNodeModules > 0) {
       warn(
         `[vinext] outputFileTracingIncludes matched ${outsideNodeModules} file(s) outside node_modules. ` +
           "Nitro's traced output only contains node_modules, so these files are not copied.",
       );
     }
-    for (const pkg of included) {
-      const pkgJSON = readPackageJson(pkg);
-      const version = pkgJSON.version || "0.0.0";
-      const traced = (tracedPackages[pkg.name] ??= { name: pkg.name, versions: {} });
-      const existing = traced.versions[version];
-      if (!existing) {
-        traced.versions[version] = { path: pkg.path, files: [...pkg.files], pkgJSON };
+
+    const otherCopies: string[] = [];
+    for (const pkg of packages) {
+      const versions = Object.values(tracedPackages[pkg.name]?.versions ?? {});
+      if (versions.length === 0) {
+        const pkgJSON = readPackageJson(pkg);
+        tracedPackages[pkg.name] = {
+          name: pkg.name,
+          versions: { [pkgJSON.version || "0.0.0"]: { path: pkg.path, files: pkg.files, pkgJSON } },
+        };
         continue;
       }
-      // Another copy of the same name and version is already traced from a
-      // different location; leave Nitro's choice alone.
-      if (!samePath(existing.path, pkg.path)) continue;
+      // nf3 links the first version without trace parents as the package
+      // root, so adding another copy could replace the copy the server bundle
+      // actually resolves. Only extend a copy Nitro already traced.
+      const existing = versions.find((version) => samePath(version.path, pkg.path));
+      if (!existing) {
+        otherCopies.push(pkg.path);
+        continue;
+      }
       const existingFiles = new Set(existing.files);
       for (const file of pkg.files) {
         if (!existingFiles.has(file)) existing.files.push(file);
       }
     }
-
-    if (excluded.size === 0) return;
-    for (const traced of Object.values(tracedPackages)) {
-      for (const version of Object.values(traced.versions)) {
-        version.files = version.files.filter((file) => !excluded.has(file));
-      }
+    if (otherCopies.length > 0) {
+      warn(
+        `[vinext] outputFileTracingIncludes matched files in ${otherCopies.join(", ")}, ` +
+          "but Nitro traced a different copy of the same package, so these files are not copied.",
+      );
     }
+  };
+
+  return {
+    tracedPackages: apply,
+    writeUntraced(serverDir) {
+      if (applied) return;
+      const tracedPackages: TracedPackages = {};
+      apply(tracedPackages);
+      const outDir = path.join(serverDir, "node_modules");
+      for (const pkg of Object.values(tracedPackages)) {
+        for (const version of Object.values(pkg.versions)) {
+          const files = new Set(version.files);
+          const packageJson = path.join(version.path, "package.json");
+          if (fs.existsSync(packageJson)) files.add(packageJson);
+          for (const file of files) {
+            const target = path.join(outDir, pkg.name, path.relative(version.path, file));
+            fs.mkdirSync(path.dirname(target), { recursive: true });
+            fs.copyFileSync(file, target);
+          }
+        }
+      }
+    },
   };
 }

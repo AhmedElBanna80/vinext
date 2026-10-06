@@ -584,14 +584,11 @@ export type ResolvedNextConfig = {
    */
   serverExternalPackages: string[];
   /**
-   * Project-root-relative globs from every route key of
-   * `outputFileTracingIncludes` / `outputFileTracingExcludes`. vinext emits a
-   * single server bundle, so the per-route keys are merged: an include under
-   * any key is added to, and an exclude under any key removed from, the whole
-   * traced output. Next.js applies each key only to the routes it matches.
+   * `outputFileTracingIncludes` / `outputFileTracingExcludes`: route-glob keys
+   * mapped to project-root-relative file globs. Malformed values are dropped.
    */
-  outputFileTracingIncludes: string[];
-  outputFileTracingExcludes: string[];
+  outputFileTracingIncludes: Record<string, string[]>;
+  outputFileTracingExcludes: Record<string, string[]>;
   /** Enable sourcemaps for prerender error stack traces. Defaults to true. */
   enablePrerenderSourceMaps: boolean;
   /**
@@ -1433,10 +1430,17 @@ function readStringArray(value: unknown): string[] {
     : [];
 }
 
-/** Merge the glob lists of every route key of an `outputFileTracing*` map. */
-function readOutputFileTracingGlobs(value: unknown): string[] {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-  return [...new Set(Object.values(value).flatMap((globs) => readStringArray(globs)))];
+/**
+ * Keep the route keys of an `outputFileTracing*` map whose value has string
+ * globs, dropping malformed values.
+ */
+function readOutputFileTracingMap(value: unknown): Record<string, string[]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value)
+      .map(([routeGlob, globs]) => [routeGlob, readStringArray(globs)] as const)
+      .filter(([, globs]) => globs.length > 0),
+  );
 }
 
 /**
@@ -1746,8 +1750,8 @@ export async function resolveNextConfig(
       reactMaxHeadersLength: DEFAULT_REACT_MAX_HEADERS_LENGTH,
       htmlLimitedBots: undefined,
       serverExternalPackages: [],
-      outputFileTracingIncludes: [],
-      outputFileTracingExcludes: [],
+      outputFileTracingIncludes: {},
+      outputFileTracingExcludes: {},
       cacheHandler: undefined,
       cacheMaxMemorySize: undefined,
       enablePrerenderSourceMaps: true,
@@ -2125,8 +2129,8 @@ export async function resolveNextConfig(
         : DEFAULT_REACT_MAX_HEADERS_LENGTH,
     htmlLimitedBots,
     serverExternalPackages,
-    outputFileTracingIncludes: readOutputFileTracingGlobs(config.outputFileTracingIncludes),
-    outputFileTracingExcludes: readOutputFileTracingGlobs(config.outputFileTracingExcludes),
+    outputFileTracingIncludes: readOutputFileTracingMap(config.outputFileTracingIncludes),
+    outputFileTracingExcludes: readOutputFileTracingMap(config.outputFileTracingExcludes),
     cacheHandler,
     cacheMaxMemorySize,
     enablePrerenderSourceMaps: config.enablePrerenderSourceMaps ?? true,
