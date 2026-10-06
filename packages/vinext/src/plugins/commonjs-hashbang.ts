@@ -6,8 +6,11 @@ import type { Plugin } from "vite";
 // of the module's original first byte.
 const PREPENDED_CHUNK_END_RE = /\/\* \[vite-plugin-commonjs\] [\w-]+-E \*\/$/;
 
+// ECMAScript line terminators, any of which can end a hashbang.
+const LINE_TERMINATOR_RE = /[\n\r\u2028\u2029]/;
+
 function firstLine(code: string): string {
-  const end = code.indexOf("\n");
+  const end = code.search(LINE_TERMINATOR_RE);
   return end === -1 ? code : code.slice(0, end);
 }
 

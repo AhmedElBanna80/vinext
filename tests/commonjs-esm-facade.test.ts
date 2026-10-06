@@ -170,6 +170,21 @@ describe("commentOutDisplacedHashbang", () => {
     });
   });
 
+  it.each([
+    ["CRLF", "\r\n"],
+    ["CR", "\r"],
+    ["LS", "\u2028"],
+    ["PS", "\u2029"],
+  ])("handles a hashbang ended by %s", async (_name, terminator) => {
+    const source = `#!/usr/env node${terminator}module.exports = 123;`;
+    const transformed = await transformCommonJs(source, id);
+    expect(() => parseAst(transformed!.code)).toThrow();
+
+    const output = commentOutDisplacedHashbang(source, transformed!.code);
+    expect(output).toBe(transformed!.code.replace("*/#!/usr/env node", "*////usr/env node"));
+    expect(() => parseAst(output!)).not.toThrow();
+  });
+
   it("lets the facade check parse ESM that starts with a hashbang", async () => {
     const source = `#!/usr/env node\nexports.named = "cjs";\nexport const named = "esm";`;
     const transformed = await transformCommonJs(source, id);
