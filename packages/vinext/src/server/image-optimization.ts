@@ -533,7 +533,10 @@ export async function handleNitroImageOptimization(
     imageConfig,
   );
   if (response.status !== 200) return response;
-  const sourceUrl = new URL(request.url).searchParams.get("url") ?? "";
+  // Resolve `..` and percent-encoding the way the source fetch does, so a
+  // traversal out of the hashed directory is not treated as hashed media.
+  const sourceUrl = new URL(new URL(request.url).searchParams.get("url") ?? "", "http://n")
+    .pathname;
   const isStatic =
     sourceUrl.startsWith(`${basePath}/_next/static/media`) ||
     sourceUrl.startsWith(`${basePath}/_next/static/immutable/media`);

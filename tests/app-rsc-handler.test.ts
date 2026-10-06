@@ -5638,6 +5638,21 @@ describe("createAppRscHandler", () => {
         null,
       );
       expect(hashed.headers.get("Cache-Control")).toBe("public, max-age=31536000, immutable");
+
+      // A traversal out of the hashed directory is a plain public file.
+      for (const traversal of [
+        "%2Fdocs%2F_next%2Fstatic%2Fmedia%2F..%2Fhero.jpg",
+        "%2Fdocs%2F_next%2Fstatic%2Fmedia%2F%2e%2e%2Fhero.jpg",
+      ]) {
+        fetchAsset.mockResolvedValueOnce(
+          new Response("img", { status: 200, headers: { "Content-Type": "image/jpeg" } }),
+        );
+        const escaped = await handler(
+          new Request(`https://example.test/docs/_next/image?url=${traversal}&w=640&q=75`),
+          null,
+        );
+        expect(escaped.headers.get("Cache-Control")).toBe("public, max-age=14400, must-revalidate");
+      }
     } finally {
       nitroGlobal.__nitro__ = previous;
     }
