@@ -279,6 +279,7 @@ describe("App Router next/image with images.loaderFile", () => {
 }
 `,
         "app/image-parity/loader-file-variants/page.tsx": `import Image from "next/image";
+import LegacyImage from "next/legacy/image";
 
 export default function Page() {
   return (
@@ -287,6 +288,7 @@ export default function Page() {
         <Image alt="fill" src="/hello world.png" fill />
       </div>
       <Image alt="override" src="/hello world.png" width={64} height={64} overrideSrc="/override.png" />
+      <LegacyImage alt="legacy" src="/hello world.png" width={64} height={64} />
     </main>
   );
 }
@@ -324,6 +326,48 @@ export default function Page() {
     expect(getImageSrcSetFromHtml(html, "override")).toBe(
       "/hello world.png#w:64,q:50 1x, /hello world.png#w:128,q:50 2x",
     );
+  });
+
+  // Next.js's next/legacy/image has its own built-in loader and never imports
+  // the aliased image-loader module, so loaderFile leaves it untouched.
+  it("leaves next/legacy/image on the built-in loader", async () => {
+    const html = await fetchHtmlWithRetry(baseUrl, "/image-parity/loader-file-variants");
+
+    expect(getImageSrcFromHtml(html, "legacy")).toBe(
+      "/_next/image?url=%2Fhello%20world.png&w=128&q=75",
+    );
+  });
+});
+
+// Ported from Next.js: test/e2e/app-dir/loader-file-named-export-custom-loader-error
+// https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/loader-file-named-export-custom-loader-error/loader-file-named-export-custom-loader-error.test.ts
+describe("App Router next/image with a loaderFile lacking a default export", () => {
+  let server: ViteDevServer;
+  let baseUrl: string;
+  let fixtureDir: string;
+
+  beforeAll(async () => {
+    fixtureDir = await createImageFixture("app", {
+      // Leading slash is project-relative, as in the upstream fixture's config.
+      nextConfig: 'export default { images: { loaderFile: "/named-loader.mjs" } };\n',
+      files: {
+        "named-loader.mjs": "export function namedLoader({ src }) {\n  return src;\n}\n",
+      },
+    });
+    ({ server, baseUrl } = await startFixtureServer(fixtureDir, { appRouter: true }));
+  }, 30000);
+
+  afterAll(async () => {
+    await server?.close();
+    await fs.rm(fixtureDir, { recursive: true, force: true });
+  });
+
+  it("reports Next.js's missing default export error", async () => {
+    const res = await fetch(`${baseUrl}/image-parity`);
+    const body = await res.text();
+
+    expect(res.status).toBe(500);
+    expect(body).toContain("images.loaderFile detected but the file is missing default export.");
   });
 });
 

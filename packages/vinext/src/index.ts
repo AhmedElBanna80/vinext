@@ -1326,7 +1326,8 @@ function resolveImageLoaderFile(images: NextConfig["images"], root: string): str
       `Specified images.loader property (${loader}) cannot be used with images.loaderFile property. Please set images.loader to "custom".`,
     );
   }
-  const absolutePath = path.resolve(root, loaderFile);
+  // path.join (not resolve), as in Next.js: "/loader.js" is project-relative.
+  const absolutePath = path.join(root, loaderFile);
   if (!fs.existsSync(absolutePath)) {
     throw new Error(`Specified images.loaderFile does not exist at "${absolutePath}".`);
   }

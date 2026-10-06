@@ -26,9 +26,13 @@ import type {
 import { getDeploymentId } from "../utils/deployment-id.js";
 import { hasRemoteMatch, isPrivateIp, type RemotePattern } from "./image-config.js";
 import { useMergedRef } from "./use-merged-ref.js";
-// The user's `images.loaderFile` default export when next.config.js sets one
-// (the vinext plugin aliases this specifier to it), otherwise `undefined`.
-import configuredImageLoader from "vinext/shims/image-loader-file";
+// The user's `images.loaderFile` module when next.config.js sets one (the
+// vinext plugin aliases this specifier to it). A namespace import so a file
+// without a default export reaches resolveImageLoader's diagnostic instead of
+// failing module linking.
+import * as imageLoaderFileModule from "vinext/shims/image-loader-file";
+
+const configuredImageLoader: ImageLoader | undefined = imageLoaderFileModule.default;
 
 export type { ImageLoader, StaticImageData, StaticRequire };
 export type ImageLoaderProps = Parameters<ImageLoader>[0];
@@ -431,24 +435,37 @@ function generateLoaderAttributes(
   );
 }
 
+function missingLoaderError(src: string): Error {
+  return new Error(
+    `Image with src "${src}" is missing "loader" prop.` +
+      "\nRead more: https://nextjs.org/docs/messages/next-image-missing-loader",
+  );
+}
+
 /**
  * Pick the loader for an image: the `loader` prop, else `images.loaderFile`,
  * else `undefined` for the built-in /_next/image loader. Ported from the
  * loader checks at the top of Next.js's getImgProps (shared/lib/get-img-props.ts).
+ *
+ * `next/legacy/image` never consults `images.loaderFile` in Next.js, and its
+ * built-in "custom" loader only throws when asked for a URL (optimized images).
  */
-function resolveImageLoader(src: string, loader: ImageLoader | undefined): ImageLoader | undefined {
+function resolveImageLoader(
+  src: string,
+  loader: ImageLoader | undefined,
+  legacy?: { unoptimized: boolean },
+): ImageLoader | undefined {
+  if (legacy) {
+    if (!loader && __customImageLoader && !legacy.unoptimized) throw missingLoaderError(src);
+    return loader;
+  }
   if (__hasImageLoaderFile && typeof configuredImageLoader === "undefined") {
     throw new Error(
       "images.loaderFile detected but the file is missing default export.\nRead more: https://nextjs.org/docs/messages/invalid-images-config",
     );
   }
   const effectiveLoader = loader ?? configuredImageLoader;
-  if (!effectiveLoader && __customImageLoader) {
-    throw new Error(
-      `Image with src "${src}" is missing "loader" prop.` +
-        "\nRead more: https://nextjs.org/docs/messages/next-image-missing-loader",
-    );
-  }
+  if (!effectiveLoader && __customImageLoader) throw missingLoaderError(src);
   return effectiveLoader;
 }
 
@@ -456,8 +473,12 @@ function isInlineSrc(src: string): boolean {
   return src.startsWith("data:") || src.startsWith("blob:");
 }
 
-const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
+/** Internal: set by shims/legacy-image.tsx, which wraps this component. */
+type InternalImageProps = ImageProps & { __vinextLegacyImage?: boolean };
+
+const Image = forwardRef<HTMLImageElement, InternalImageProps>(function Image(
   {
+    __vinextLegacyImage,
     src: srcProp,
     alt,
     width,
@@ -529,7 +550,13 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
     height: imgHeight,
     blurDataURL: imgBlurDataURL,
   } = resolveImageSource({ src: srcProp, width, height, blurDataURL });
-  const effectiveLoader = resolveImageLoader(src, loader);
+  const effectiveLoader = resolveImageLoader(
+    src,
+    loader,
+    __vinextLegacyImage
+      ? { unoptimized: _unoptimized === true || __globallyUnoptimized || isInlineSrc(src) }
+      : undefined,
+  );
   const shouldPreload = preload === true || priority === true;
   const priorityFetchPriority = priority ? "high" : undefined;
   const imageLoading = priority ? "eager" : shouldPreload ? loading : (loading ?? "lazy");

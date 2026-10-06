@@ -154,6 +154,25 @@ describe("images.loader config validation", () => {
       shim.getImageProps({ alt: "a", src: "/photo.jpg", width: 100, height: 100 }),
     ).toThrow("images.loaderFile detected but the file is missing default export.");
   });
+
+  // Next.js's next/legacy/image never reads loaderFile, and its "custom" loader
+  // only throws when it has to build a URL (client/legacy/image.tsx).
+  it("keeps next/legacy/image off loaderFile and lets unoptimized images through", async () => {
+    process.env.__VINEXT_IMAGE_CUSTOM_LOADER = "true";
+    process.env.__VINEXT_IMAGE_LOADER_FILE = "true";
+    vi.resetModules();
+    const { default: LegacyImage } = await import("../packages/vinext/src/shims/legacy-image.js");
+    const imageProps = { alt: "a", src: "/photo.jpg", width: 100, height: 100 };
+
+    expect(
+      ReactDOMServer.renderToString(
+        React.createElement(LegacyImage, { ...imageProps, unoptimized: true }),
+      ),
+    ).toContain('src="/photo.jpg"');
+    expect(() =>
+      ReactDOMServer.renderToString(React.createElement(LegacyImage, imageProps)),
+    ).toThrow('Image with src "/photo.jpg" is missing "loader" prop.');
+  });
 });
 
 // ─── SSR rendering ──────────────────────────────────────────────────────
