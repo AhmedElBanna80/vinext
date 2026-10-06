@@ -1,5 +1,7 @@
 import fs from "node:fs";
 import path, { toSlash } from "pathslash";
+import { createValidFileMatcher } from "../routing/file-matcher.js";
+import { createContainsMatcher, createPathMatcher, globFiles } from "./trace-glob.js";
 
 /**
  * Apply Next.js `outputFileTracingIncludes` / `outputFileTracingExcludes` to
@@ -14,20 +16,23 @@ import path, { toSlash } from "pathslash";
  * server bundle has no traced externals Nitro skips the trace (and the hook),
  * so the included files are copied after the build instead.
  *
- * Next.js applies each route key to the routes it matches and subtracts that
- * route's excludes from its own trace. vinext emits one server bundle shared
- * by every route, so it cannot tell whether a traced file excluded for one
- * route is needed by another. Excludes therefore only remove files selected by
- * the includes of the same route key, and never remove Nitro's traced files.
+ * Next.js matches every route key against each server route and writes one
+ * trace per route: the route's traced files plus the files of every matching
+ * include key, minus the files of every matching exclude key
+ * (`collect-build-traces.ts`). A deployment ships the union of those traces.
+ * Nitro emits one server bundle and one traced `node_modules` shared by every
+ * route, so vinext ships that union directly:
  *
- * Files outside `node_modules` are not part of Nitro's traced output, so they
- * are reported through `warn` and otherwise ignored.
+ * - an included file ships when some route includes it and none of that
+ *   route's excludes match it;
+ * - a file Nitro traced is dropped only when the excludes of every route match
+ *   it, because the shared trace cannot be attributed to individual routes.
  *
- * Globs are expanded with `fs.globSync`, which differs from the `glob` options
- * Next.js uses (`{ dot: true, nodir: true }`) in two ways: dot files are only
- * matched when a pattern segment names them (`.prisma`, `.*`), and a wildcard
- * segment does not descend through a symlinked directory (literal segments,
- * such as pnpm's `node_modules/<name>` links, do).
+ * Next.js's Turbopack build does not apply excludes to included files; this
+ * follows the webpack build, which does. Edge runtime routes are matched like
+ * other routes, since they run in the same Node server under Nitro. Files
+ * outside `node_modules` are not part of Nitro's traced output, so they are
+ * reported through `warn` and otherwise ignored.
  */
 
 type TracedPackageVersion = {
@@ -59,43 +64,157 @@ export type NitroTraceIncludes = {
   writeUntraced(serverDir: string): void;
 };
 
+export type NitroTraceIncludesOptions = {
+  root: string;
+  /** Server route names, from {@link collectTraceRouteNames}. */
+  routes: readonly string[];
+  includes: Readonly<Record<string, readonly string[]>>;
+  excludes: Readonly<Record<string, readonly string[]>>;
+  warn: (message: string) => void;
+};
+
 // Nitro's tracer reports forward-slash paths, so compare in that form.
 const NODE_MODULES_SEGMENT = "/node_modules/";
 
-/**
- * Expand globs from the project root into matched file paths mapped to their
- * real paths. Like Next.js, the matched path decides where a file lands, so a
- * `node_modules/<link>` symlink keeps its link name.
- */
-function globFiles(root: string, patterns: readonly string[]): Map<string, string> {
-  const files = new Map<string, string>();
-  if (patterns.length === 0) return files;
-  for (const match of fs.globSync([...patterns], { cwd: root })) {
-    const absolute = path.resolve(root, match);
-    try {
-      if (!fs.statSync(absolute).isFile()) continue;
-      files.set(toSlash(absolute), toSlash(fs.realpathSync(absolute)));
-    } catch {
-      // Broken symlink or file removed during the build.
-    }
-  }
-  return files;
+function isGroupSegment(segment: string): boolean {
+  return segment.startsWith("(") && segment.endsWith(")");
 }
 
-/** Files selected by each route key's includes, minus that key's excludes. */
-function collectIncludedFiles(
-  root: string,
-  includes: Readonly<Record<string, readonly string[]>>,
-  excludes: Readonly<Record<string, readonly string[]>>,
-): Map<string, string> {
-  const files = new Map<string, string>();
-  for (const [routeGlob, includeGlobs] of Object.entries(includes)) {
-    const excluded = globFiles(root, Object.hasOwn(excludes, routeGlob) ? excludes[routeGlob] : []);
-    for (const [file, real] of globFiles(root, includeGlobs)) {
-      if (!excluded.has(file)) files.set(file, real);
+/** Port of Next.js `normalizeAppPath`. */
+function normalizeAppPath(entryName: string): string {
+  const segments = entryName.split("/");
+  let pathname = "";
+  segments.forEach((segment, index) => {
+    if (!segment || isGroupSegment(segment) || segment.startsWith("@")) return;
+    if ((segment === "page" || segment === "route") && index === segments.length - 1) return;
+    pathname += `/${segment}`;
+  });
+  return pathname || "/";
+}
+
+/** Port of Next.js `normalizePagePath`. */
+function normalizePagePath(page: string, isDynamic: boolean): string {
+  if (/^\/index(\/|$)/.test(page) && !isDynamic) return `/index${page}`;
+  return page === "/" ? "/index" : page;
+}
+
+/**
+ * Name each server route the way Next.js's build trace step does before
+ * matching route keys: the entry name normalized with `normalizeAppPath` for
+ * App Router entries (`app/(group)/api/hello/route` is `/app/api/hello`) and
+ * `normalizePagePath` for Pages Router entries (`/pages/index`,
+ * `/pages/api/hello`). Keys match anywhere in the name, so the documented
+ * `/api/hello` and `/*` forms work. The built-in entries Next.js always emits
+ * are included too.
+ */
+export async function collectTraceRouteNames(options: {
+  appDir: string | null;
+  pagesDir: string | null;
+  pageExtensions: readonly string[];
+}): Promise<string[]> {
+  const { appDir, pagesDir } = options;
+  const matcher = createValidFileMatcher(options.pageExtensions);
+  const names = new Set<string>();
+
+  if (appDir) {
+    const [{ appRouter }, { scanMetadataFiles }] = await Promise.all([
+      import("../routing/app-router.js"),
+      import("../server/metadata-routes.js"),
+    ]);
+    for (const route of await appRouter(appDir, options.pageExtensions, matcher)) {
+      const file = route.pagePath ?? route.routePath;
+      if (!file) continue;
+      const entry = matcher.stripExtension(toSlash(path.relative(appDir, file)));
+      names.add(normalizeAppPath(`app/${entry}`));
+    }
+    // Metadata routes are `app/<served path>/route` entries.
+    for (const route of scanMetadataFiles(appDir)) names.add(`/app${route.servedUrl}`);
+    names.add("/app/_not-found");
+    names.add("/app/_global-error");
+  }
+
+  if (pagesDir) {
+    const { apiRouter, pagesRouter } = await import("../routing/pages-router.js");
+    const [pages, apis] = await Promise.all([
+      pagesRouter(pagesDir, options.pageExtensions, matcher),
+      apiRouter(pagesDir, options.pageExtensions, matcher),
+    ]);
+    for (const route of [...pages, ...apis]) {
+      const relative = matcher.stripExtension(toSlash(path.relative(pagesDir, route.filePath)));
+      const page = `/${relative}`.replace(/\/index$/, "") || "/";
+      names.add(`/pages${normalizePagePath(page, route.isDynamic)}`);
+    }
+    for (const name of ["_app", "_document", "_error"]) names.add(`/pages/${name}`);
+  }
+
+  return [...names];
+}
+
+function realPath(file: string): string | null {
+  try {
+    return toSlash(fs.realpathSync(file));
+  } catch {
+    return null;
+  }
+}
+
+type TraceSelection = {
+  /** Included files (matched path to real path) that some route keeps. */
+  included: Map<string, string>;
+  /** Whether every route excludes a traced file. */
+  isTracedFileExcluded: (file: string) => boolean;
+};
+
+function selectFiles(options: NitroTraceIncludesOptions): TraceSelection {
+  const { root, routes, includes, excludes } = options;
+  const includeKeys = Object.keys(includes).map(
+    (key) => [key, createContainsMatcher([key])] as const,
+  );
+  const excludeKeys = Object.keys(excludes).map(
+    (key) => [key, createContainsMatcher([key])] as const,
+  );
+
+  // Routes that match the same keys select the same files.
+  const groups = new Map<string, { includes: string[]; excludes: string[] }>();
+  for (const route of routes) {
+    const matchedIncludes = includeKeys.filter(([, matches]) => matches(route)).map(([key]) => key);
+    const matchedExcludes = excludeKeys.filter(([, matches]) => matches(route)).map(([key]) => key);
+    groups.set(JSON.stringify([matchedIncludes, matchedExcludes]), {
+      includes: [...new Set(matchedIncludes.flatMap((key) => includes[key]))],
+      excludes: [...new Set(matchedExcludes.flatMap((key) => excludes[key]))],
+    });
+  }
+
+  // Nitro lists traced files by real path, so excludes also match from the
+  // project root's real path when the root is reached through a symlink.
+  const roots = [...new Set([path.resolve(root), realPath(root) ?? path.resolve(root)])];
+  const expanded = new Map<string, string[]>();
+  const included = new Map<string, string>();
+  const routeExcludes: Array<(file: string) => boolean> = [];
+  for (const group of groups.values()) {
+    const matchers = roots.map((base) => createPathMatcher(base, group.excludes));
+    const isExcluded = (file: string) => matchers.some((matches) => matches(file));
+    routeExcludes.push(isExcluded);
+    for (const glob of group.includes) {
+      let files = expanded.get(glob);
+      if (!files) {
+        files = globFiles(root, glob);
+        expanded.set(glob, files);
+      }
+      for (const file of files) {
+        if (included.has(file) || isExcluded(file)) continue;
+        // Skips files removed during the build.
+        const real = realPath(file);
+        if (real) included.set(file, real);
+      }
     }
   }
-  return files;
+
+  return {
+    included,
+    isTracedFileExcluded: (file) =>
+      routeExcludes.length > 0 && routeExcludes.every((isExcluded) => isExcluded(file)),
+  };
 }
 
 /** Split a `node_modules` file path into its package name and root. */
@@ -134,6 +253,24 @@ function groupByPackage(files: ReadonlyMap<string, string>): {
   return { packages: [...packages.values()], outsideNodeModules };
 }
 
+/**
+ * Drop traced files that every route excludes, and the package versions left
+ * without files. Nitro writes a `package.json` for each version it keeps, so
+ * an excluded `package.json` alone does not remove it.
+ */
+function removeExcludedTracedFiles(
+  tracedPackages: TracedPackages,
+  isExcluded: (file: string) => boolean,
+): void {
+  for (const [name, pkg] of Object.entries(tracedPackages)) {
+    for (const [version, entry] of Object.entries(pkg.versions)) {
+      entry.files = entry.files.filter((file) => !isExcluded(toSlash(file)));
+      if (entry.files.length === 0) delete pkg.versions[version];
+    }
+    if (Object.keys(pkg.versions).length === 0) delete tracedPackages[name];
+  }
+}
+
 // Same fallback nf3 uses for traced package directories without a
 // package.json, such as Prisma's generated `node_modules/.prisma`.
 function readPackageJson(pkg: PackageFiles): TracedPackageVersion["pkgJSON"] {
@@ -153,24 +290,23 @@ function samePath(a: string, b: string): boolean {
 }
 
 /**
- * Build the Nitro hooks that apply `outputFileTracingIncludes` (filtered by
- * `outputFileTracingExcludes`), or `null` when no include globs are set. Globs
+ * Build the Nitro hooks that apply `outputFileTracingIncludes` and
+ * `outputFileTracingExcludes`, or `null` when neither option has globs. Globs
  * are expanded when the hooks run, after the server build.
  */
 export function createNitroTraceIncludes(
-  root: string,
-  includes: Readonly<Record<string, readonly string[]>>,
-  excludes: Readonly<Record<string, readonly string[]>>,
-  warn: (message: string) => void,
+  options: NitroTraceIncludesOptions,
 ): NitroTraceIncludes | null {
-  if (!Object.values(includes).some((globs) => globs.length > 0)) return null;
+  const { includes, excludes, warn } = options;
+  if (Object.keys(includes).length === 0 && Object.keys(excludes).length === 0) return null;
   let applied = false;
 
   const apply = (tracedPackages: TracedPackages): void => {
     applied = true;
-    const { packages, outsideNodeModules } = groupByPackage(
-      collectIncludedFiles(root, includes, excludes),
-    );
+    const { included, isTracedFileExcluded } = selectFiles(options);
+    removeExcludedTracedFiles(tracedPackages, isTracedFileExcluded);
+
+    const { packages, outsideNodeModules } = groupByPackage(included);
     if (outsideNodeModules > 0) {
       warn(
         `[vinext] outputFileTracingIncludes matched ${outsideNodeModules} file(s) outside node_modules. ` +

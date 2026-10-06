@@ -7962,13 +7962,24 @@ export const loadServerActionClient = ${
 
           if (nitro.options.dev) return;
 
-          const { createNitroTraceIncludes } = await import("./build/nitro-trace-includes.js");
-          const traceIncludes = createNitroTraceIncludes(
-            root,
-            nextConfig.outputFileTracingIncludes,
-            nextConfig.outputFileTracingExcludes,
-            nitro.logger?.warn ?? console.warn,
-          );
+          const { collectTraceRouteNames, createNitroTraceIncludes } =
+            await import("./build/nitro-trace-includes.js");
+          const { outputFileTracingIncludes, outputFileTracingExcludes } = nextConfig;
+          const traceIncludes =
+            Object.keys(outputFileTracingIncludes).length > 0 ||
+            Object.keys(outputFileTracingExcludes).length > 0
+              ? createNitroTraceIncludes({
+                  root,
+                  routes: await collectTraceRouteNames({
+                    appDir: hasAppDir ? appDir : null,
+                    pagesDir: hasPagesDir ? pagesDir : null,
+                    pageExtensions: nextConfig.pageExtensions,
+                  }),
+                  includes: outputFileTracingIncludes,
+                  excludes: outputFileTracingExcludes,
+                  warn: nitro.logger?.warn ?? console.warn,
+                })
+              : null;
           if (traceIncludes) {
             const traceOpts = (nitro.options.traceOpts ??= {});
             const hooks = (traceOpts.hooks ??= {});
