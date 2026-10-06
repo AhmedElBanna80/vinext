@@ -1,6 +1,7 @@
 /**
  * `experimental.lightningCssFeatures` plumbed through to Vite's lightningcss
- * bridge (`css.lightningcss.include` / `css.lightningcss.exclude`).
+ * bridge (`css.lightningcss.include` / `css.lightningcss.exclude` /
+ * `css.lightningcss.drafts`).
  *
  * Ported from Next.js: test/e2e/app-dir/experimental-lightningcss-features/experimental-lightningcss-features.test.ts
  * https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/experimental-lightningcss-features/experimental-lightningcss-features.test.ts
@@ -29,39 +30,10 @@ async function makeFixture(): Promise<string> {
     ".themed {\n" +
       "  color: light-dark(black, white);\n" +
       "  background-color: light-dark(white, black);\n" +
-      "}\n",
-  );
-
-  const pagesDir = path.join(tmpDir, "pages");
-  await fs.mkdir(pagesDir, { recursive: true });
-  await fs.writeFile(
-    path.join(pagesDir, "_app.tsx"),
-    'import "../styles.css";\n' +
-      "export default function App({ Component, pageProps }: any) {\n" +
-      "  return <Component {...pageProps} />;\n" +
-      "}\n",
-  );
-  await fs.writeFile(
-    path.join(pagesDir, "index.tsx"),
-    'export default function Home() {\n  return <div className="themed">Hello</div>;\n}\n',
-  );
-
-  return tmpDir;
-}
-
-async function makeCustomMediaFixture(): Promise<string> {
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-lightning-css-custom-media-"));
-  await fs.symlink(ROOT_NODE_MODULES, path.join(tmpDir, "node_modules"), "junction");
-
-  const stylesPath = path.join(tmpDir, "styles.css");
-  await fs.writeFile(
-    stylesPath,
-    "@custom-media --narrow (max-width: 960px);\n" +
-      ".box {\n" +
-      "  color: blue;\n" +
       "}\n" +
+      "@custom-media --narrow (max-width: 960px);\n" +
       "@media (--narrow) {\n" +
-      "  .box {\n" +
+      "  .themed {\n" +
       "    color: red;\n" +
       "  }\n" +
       "}\n",
@@ -78,7 +50,7 @@ async function makeCustomMediaFixture(): Promise<string> {
   );
   await fs.writeFile(
     path.join(pagesDir, "index.tsx"),
-    'export default function Home() {\n  return <div className="box">Custom media</div>;\n}\n',
+    'export default function Home() {\n  return <div className="themed">Hello</div>;\n}\n',
   );
 
   return tmpDir;
@@ -100,143 +72,85 @@ async function findBuiltCss(dir: string): Promise<string> {
   return combined;
 }
 
+async function buildFixtureCss(lightningCssFeatures: {
+  include?: string[];
+  exclude?: string[];
+}): Promise<string> {
+  const tmpDir = await makeFixture();
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-lightning-build-"));
+  try {
+    await build({
+      root: tmpDir,
+      configFile: false,
+      plugins: [
+        vinext({
+          disableAppRouter: true,
+          nextConfig: {
+            experimental: {
+              useLightningcss: true,
+              lightningCssFeatures,
+            },
+          },
+        }),
+      ],
+      logLevel: "silent",
+      build: {
+        outDir: path.join(outDir, "client"),
+        manifest: true,
+        ssrManifest: true,
+        rolldownOptions: { input: "virtual:vinext-client-entry" },
+      },
+    });
+
+    return await findBuiltCss(path.join(outDir, "client"));
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(outDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 describe("experimental.lightningCssFeatures", () => {
   it("preserves light-dark() when listed in `exclude`", async () => {
-    const tmpDir = await makeFixture();
-    const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-lightning-build-"));
-    try {
-      await build({
-        root: tmpDir,
-        configFile: false,
-        plugins: [
-          vinext({
-            disableAppRouter: true,
-            nextConfig: {
-              experimental: {
-                useLightningcss: true,
-                lightningCssFeatures: {
-                  exclude: ["light-dark"],
-                },
-              },
-            },
-          }),
-        ],
-        logLevel: "silent",
-        build: {
-          outDir: path.join(outDir, "client"),
-          manifest: true,
-          ssrManifest: true,
-          rolldownOptions: { input: "virtual:vinext-client-entry" },
-        },
-      });
+    const css = await buildFixtureCss({ exclude: ["light-dark"] });
 
-      const css = await findBuiltCss(path.join(outDir, "client"));
-
-      // With `exclude: ['light-dark']`, lightningcss should NOT lower
-      // `light-dark()` — the raw function should remain in the output.
-      expect(css).toContain("light-dark(");
-      expect(css).not.toContain("--lightningcss-light");
-      expect(css).not.toContain("--lightningcss-dark");
-    } finally {
-      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-      await fs.rm(outDir, { recursive: true, force: true }).catch(() => {});
-    }
+    // With `exclude: ['light-dark']`, lightningcss should NOT lower
+    // `light-dark()` — the raw function should remain in the output.
+    expect(css).toContain("light-dark(");
+    expect(css).not.toContain("--lightningcss-light");
+    expect(css).not.toContain("--lightningcss-dark");
   }, 60_000);
 
   it("transpiles light-dark() when listed in `include`", async () => {
-    const tmpDir = await makeFixture();
-    const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-lightning-build-"));
-    try {
-      await build({
-        root: tmpDir,
-        configFile: false,
-        plugins: [
-          vinext({
-            disableAppRouter: true,
-            nextConfig: {
-              experimental: {
-                useLightningcss: true,
-                lightningCssFeatures: {
-                  include: ["light-dark"],
-                },
-              },
-            },
-          }),
-        ],
-        logLevel: "silent",
-        build: {
-          outDir: path.join(outDir, "client"),
-          manifest: true,
-          ssrManifest: true,
-          rolldownOptions: { input: "virtual:vinext-client-entry" },
-        },
-      });
+    const css = await buildFixtureCss({ include: ["light-dark"] });
 
-      const css = await findBuiltCss(path.join(outDir, "client"));
-
-      // With `include: ['light-dark']`, lightningcss should always transpile
-      // `light-dark()` into the var(--lightningcss-light/dark) polyfill —
-      // even when the resolved browser targets already support the function.
-      expect(css).not.toContain("light-dark(");
-      expect(css).toContain("--lightningcss-light");
-      expect(css).toContain("--lightningcss-dark");
-    } finally {
-      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-      await fs.rm(outDir, { recursive: true, force: true }).catch(() => {});
-    }
+    // With `include: ['light-dark']`, lightningcss should always transpile
+    // `light-dark()` into the var(--lightningcss-light/dark) polyfill —
+    // even when the resolved browser targets already support the function.
+    expect(css).not.toContain("light-dark(");
+    expect(css).toContain("--lightningcss-light");
+    expect(css).toContain("--lightningcss-dark");
   }, 60_000);
 
   it("substitutes @custom-media when custom-media-queries is included", async () => {
-    // Ported from Next.js: test/e2e/app-dir/experimental-lightningcss-features
-    // (the `custom-media-queries` describe block) —
-    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/experimental-lightningcss-features/experimental-lightningcss-features.test.ts
-    //
-    // `@custom-media` is draft CSS syntax, gated behind lightningcss's own
-    // `drafts.customMedia` parser flag — independent of the include/exclude
-    // transform mask. Next.js derives it from the same `include` list
-    // (packages/next/src/build/webpack/loaders/lightningcss-loader/src/loader.ts):
-    // when the user's `include` turns on `custom-media-queries`, Next also
-    // turns on `drafts.customMedia` so the parser accepts the syntax it is
-    // about to transpile. vinext forwarded `include`/`exclude` to lightningcss
-    // but never derived `drafts`, so `@custom-media` failed to parse at all.
-    const tmpDir = await makeCustomMediaFixture();
-    const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-lightning-build-"));
-    try {
-      await build({
-        root: tmpDir,
-        configFile: false,
-        plugins: [
-          vinext({
-            disableAppRouter: true,
-            nextConfig: {
-              experimental: {
-                useLightningcss: true,
-                lightningCssFeatures: {
-                  include: ["custom-media-queries"],
-                },
-              },
-            },
-          }),
-        ],
-        logLevel: "silent",
-        build: {
-          outDir: path.join(outDir, "client"),
-          manifest: true,
-          ssrManifest: true,
-          rolldownOptions: { input: "virtual:vinext-client-entry" },
-        },
-      });
+    // Next.js `custom-media-queries` case: `@custom-media` only parses when
+    // lightningcss's `drafts.customMedia` flag is on, which Next.js derives
+    // from the resolved include mask.
+    const css = await buildFixtureCss({ include: ["custom-media-queries"] });
 
-      const css = await findBuiltCss(path.join(outDir, "client"));
+    expect(css).not.toContain("@custom-media");
+    expect(css).not.toContain("--narrow");
+    expect(css).toMatch(/max-width:\s*960px|width\s*<=\s*960px/);
+  }, 60_000);
 
-      // With `include: ['custom-media-queries']`, lightningcss should
-      // substitute `@custom-media` away entirely, leaving a plain media query.
-      expect(css).not.toContain("@custom-media");
-      expect(css).not.toContain("--narrow");
-      expect(css).toMatch(/max-width:\s*960px|width\s*<=\s*960px/);
-    } finally {
-      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-      await fs.rm(outDir, { recursive: true, force: true }).catch(() => {});
-    }
+  it("leaves @custom-media untouched when custom-media-queries is also excluded", async () => {
+    // Next.js subtracts `exclude` from the include mask before deriving
+    // `drafts.customMedia`, so the draft parser stays off.
+    const css = await buildFixtureCss({
+      include: ["custom-media-queries"],
+      exclude: ["custom-media-queries"],
+    });
+
+    expect(css).toContain("@custom-media --narrow");
+    expect(css).toContain("(--narrow)");
   }, 60_000);
 });

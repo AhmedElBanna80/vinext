@@ -3632,15 +3632,13 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                     ...(nextConfig.lightningCssFeatures.exclude
                       ? { exclude: nextConfig.lightningCssFeatures.exclude }
                       : {}),
-                    // `@custom-media` is draft CSS syntax, gated behind
-                    // lightningcss's own `drafts.customMedia` parser flag —
-                    // independent of the include/exclude transform mask.
-                    // Next.js derives it the same way (lightningcss-loader):
-                    // when the user's `include` turns on the
-                    // `custom-media-queries` feature, also turn on
-                    // `drafts.customMedia` so the parser accepts the syntax
-                    // it is about to transpile.
+                    // `@custom-media` is draft syntax behind lightningcss's
+                    // `drafts.customMedia` parser flag. Like Next.js
+                    // (lightningcss-loader `drafts`), enable it only when
+                    // `custom-media-queries` is in the include mask after
+                    // `exclude` is subtracted.
                     ...((nextConfig.lightningCssFeatures.include &
+                      ~nextConfig.lightningCssFeatures.exclude &
                       lightningCssFeatureNamesToMask(["custom-media-queries"])) !==
                     0
                       ? { drafts: { customMedia: true } }
