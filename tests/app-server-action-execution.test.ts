@@ -241,16 +241,22 @@ function createFetchActionRequest(headers?: HeadersInit): Request {
   });
 }
 
-function createRscOptions(
-  overrides: Partial<
-    HandleServerActionRscRequestOptions<
-      string,
-      TestRoute,
-      TestInterceptOptions,
-      TestTemporaryReferences
-    >
-  > = {},
-): HandleServerActionRscRequestOptions<
+type TestRouteMatch = { params: Record<string, string | string[]>; route: TestRoute };
+
+function createRscOptions({
+  matchRoute: matchRouteOverride,
+  ...overrides
+}: Partial<
+  HandleServerActionRscRequestOptions<
+    string,
+    TestRoute,
+    TestInterceptOptions,
+    TestTemporaryReferences
+  >
+> & {
+  /** Test-only route table behind the fake redirect-target dispatch. */
+  matchRoute?: (pathname: string) => TestRouteMatch | null;
+} = {}): HandleServerActionRscRequestOptions<
   string,
   TestRoute,
   TestInterceptOptions,
@@ -260,8 +266,8 @@ function createRscOptions(
 
   const cleanPathname = overrides.cleanPathname ?? "/dashboard";
   const matchRoute =
-    overrides.matchRoute ??
-    (() => ({
+    matchRouteOverride ??
+    ((): TestRouteMatch | null => ({
       params: {},
       route,
     }));
@@ -378,7 +384,6 @@ function createRscOptions(
         ? overrides.currentRouteMatch
         : matchRoute(cleanPathname),
     currentRoutePathname: overrides.currentRoutePathname ?? cleanPathname,
-    matchRoute,
   };
   const loadServerAction = options.loadServerAction;
   options.loadServerAction = async (actionId) =>
@@ -3215,9 +3220,6 @@ describe("app server action execution helpers", () => {
           }
           return null;
         },
-        resolveRouteRuntime(route) {
-          return route.runtime ?? null;
-        },
         request: createFetchActionRequest({
           "next-action": "action-id",
           rsc: "1",
@@ -3265,9 +3267,6 @@ describe("app server action execution helpers", () => {
             };
           }
           return null;
-        },
-        resolveRouteRuntime(route) {
-          return route.runtime ?? null;
         },
         request: createFetchActionRequest({
           "next-action": "action-id",

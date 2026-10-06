@@ -158,8 +158,6 @@ type ProgressiveServerActionSideEffects = {
   revalidationKind: ActionRevalidationKind;
 };
 
-type AppServerActionRouteRuntime = "edge" | "experimental-edge" | "nodejs" | null;
-
 type ProgressiveServerActionResult =
   | ({
       formState: ReactFormState | null;
@@ -355,8 +353,8 @@ export type HandleServerActionRscRequestOptions<
   draftModeSecret: string;
   /**
    * Hydrate a route's lazy page/route-handler modules before reading
-   * `route.page` / `route.routeHandler` on action redirect targets and
-   * re-render targets obtained via `matchRoute`/`getSourceRoute`. Idempotent.
+   * `route.page` / `route.routeHandler` on action re-render targets obtained
+   * via `getSourceRoute`. Idempotent.
    */
   ensureRouteLoaded?: (route: TRoute) => unknown;
   findIntercept: (pathname: string) => AppServerActionIntercept<TPage> | null;
@@ -367,14 +365,6 @@ export type HandleServerActionRscRequestOptions<
   isEdgeRuntime?: boolean;
   isRscRequest: boolean;
   loadServerAction: (actionId: string) => Promise<unknown>;
-  /**
-   * Match an action redirect target. Must use *request* route identity — the
-   * raw, undecoded pathname — because the target is rendered as if the client
-   * had navigated to it. A matcher that decodes would resolve an encoded alias
-   * like `/%61dmin` to `/admin` and render a page the navigation itself, and
-   * the middleware that just ran for `/%61dmin`, would never have reached.
-   */
-  matchRoute: (pathname: string) => AppServerActionMatch<TRoute> | null;
   maxActionBodySize: number;
   /** Verbatim `serverActions.bodySizeLimit` config string (e.g. "2mb") for the body-exceeded error. */
   maxActionBodySizeLabel: string;
@@ -402,7 +392,6 @@ export type HandleServerActionRscRequestOptions<
   resolveRouteFetchCacheMode?: (route: TRoute) => FetchCacheMode | null;
   resolveRouteRevalidateSeconds?: (route: TRoute) => number | null;
   resolveRouteDynamicConfig?: (route: TRoute) => string | null | undefined;
-  resolveRouteRuntime?: (route: TRoute) => AppServerActionRouteRuntime;
   request: Request;
   sanitizeErrorForClient: (error: unknown) => unknown;
   searchParams: URLSearchParams;
@@ -1657,19 +1646,17 @@ export async function handleServerActionRscRequest<
       if (actionDraftCookie) redirectHeaders.append("Set-Cookie", actionDraftCookie);
       setActionRevalidatedHeader(redirectHeaders, actionRevalidationKind);
 
+      // Every fetch-action redirect below answers 200, never 303: the client
+      // router navigates from ACTION_REDIRECT_HEADER, and a body-carrying 303
+      // without a Location is mangled by some intermediaries. Only the no-JS
+      // form path (handleProgressiveServerActionRequest) answers 303. Ported
+      // from Next.js action-handler.ts (vercel/next.js#96310, v16.3.0).
       const redirectTarget = resolveInternalActionRedirectTarget(
         actionRedirectUrl,
         options.request.url,
         options.basePath ?? "",
       );
       if (!redirectTarget) {
-        // Next.js answers every fetch (client-invoked) action's redirect with
-        // 200, whether or not the target can be streamed in-process — the
-        // actual navigation is driven by the client reading
-        // ACTION_REDIRECT_HEADER, not by the HTTP status (vercel/next.js
-        // action-handler.ts, `isFetchAction` branch; the non-fetch,
-        // progressive-enhancement path above is the only one that answers
-        // 303). An external or otherwise non-internal target falls here.
         options.clearRequestContext();
         return new Response(null, {
           status: 200,
@@ -1711,10 +1698,6 @@ export async function handleServerActionRscRequest<
       ) {
         targetResponse?.body?.cancel().catch(() => {});
         options.clearRequestContext();
-        // Same rationale as the `!redirectTarget` branch above: a fetch
-        // action's redirect is always 200, even when the in-process forward
-        // couldn't be completed (non-RSC content-type, no body, or the
-        // dispatch itself threw).
         return new Response(null, {
           status: 200,
           headers: withoutRscBodyHeaders(redirectHeaders),
@@ -1726,11 +1709,6 @@ export async function handleServerActionRscRequest<
       return markAppRscResponseConfigHeadersApplied(
         createServerActionRscResponse(
           targetResponse.body,
-          // Always 200: see the `!redirectTarget` branch above. (Previously
-          // this forwarded 200 only for an already-forwarded action, an
-          // ancestor/stale-sibling route redirect, or a cross-runtime
-          // redirect, and fell back to 303 otherwise — a pre-vercel/next.js#96310
-          // rule Next.js no longer applies.)
           { status: 200, headers: redirectHeaders },
           options.clearRequestContext,
         ),
