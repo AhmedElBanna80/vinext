@@ -116,6 +116,46 @@ describe("imageOptimizationUrl honors trailingSlash", () => {
   });
 });
 
+// ─── images.loader / images.loaderFile validation ──────────────────────
+//
+// Ported from the loader checks at the top of Next.js's getImgProps
+// (packages/next/src/shared/lib/get-img-props.ts).
+
+describe("images.loader config validation", () => {
+  afterEach(() => {
+    delete process.env.__VINEXT_IMAGE_CUSTOM_LOADER;
+    delete process.env.__VINEXT_IMAGE_LOADER_FILE;
+    vi.resetModules();
+  });
+
+  it('throws for an image without a loader prop when images.loader is "custom"', async () => {
+    process.env.__VINEXT_IMAGE_CUSTOM_LOADER = "true";
+    vi.resetModules();
+    const shim = await import("../packages/vinext/src/shims/image.js");
+    const imageProps = { alt: "a", src: "/photo.jpg", width: 100, height: 100 };
+    const message = 'Image with src "/photo.jpg" is missing "loader" prop.';
+
+    expect(() =>
+      ReactDOMServer.renderToString(React.createElement(shim.default, imageProps)),
+    ).toThrow(message);
+    expect(() => shim.getImageProps({ ...imageProps, unoptimized: true })).toThrow(message);
+    expect(
+      shim.getImageProps({ ...imageProps, loader: ({ src, width }) => `${src}?w=${width}` }).props
+        .src,
+    ).toBe("/photo.jpg?w=256");
+  });
+
+  it("throws when images.loaderFile has no default export", async () => {
+    process.env.__VINEXT_IMAGE_LOADER_FILE = "true";
+    vi.resetModules();
+    const shim = await import("../packages/vinext/src/shims/image.js");
+
+    expect(() =>
+      shim.getImageProps({ alt: "a", src: "/photo.jpg", width: 100, height: 100 }),
+    ).toThrow("images.loaderFile detected but the file is missing default export.");
+  });
+});
+
 // ─── SSR rendering ──────────────────────────────────────────────────────
 
 describe("Image SSR rendering", () => {
@@ -272,6 +312,53 @@ describe("Image SSR rendering", () => {
     expect(html).toContain(
       'srcSet="https://cdn.example.com/photo.jpg?w=256&amp;q=75 1x, https://cdn.example.com/photo.jpg?w=640&amp;q=75 2x"',
     );
+  });
+
+  // Next.js getWidths(config, undefined, sizes): a width-less (fill) image
+  // offers every device size and defaults sizes to 100vw.
+  it("gives a fill image's custom loader every device width and sizes=100vw", () => {
+    const loader = ({ src, width }: { src: string; width: number }) =>
+      `https://cdn.example.com${src}?w=${width}`;
+    const deviceSizes = [640, 750, 828, 1080, 1200, 1920, 2048, 3840];
+    const expectedSrcSet = deviceSizes
+      .map((w) => `https://cdn.example.com/photo.jpg?w=${w} ${w}w`)
+      .join(", ");
+
+    const html = ReactDOMServer.renderToString(
+      React.createElement(Image, { alt: "fill", src: "/photo.jpg", fill: true, loader }),
+    );
+    expect(html).toContain('src="https://cdn.example.com/photo.jpg?w=3840"');
+    expect(html).toContain(`srcSet="${expectedSrcSet}"`);
+    expect(html).toContain('sizes="100vw"');
+
+    const { props } = getImageProps({ alt: "fill", src: "/photo.jpg", fill: true, loader });
+    expect(props.src).toBe("https://cdn.example.com/photo.jpg?w=3840");
+    expect(props.srcSet).toBe(expectedSrcSet);
+    expect(props.sizes).toBe("100vw");
+  });
+
+  // Next.js: `src: overrideSrc || imgAttributes.src`, keeping the loader srcSet.
+  it("applies overrideSrc on top of custom loader attributes", () => {
+    const loader = ({ src, width }: { src: string; width: number }) =>
+      `https://cdn.example.com${src}?w=${width}`;
+    const imageProps = {
+      alt: "override",
+      src: "/photo.jpg",
+      width: 200,
+      height: 150,
+      loader,
+      overrideSrc: "/override.jpg",
+    };
+    const srcSet =
+      "https://cdn.example.com/photo.jpg?w=256 1x, https://cdn.example.com/photo.jpg?w=640 2x";
+
+    const html = ReactDOMServer.renderToString(React.createElement(Image, imageProps));
+    expect(html).toContain('src="/override.jpg"');
+    expect(html).toContain(`srcSet="${srcSet}"`);
+
+    const { props } = getImageProps(imageProps);
+    expect(props.src).toBe("/override.jpg");
+    expect(props.srcSet).toBe(srcSet);
   });
 
   it("renders StaticImageData (import result)", () => {

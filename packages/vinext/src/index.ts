@@ -2905,6 +2905,14 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         defines["process.env.__VINEXT_IMAGE_UNOPTIMIZED"] = JSON.stringify(
           String(nextConfig.images?.unoptimized === true),
         );
+        // images.loader / images.loaderFile modes the next/image shim validates
+        // against at render time (see resolveImageLoader in shims/image.tsx).
+        defines["process.env.__VINEXT_IMAGE_CUSTOM_LOADER"] = JSON.stringify(
+          String(nextConfig.images?.loader === "custom"),
+        );
+        defines["process.env.__VINEXT_IMAGE_LOADER_FILE"] = JSON.stringify(
+          String(Boolean(nextConfig.images?.loaderFile)),
+        );
         // Build ID — resolved from next.config generateBuildId() or random UUID.
         // Exposed so server entries and the next/server shim can inject it.
         // Also used to namespace ISR cache keys so old cached entries from a

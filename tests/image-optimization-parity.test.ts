@@ -278,6 +278,19 @@ describe("App Router next/image with images.loaderFile", () => {
   return \`\${src}#w:\${width},q:\${quality || 50}\`;
 }
 `,
+        "app/image-parity/loader-file-variants/page.tsx": `import Image from "next/image";
+
+export default function Page() {
+  return (
+    <main>
+      <div style={{ position: "relative", width: 64, height: 64 }}>
+        <Image alt="fill" src="/hello world.png" fill />
+      </div>
+      <Image alt="override" src="/hello world.png" width={64} height={64} overrideSrc="/override.png" />
+    </main>
+  );
+}
+`,
       },
     });
     ({ server, baseUrl } = await startFixtureServer(fixtureDir, { appRouter: true }));
@@ -293,6 +306,22 @@ describe("App Router next/image with images.loaderFile", () => {
 
     expect(getImageSrcFromHtml(html, "space")).toBe("/hello world.png#w:128,q:50");
     expect(getImageSrcSetFromHtml(html, "space")).toBe(
+      "/hello world.png#w:64,q:50 1x, /hello world.png#w:128,q:50 2x",
+    );
+  });
+
+  it("gives fill images every device width and honors overrideSrc", async () => {
+    const html = await fetchHtmlWithRetry(baseUrl, "/image-parity/loader-file-variants");
+    const deviceSizes = [640, 750, 828, 1080, 1200, 1920, 2048, 3840];
+
+    expect(getImageSrcFromHtml(html, "fill")).toBe("/hello world.png#w:3840,q:50");
+    expect(getImageSrcSetFromHtml(html, "fill")).toBe(
+      deviceSizes.map((w) => `/hello world.png#w:${w},q:50 ${w}w`).join(", "),
+    );
+    expect(html).toMatch(/<img[^>]*alt="fill"[^>]*sizes="100vw"/);
+
+    expect(getImageSrcFromHtml(html, "override")).toBe("/override.png");
+    expect(getImageSrcSetFromHtml(html, "override")).toBe(
       "/hello world.png#w:64,q:50 1x, /hello world.png#w:128,q:50 2x",
     );
   });

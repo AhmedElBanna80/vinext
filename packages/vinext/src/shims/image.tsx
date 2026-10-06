@@ -85,6 +85,10 @@ const __dangerouslyAllowSVG = process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_SVG =
  */
 const __dangerouslyAllowLocalIP = process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP === "true";
 const __globallyUnoptimized = process.env.__VINEXT_IMAGE_UNOPTIMIZED === "true";
+/** `images.loader: "custom"` — images without a loader prop or loaderFile throw. */
+const __customImageLoader = process.env.__VINEXT_IMAGE_CUSTOM_LOADER === "true";
+/** `images.loaderFile` is set, so `configuredImageLoader` must be its default export. */
+const __hasImageLoaderFile = process.env.__VINEXT_IMAGE_LOADER_FILE === "true";
 /**
  * Whether trailingSlash is enabled in next.config.js. Mirrors the define
  * consumed by the Link/Router shims (shims/link.tsx, shims/router.ts,
@@ -349,10 +353,10 @@ function getImageWidths(width: number): number[] {
 function generateAttributesWithResolver(
   resolveUrl: (src: string, width: number, quality?: number) => string,
   src: string,
-  width: number,
+  width: number | undefined,
   quality: number | undefined,
   sizes?: string,
-): { src: string; srcSet: string } {
+): { src: string; srcSet: string; sizes?: string } {
   if (sizes) {
     const viewportWidthPattern = /(^|\s)(1?\d?\d)vw/g;
     const viewportPercentages = Array.from(sizes.matchAll(viewportWidthPattern), (match) =>
@@ -368,6 +372,19 @@ function generateAttributesWithResolver(
       srcSet: candidates
         .map((candidateWidth) => `${resolveUrl(src, candidateWidth, quality)} ${candidateWidth}w`)
         .join(", "),
+      sizes,
+    };
+  }
+
+  // No intrinsic width (e.g. `fill`): Next.js's getWidths() offers every
+  // device size and defaults `sizes` to 100vw.
+  if (width === undefined) {
+    return {
+      src: resolveUrl(src, RESPONSIVE_WIDTHS[RESPONSIVE_WIDTHS.length - 1], quality),
+      srcSet: RESPONSIVE_WIDTHS.map(
+        (candidateWidth) => `${resolveUrl(src, candidateWidth, quality)} ${candidateWidth}w`,
+      ).join(", "),
+      sizes: "100vw",
     };
   }
 
@@ -400,10 +417,10 @@ function generateImageAttributes(
 function generateLoaderAttributes(
   loader: ImageLoader,
   src: string,
-  width: number,
+  width: number | undefined,
   quality: number | undefined,
   sizes?: string,
-): { src: string; srcSet: string } {
+): { src: string; srcSet: string; sizes?: string } {
   return generateAttributesWithResolver(
     (loaderSrc, loaderWidth, loaderQuality) =>
       loader({ src: loaderSrc, width: loaderWidth, quality: loaderQuality }),
@@ -412,6 +429,27 @@ function generateLoaderAttributes(
     quality,
     sizes,
   );
+}
+
+/**
+ * Pick the loader for an image: the `loader` prop, else `images.loaderFile`,
+ * else `undefined` for the built-in /_next/image loader. Ported from the
+ * loader checks at the top of Next.js's getImgProps (shared/lib/get-img-props.ts).
+ */
+function resolveImageLoader(src: string, loader: ImageLoader | undefined): ImageLoader | undefined {
+  if (__hasImageLoaderFile && typeof configuredImageLoader === "undefined") {
+    throw new Error(
+      "images.loaderFile detected but the file is missing default export.\nRead more: https://nextjs.org/docs/messages/invalid-images-config",
+    );
+  }
+  const effectiveLoader = loader ?? configuredImageLoader;
+  if (!effectiveLoader && __customImageLoader) {
+    throw new Error(
+      `Image with src "${src}" is missing "loader" prop.` +
+        "\nRead more: https://nextjs.org/docs/messages/next-image-missing-loader",
+    );
+  }
+  return effectiveLoader;
 }
 
 const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
@@ -487,6 +525,7 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
     height: imgHeight,
     blurDataURL: imgBlurDataURL,
   } = resolveImageSource({ src: srcProp, width, height, blurDataURL });
+  const effectiveLoader = resolveImageLoader(src, loader);
   const shouldPreload = preload === true || priority === true;
   const priorityFetchPriority = priority ? "high" : undefined;
   const imageLoading = priority ? "eager" : shouldPreload ? loading : (loading ?? "lazy");
@@ -621,22 +660,21 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
   // responsibility for the URL, bypassing remotePatterns validation and the
   // /_next/image endpoint. `quality` is passed through as given (possibly
   // undefined); only the built-in loader defaults it to 75.
-  const effectiveLoader = loader ?? configuredImageLoader;
   if (effectiveLoader) {
     const resolvedQuality = typeof quality === "string" ? Number(quality) : quality;
-    const loaderAttributes =
-      imgWidth && !fill
-        ? generateLoaderAttributes(effectiveLoader, src, imgWidth, resolvedQuality, sizes)
-        : undefined;
-    const resolvedSrc = loaderAttributes
-      ? loaderAttributes.src
-      : effectiveLoader({ src, width: imgWidth ?? 0, quality: resolvedQuality });
-    const resolvedSrcSet = loaderAttributes?.srcSet;
+    const loaderAttributes = generateLoaderAttributes(
+      effectiveLoader,
+      src,
+      fill ? undefined : imgWidth,
+      resolvedQuality,
+      sizes,
+    );
+    const resolvedSrc = overrideSrc || loaderAttributes.src;
     preloadImageResource({
       shouldPreload,
       src: resolvedSrc,
-      srcSet: resolvedSrcSet,
-      sizes,
+      srcSet: loaderAttributes.srcSet,
+      sizes: loaderAttributes.sizes,
       fetchPriority: priorityFetchPriority,
     });
     return (
@@ -648,8 +686,8 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
         height={fill ? undefined : imgHeight}
         loading={imageLoading}
         decoding="async"
-        srcSet={resolvedSrcSet}
-        sizes={sizes}
+        srcSet={loaderAttributes.srcSet}
+        sizes={loaderAttributes.sizes}
         className={className}
         onLoad={handleLoad}
         onError={handleError}
@@ -865,6 +903,7 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
     height: imgHeight,
     blurDataURL: imgBlurDataURL,
   } = resolveImageSource({ src: srcProp, width, height, blurDataURL: blurDataURLProp });
+  const effectiveLoader = resolveImageLoader(src, loader);
   const shouldPreload = _preload === true || priority === true;
 
   if (_unoptimized === true || __globallyUnoptimized) {
@@ -898,11 +937,10 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
     return { props: Object.assign(imageProps, { "data-nimg": fill ? "fill" : "1" }) };
   }
 
-  // Resolve src through a custom loader if provided (the `loader` prop, or
-  // `images.loaderFile` from next.config.js when no per-image prop was
-  // given). `quality` is passed through as given, including `undefined` —
-  // only the built-in /_next/image loader below defaults it to 75.
-  const effectiveLoader = loader ?? configuredImageLoader;
+  // A custom loader (the `loader` prop, or `images.loaderFile` from
+  // next.config.js when no per-image prop was given) gets `quality` as given,
+  // including `undefined` — only the built-in /_next/image loader below
+  // defaults it to 75.
   const imgQuality = typeof _quality === "string" ? Number(_quality) : _quality;
 
   // Validate remote URLs against configured patterns. As in the component
@@ -927,14 +965,15 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
     optimizedSrc = "";
     srcSet = undefined;
   } else if (effectiveLoader) {
-    const loaderAttributes =
-      imgWidth && !fill
-        ? generateLoaderAttributes(effectiveLoader, src, imgWidth, imgQuality, sizes)
-        : undefined;
-    optimizedSrc = loaderAttributes
-      ? loaderAttributes.src
-      : effectiveLoader({ src, width: imgWidth ?? 0, quality: imgQuality });
-    srcSet = loaderAttributes?.srcSet;
+    const loaderAttributes = generateLoaderAttributes(
+      effectiveLoader,
+      src,
+      fill ? undefined : imgWidth,
+      imgQuality,
+      sizes,
+    );
+    optimizedSrc = overrideSrc || loaderAttributes.src;
+    srcSet = loaderAttributes.srcSet;
   } else {
     // For local images (no loader, not remote), route through the
     // optimization endpoint. When `unoptimized` is true, bypass the

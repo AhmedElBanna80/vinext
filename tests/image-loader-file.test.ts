@@ -17,14 +17,18 @@ import { APP_FIXTURE_DIR, aliasEntriesToRecord } from "./helpers.js";
 const SPECIFIER = "vinext/shims/image-loader-file";
 const DEFAULT_MODULE_RE = /[/\\]shims[/\\]image-loader-file\.(ts|js)$/;
 
-async function resolveAliasMap(images?: Record<string, unknown>) {
+async function runConfigHook(images?: Record<string, unknown>) {
   // oxlint-disable-next-line typescript/no-explicit-any
   const plugins = vinext({ nextConfig: () => ({ images }) }) as any[];
   const configPlugin = plugins.find((plugin) => plugin.name === "vinext:config");
-  const config = await configPlugin.config(
+  return configPlugin.config(
     { root: APP_FIXTURE_DIR, plugins: [] },
     { command: "build", mode: "production" },
   );
+}
+
+async function resolveAliasMap(images?: Record<string, unknown>) {
+  const config = await runConfigHook(images);
   return aliasEntriesToRecord(config.resolve.alias);
 }
 
@@ -45,6 +49,16 @@ describe("images.loaderFile resolve.alias wiring", () => {
   it("keeps vinext's undefined default when loaderFile is unset", async () => {
     expect((await resolveAliasMap(undefined))[SPECIFIER]).toMatch(DEFAULT_MODULE_RE);
     expect((await resolveAliasMap({ loader: "custom" }))[SPECIFIER]).toMatch(DEFAULT_MODULE_RE);
+  });
+
+  it("inlines the loader modes the next/image shim validates against", async () => {
+    const unset = (await runConfigHook(undefined)).define;
+    expect(unset["process.env.__VINEXT_IMAGE_CUSTOM_LOADER"]).toBe('"false"');
+    expect(unset["process.env.__VINEXT_IMAGE_LOADER_FILE"]).toBe('"false"');
+
+    const custom = (await runConfigHook({ loader: "custom", loaderFile })).define;
+    expect(custom["process.env.__VINEXT_IMAGE_CUSTOM_LOADER"]).toBe('"true"');
+    expect(custom["process.env.__VINEXT_IMAGE_LOADER_FILE"]).toBe('"true"');
   });
 
   it.each([undefined, "default", "custom"])(
