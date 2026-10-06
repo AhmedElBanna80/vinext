@@ -159,19 +159,22 @@ function collectLiteralRequires(code: string, id: string): LiteralRequire[] {
 
 type BundlerExternal = NonNullable<ResolvedConfig["build"]["rolldownOptions"]>["external"];
 
-// Mirror the bundler's check of an unresolved import against `external`.
+// Mirror the bundler's check of an import against `external`.
 function isBundlerExternal(
   external: BundlerExternal,
-  specifier: string,
+  id: string,
   importer: string,
+  isResolved: boolean,
 ): boolean {
-  if (typeof external === "function") return Boolean(external(specifier, importer, false));
+  if (typeof external === "function") return Boolean(external(id, importer, isResolved));
   const patterns = Array.isArray(external) ? external : [external];
-  return patterns.some((pattern) =>
-    typeof pattern === "string"
-      ? pattern === specifier
-      : pattern instanceof RegExp && pattern.test(specifier),
-  );
+  return patterns.some((pattern) => {
+    if (typeof pattern === "string") return pattern === id;
+    if (!(pattern instanceof RegExp)) return false;
+    // Global and sticky patterns keep state between test() calls.
+    pattern.lastIndex = 0;
+    return pattern.test(id);
+  });
 }
 
 /**
@@ -275,7 +278,7 @@ export function createRequireConditionResolutionPlugin(
           // The rewrite replaces the bare specifier, so a bundler external
           // matching it would no longer apply; keep the default resolution.
           const resolvers =
-            keepExternals || isBundlerExternal(bundlerExternal, specifier, id)
+            keepExternals || isBundlerExternal(bundlerExternal, specifier, id, false)
               ? defaultResolvers
               : bundlingResolvers;
           const [requireResolution, importResolution] = await Promise.all([
@@ -297,6 +300,16 @@ export function createRequireConditionResolutionPlugin(
 
           const moduleType = syntheticModuleType(requirePath);
           const virtualId = `${requirePath}.vinext-require.${moduleType}`;
+          // Leave the call alone when the bundler would externalize the
+          // resolved target: the synthetic import would then be emitted as a
+          // reference to a file that does not exist.
+          if (
+            isBundlerExternal(bundlerExternal, requirePath, id, true) ||
+            isBundlerExternal(bundlerExternal, virtualId, id, false) ||
+            isBundlerExternal(bundlerExternal, virtualId, id, true)
+          ) {
+            continue;
+          }
           virtualTargets.set(virtualId, { file: requirePath, moduleType });
           output.overwrite(argument.start, argument.end, JSON.stringify(virtualId));
           changed = true;

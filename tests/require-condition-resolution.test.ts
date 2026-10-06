@@ -324,6 +324,28 @@ describe("vinext:require-condition-resolution", () => {
       { build: { rolldownOptions: { external: (id: string) => id === "lib-cjs" } } },
       false,
     ],
+    [
+      "keeps every match of a global RegExp bundler external external",
+      { build: { rollupOptions: { external: /^lib-/g } } },
+      false,
+    ],
+    [
+      "leaves a require whose resolved target is a bundler external",
+      { build: { rollupOptions: { external: /node_modules/ } } },
+      false,
+    ],
+    [
+      "leaves a require whose resolved target a function bundler external matches",
+      {
+        build: {
+          rolldownOptions: {
+            external: (id: string, _importer: string | undefined, isResolved: boolean) =>
+              isResolved && id.includes("lib-cjs"),
+          },
+        },
+      },
+      false,
+    ],
   ])("%s", async (_name, environment, rewritten) => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vinext-require-condition-")));
     try {
@@ -356,7 +378,7 @@ describe("vinext:require-condition-resolution", () => {
 
       const result = (await handler!.call(
         { environment: builder.environments.ssr } as never,
-        `const Library = require("lib-cjs");\nexport default Library;`,
+        `const Library = require("lib-cjs");\nconst Again = require("lib-cjs");\nexport { Library, Again };`,
         path.join(root, "page.tsx"),
       )) as { code: string } | null;
 
