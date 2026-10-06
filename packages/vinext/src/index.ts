@@ -319,6 +319,10 @@ import {
   commonJsEsmFacadeOptimizeDepsPlugin,
   stripEsmCommonJsExportFacade,
 } from "./plugins/commonjs-esm-facade.js";
+import {
+  commentOutDisplacedHashbang,
+  commonJsHashbangOptimizeDepsPlugin,
+} from "./plugins/commonjs-hashbang.js";
 import { COMMONJS_SYNTAX_CODE_FILTER } from "./plugins/commonjs-syntax.js";
 import {
   createRequireConditionResolutionPlugin,
@@ -2232,30 +2236,24 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       const previous = transformBundledCommonJsDependencies;
       transformProjectLocalCommonJs = projectLocal && isDev;
       transformBundledCommonJsDependencies = bundledDependency;
-      // vite-plugin-commonjs prepends its CJS->ESM interop runtime (the
-      // `module`/`exports` facade) to the source it transforms. If `code`
-      // starts with a hashbang line, that prepend pushes `#!` out of
-      // byte-0, which later fails to parse ("Invalid Character '!'") once
-      // bundled -- `#!` is only valid Hashbang grammar at the very start of
-      // the file. Strip it before handing the source to the transform and
-      // splice it back onto whatever comes back.
-      const hashbang = /^#![^\n]*\n/.exec(code)?.[0] ?? "";
       let result: ReturnType<typeof commonJsTransform>;
       try {
         // Do not await here: the filter is consulted synchronously while this
         // environment-scoped flag is set. The remaining async transform work
         // does not read it, so concurrent module transforms cannot cross-talk.
-        result = commonJsTransform.call(this, code.slice(hashbang.length), id, ...args);
+        result = commonJsTransform.call(this, code, id, ...args);
       } finally {
         transformProjectLocalCommonJs = previousProjectLocal;
         transformBundledCommonJsDependencies = previous;
       }
       return Promise.resolve(result).then((transformed) => {
         if (typeof transformed !== "object" || typeof transformed?.code !== "string") {
-          return typeof transformed === "string" ? hashbang + transformed : transformed;
+          return transformed;
         }
-        const stripped = stripEsmCommonJsExportFacade(transformed.code);
-        return { ...transformed, code: hashbang + (stripped ?? transformed.code) };
+        // Before the facade check, which has to parse the output.
+        const output = commentOutDisplacedHashbang(transformed.code) ?? transformed.code;
+        const stripped = stripEsmCommonJsExportFacade(output) ?? output;
+        return stripped === transformed.code ? transformed : { ...transformed, code: stripped };
       });
     };
     // Modules without any syntax vite-plugin-commonjs could rewrite never
@@ -3781,7 +3779,12 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           rolldownOptions: {
             ...depOptimizeNodeEnvOptions.rolldownOptions,
             // vite-plugin-commonjs's pre-bundle plugin runs in this optimizer.
-            plugins: [depOptimizeAliasPlugin, commonJsEsmFacadeOptimizeDepsPlugin],
+            // The facade check parses the code, so the hashbang goes first.
+            plugins: [
+              depOptimizeAliasPlugin,
+              commonJsHashbangOptimizeDepsPlugin,
+              commonJsEsmFacadeOptimizeDepsPlugin,
+            ],
           },
         };
         pagesOptimizeEntries = !hasAppDir

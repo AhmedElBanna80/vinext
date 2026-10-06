@@ -1,16 +1,24 @@
 import { createRequire } from "node:module";
 import path from "node:path";
+import { parseAst } from "vite";
 import { describe, expect, it } from "vite-plus/test";
 import {
   commonJsEsmFacadeOptimizeDepsPlugin,
   stripEsmCommonJsExportFacade,
 } from "../packages/vinext/src/plugins/commonjs-esm-facade.js";
 import {
+  commentOutDisplacedHashbang,
+  commonJsHashbangOptimizeDepsPlugin,
+} from "../packages/vinext/src/plugins/commonjs-hashbang.js";
+import {
   originalPositionFor,
   type SourceMapPayload,
 } from "../packages/vinext/src/server/dev-stack-sourcemap.js";
 
-type CommonJsTransform = (code: string, id: string) => Promise<{ code: string } | null | undefined>;
+type CommonJsTransform = (
+  code: string,
+  id: string,
+) => Promise<{ code: string; map: SourceMapPayload } | null | undefined>;
 
 const require = createRequire(path.join(import.meta.dirname, "../packages/vinext/package.json"));
 const FIXTURES_DIR = path.join(import.meta.dirname, "fixtures");
@@ -139,5 +147,57 @@ describe("commonJsEsmFacadeOptimizeDepsPlugin", () => {
     ].join("\n");
 
     expect(transform.handler.call(undefined, loaded, "/project/module.js")).toBeNull();
+  });
+});
+
+describe("commentOutDisplacedHashbang", () => {
+  it("comments out the hashbang the plugin's prepended code displaced", async () => {
+    const transformed = await transformCommonJs("#!/usr/env node\n\nmodule.exports = 123\n", id);
+    expect(transformed?.code).toMatch(/-E \*\/#!\/usr\/env node\n/);
+
+    const output = commentOutDisplacedHashbang(transformed!.code);
+    expect(output).toBe(transformed!.code.replace("*/#!/usr/env node", "*////usr/env node"));
+    expect(() => parseAst(output!)).not.toThrow();
+    // The plugin's source map still points `module.exports` at line 3.
+    const generatedLine = output!.split("\n").findIndex((line) => line.startsWith("module."));
+    expect(originalPositionFor(transformed!.map, generatedLine + 1, 1)).toEqual({
+      source: id,
+      line: 3,
+      column: 1,
+    });
+  });
+
+  it("lets the facade check parse ESM that starts with a hashbang", async () => {
+    const transformed = await transformCommonJs(
+      `#!/usr/env node\nexports.named = "cjs";\nexport const named = "esm";`,
+      id,
+    );
+    expect(stripEsmCommonJsExportFacade(transformed!.code)).toBeUndefined();
+
+    const output = commentOutDisplacedHashbang(transformed!.code);
+    expect(stripEsmCommonJsExportFacade(output!)).not.toContain("__CJS__export_named__");
+  });
+
+  it("leaves a hashbang on byte 0 and later `#!` text alone", () => {
+    expect(commentOutDisplacedHashbang(`#!/usr/env node\nmodule.exports = 1;`)).toBeUndefined();
+    expect(
+      commentOutDisplacedHashbang(
+        `/* [vite-plugin-commonjs] export-runtime-E */module.exports = 1;\n/* [vite-plugin-commonjs] export-runtime-E */#!`,
+      ),
+    ).toBeUndefined();
+  });
+});
+
+describe("commonJsHashbangOptimizeDepsPlugin", () => {
+  type TransformHandler = (code: string) => { code: string; map: null } | null;
+  const transform = commonJsHashbangOptimizeDepsPlugin.transform as { handler: TransformHandler };
+
+  it("comments out a displaced hashbang without moving code", () => {
+    const loaded = `/* [vite-plugin-commonjs] export-runtime-E */#!/usr/env node\nmodule.exports = 1;`;
+
+    expect(transform.handler.call(undefined, loaded)).toEqual({
+      code: `/* [vite-plugin-commonjs] export-runtime-E *////usr/env node\nmodule.exports = 1;`,
+      map: null,
+    });
   });
 });
