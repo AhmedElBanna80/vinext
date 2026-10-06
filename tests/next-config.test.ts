@@ -1974,6 +1974,19 @@ describe("resolveNextConfig outputFileTracingIncludes/Excludes", () => {
     expect(resolved.outputFileTracingIncludes).toEqual({});
     expect(resolved.outputFileTracingExcludes).toEqual({ "/": ["./keep/**"] });
   });
+
+  it("reads the legacy experimental placement, which replaces the top-level value", async () => {
+    // Next.js: warnOptionHasBeenMovedOutOfExperimental
+    const resolved = await resolveNextConfig({
+      outputFileTracingIncludes: { "/": ["./top-level/**"] },
+      experimental: {
+        outputFileTracingIncludes: { "/": ["./legacy/**"] },
+        outputFileTracingExcludes: { "/api/*": ["./legacy-exclude/**"] },
+      },
+    });
+    expect(resolved.outputFileTracingIncludes).toEqual({ "/": ["./legacy/**"] });
+    expect(resolved.outputFileTracingExcludes).toEqual({ "/api/*": ["./legacy-exclude/**"] });
+  });
 });
 
 describe("resolveNextConfig serverExternalPackages", () => {

@@ -1444,6 +1444,19 @@ function readOutputFileTracingMap(value: unknown): Record<string, string[]> {
 }
 
 /**
+ * Read an option that moved out of `experimental`. Like Next.js's
+ * `warnOptionHasBeenMovedOutOfExperimental`, a value under the old
+ * `experimental` key replaces the top-level one.
+ */
+function readMovedExperimentalOption(
+  config: NextConfig,
+  experimental: Record<string, unknown> | undefined,
+  key: "outputFileTracingIncludes" | "outputFileTracingExcludes",
+): unknown {
+  return experimental && key in experimental ? experimental[key] : config[key];
+}
+
+/**
  * Convert lightningcss feature names from `experimental.lightningCssFeatures`
  * into a numeric bitmask consumable by the `lightningcss` `transform()` /
  * `bundle()` API (the `include` / `exclude` options).
@@ -2129,8 +2142,12 @@ export async function resolveNextConfig(
         : DEFAULT_REACT_MAX_HEADERS_LENGTH,
     htmlLimitedBots,
     serverExternalPackages,
-    outputFileTracingIncludes: readOutputFileTracingMap(config.outputFileTracingIncludes),
-    outputFileTracingExcludes: readOutputFileTracingMap(config.outputFileTracingExcludes),
+    outputFileTracingIncludes: readOutputFileTracingMap(
+      readMovedExperimentalOption(config, experimental, "outputFileTracingIncludes"),
+    ),
+    outputFileTracingExcludes: readOutputFileTracingMap(
+      readMovedExperimentalOption(config, experimental, "outputFileTracingExcludes"),
+    ),
     cacheHandler,
     cacheMaxMemorySize,
     enablePrerenderSourceMaps: config.enablePrerenderSourceMaps ?? true,
