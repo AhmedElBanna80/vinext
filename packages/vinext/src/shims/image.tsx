@@ -703,6 +703,16 @@ const Image = forwardRef<HTMLImageElement, InternalImageProps>(function Image(
       sizes,
     );
     const resolvedSrc = overrideSrc || loaderAttributes.src;
+    const sanitizedBlur = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;
+    const blurStyle =
+      !blurComplete && placeholder === "blur" && sanitizedBlur
+        ? {
+            backgroundImage: `url(${sanitizedBlur})`,
+            backgroundSize: "cover",
+            backgroundRepeat: "no-repeat",
+            backgroundPosition: "center",
+          }
+        : undefined;
     preloadImageResource({
       shouldPreload,
       src: resolvedSrc,
@@ -717,6 +727,7 @@ const Image = forwardRef<HTMLImageElement, InternalImageProps>(function Image(
         width={fill ? undefined : imgWidth}
         height={fill ? undefined : imgHeight}
         loading={imageLoading}
+        fetchPriority={priorityFetchPriority}
         decoding="async"
         srcSet={loaderAttributes.srcSet}
         sizes={loaderAttributes.sizes}
@@ -724,9 +735,10 @@ const Image = forwardRef<HTMLImageElement, InternalImageProps>(function Image(
         // fetching `src` before it sees the responsive candidates.
         src={resolvedSrc}
         className={className}
+        data-nimg={fill ? "fill" : "1"}
         onLoad={handleLoad}
         onError={handleError}
-        style={fill ? getFillStyle(style) : style}
+        style={fill ? getFillStyle(style, blurStyle) : { ...blurStyle, ...style }}
         {...rest}
       />
     );

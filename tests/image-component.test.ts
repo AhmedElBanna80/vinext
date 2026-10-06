@@ -397,6 +397,27 @@ describe("Image SSR rendering", () => {
     expect(loader).not.toHaveBeenCalled();
   });
 
+  // Next.js applies these attributes regardless of which loader built the URL.
+  it("keeps priority, data-nimg and blur placeholder styles for custom loaders", () => {
+    const loader = ({ src, width }: { src: string; width: number }) => `${src}?w=${width}`;
+    const html = ReactDOMServer.renderToString(
+      React.createElement(Image, {
+        alt: "blur",
+        src: "/photo.jpg",
+        width: 100,
+        height: 100,
+        loader,
+        priority: true,
+        placeholder: "blur",
+        blurDataURL: "data:image/png;base64,iVBORw0KGgo=",
+      }),
+    );
+    const img = html.match(/<img\b[^>]*>/)?.[0] ?? "";
+    expect(img).toContain('fetchPriority="high"');
+    expect(img).toContain('data-nimg="1"');
+    expect(img).toContain("background-image:url(data:image/png;base64,iVBORw0KGgo=)");
+  });
+
   // Next.js keeps `src` after `sizes`/`srcSet` so Safari doesn't fetch it early.
   it("orders src after srcSet and sizes for custom loaders", () => {
     const loader = ({ src, width }: { src: string; width: number }) => `${src}?w=${width}`;
