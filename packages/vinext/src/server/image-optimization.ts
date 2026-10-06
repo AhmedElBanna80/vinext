@@ -17,6 +17,7 @@
  * as-is (no transformation) with security headers applied.
  */
 
+import { NEXTJS_CACHE_HEADER } from "./headers.js";
 import { badRequestResponse } from "./http-error-responses.js";
 
 /** The pathname that triggers image optimization (matches Next.js). */
@@ -251,6 +252,10 @@ export function isSafeImageContentType(
  * When an ImageConfig is provided, uses its values for CSP and Content-Disposition.
  */
 function setImageSecurityHeaders(headers: Headers, config?: ImageConfig): void {
+  // vinext keeps no image cache of its own: every 200 response is produced by
+  // this handler, which is what Next.js reports as a cache MISS. (HIT/STALE
+  // would need a cache that remembers a previous optimization.)
+  headers.set(NEXTJS_CACHE_HEADER, "MISS");
   headers.set(
     "Content-Security-Policy",
     config?.contentSecurityPolicy ?? IMAGE_CONTENT_SECURITY_POLICY,

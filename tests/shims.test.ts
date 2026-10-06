@@ -27457,6 +27457,63 @@ describe("handleImageOptimization", () => {
     expect(response.headers.get("Vary")).toBe("Accept");
   });
 
+  it("marks successful responses as x-nextjs-cache: MISS and leaves errors unmarked", async () => {
+    const { handleImageOptimization } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    const url = "http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75";
+    const jpeg = () =>
+      new Response("img", { status: 200, headers: { "Content-Type": "image/jpeg" } });
+
+    // Passthrough (no transformImage handler)
+    const passthrough = await handleImageOptimization(new Request(url), {
+      fetchAsset: async () => jpeg(),
+    });
+    expect(passthrough.headers.get("x-nextjs-cache")).toBe("MISS");
+
+    // Transformed, including a transformer that tries to claim a cache hit
+    const transformed = await handleImageOptimization(new Request(url), {
+      fetchAsset: async () => jpeg(),
+      transformImage: async () =>
+        new Response("t", {
+          status: 200,
+          headers: { "Content-Type": "image/webp", "x-nextjs-cache": "HIT" },
+        }),
+    });
+    expect(transformed.headers.get("x-nextjs-cache")).toBe("MISS");
+
+    // SVG passthrough (dangerouslyAllowSVG)
+    const svg = await handleImageOptimization(
+      new Request(url),
+      {
+        fetchAsset: async () =>
+          new Response("<svg/>", { status: 200, headers: { "Content-Type": "image/svg+xml" } }),
+      },
+      undefined,
+      { dangerouslyAllowSVG: true },
+    );
+    expect(svg.headers.get("x-nextjs-cache")).toBe("MISS");
+
+    // Errors carry no cache header
+    const invalid = await handleImageOptimization(new Request("http://localhost/_next/image"), {
+      fetchAsset: async () => jpeg(),
+    });
+    expect(invalid.status).toBe(400);
+    expect(invalid.headers.has("x-nextjs-cache")).toBe(false);
+
+    const missing = await handleImageOptimization(new Request(url), {
+      fetchAsset: async () => new Response("", { status: 404 }),
+    });
+    expect(missing.status).toBe(404);
+    expect(missing.headers.has("x-nextjs-cache")).toBe(false);
+
+    const blocked = await handleImageOptimization(new Request(url), {
+      fetchAsset: async () =>
+        new Response("<svg/>", { status: 200, headers: { "Content-Type": "image/svg+xml" } }),
+    });
+    expect(blocked.status).toBe(400);
+    expect(blocked.headers.has("x-nextjs-cache")).toBe(false);
+  });
+
   it("calls transformImage when provided", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
