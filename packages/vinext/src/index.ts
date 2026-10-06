@@ -7958,6 +7958,7 @@ export const loadServerActionClient = ${
             root,
             nextConfig.outputFileTracingIncludes,
             nextConfig.outputFileTracingExcludes,
+            nitro.logger?.warn ?? console.warn,
           );
           if (traceIncludesHook) {
             const traceOpts = (nitro.options.traceOpts ??= {});

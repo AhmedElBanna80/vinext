@@ -13,8 +13,14 @@ import path, { toSlash } from "pathslash";
  * output, so included files inside `node_modules` are added there and
  * excluded files are removed.
  *
- * Files outside `node_modules` are not part of Nitro's traced output and are
- * ignored here.
+ * Files outside `node_modules` are not part of Nitro's traced output, so they
+ * are reported through `warn` and otherwise ignored.
+ *
+ * Globs are expanded with `fs.globSync`, which differs from the `glob` options
+ * Next.js uses (`{ dot: true, nodir: true }`) in two ways: dot files are only
+ * matched when a pattern segment names them (`.prisma`, `.*`), and a wildcard
+ * segment does not descend through a symlinked directory (literal segments,
+ * such as pnpm's `node_modules/<name>` links, do).
  */
 
 type TracedPackageVersion = {
@@ -66,11 +72,18 @@ function packageOfFile(file: string): { name: string; path: string } | null {
   };
 }
 
-function groupByPackage(files: readonly string[]): PackageFiles[] {
+function groupByPackage(files: readonly string[]): {
+  packages: PackageFiles[];
+  outsideNodeModules: number;
+} {
   const packages = new Map<string, PackageFiles>();
+  let outsideNodeModules = 0;
   for (const file of files) {
     const pkg = packageOfFile(file);
-    if (!pkg) continue;
+    if (!pkg) {
+      outsideNodeModules++;
+      continue;
+    }
     let entry = packages.get(pkg.path);
     if (!entry) {
       entry = { ...pkg, files: [] };
@@ -78,14 +91,16 @@ function groupByPackage(files: readonly string[]): PackageFiles[] {
     }
     entry.files.push(file);
   }
-  return [...packages.values()];
+  return { packages: [...packages.values()], outsideNodeModules };
 }
 
-function readPackageJson(packagePath: string): TracedPackageVersion["pkgJSON"] | null {
+// Same fallback nf3 uses for traced package directories without a
+// package.json, such as Prisma's generated `node_modules/.prisma`.
+function readPackageJson(pkg: PackageFiles): TracedPackageVersion["pkgJSON"] {
   try {
-    return JSON.parse(fs.readFileSync(path.join(packagePath, "package.json"), "utf8"));
+    return JSON.parse(fs.readFileSync(path.join(pkg.path, "package.json"), "utf8"));
   } catch {
-    return null;
+    return { name: pkg.name, version: "0.0.0" };
   }
 }
 
@@ -105,15 +120,21 @@ export function createNitroTraceIncludesHook(
   root: string,
   includes: readonly string[],
   excludes: readonly string[],
+  warn: (message: string) => void,
 ): ((tracedPackages: TracedPackages) => void) | null {
-  const included = groupByPackage(globFiles(root, includes));
+  const { packages: included, outsideNodeModules } = groupByPackage(globFiles(root, includes));
   const excluded = new Set(globFiles(root, excludes));
-  if (included.length === 0 && excluded.size === 0) return null;
+  if (included.length === 0 && excluded.size === 0 && outsideNodeModules === 0) return null;
 
   return (tracedPackages) => {
+    if (outsideNodeModules > 0) {
+      warn(
+        `[vinext] outputFileTracingIncludes matched ${outsideNodeModules} file(s) outside node_modules. ` +
+          "Nitro's traced output only contains node_modules, so these files are not copied.",
+      );
+    }
     for (const pkg of included) {
-      const pkgJSON = readPackageJson(pkg.path);
-      if (!pkgJSON) continue;
+      const pkgJSON = readPackageJson(pkg);
       const version = pkgJSON.version || "0.0.0";
       const traced = (tracedPackages[pkg.name] ??= { name: pkg.name, versions: {} });
       const existing = traced.versions[version];
@@ -124,8 +145,9 @@ export function createNitroTraceIncludesHook(
       // Another copy of the same name and version is already traced from a
       // different location; leave Nitro's choice alone.
       if (!samePath(existing.path, pkg.path)) continue;
+      const existingFiles = new Set(existing.files);
       for (const file of pkg.files) {
-        if (!existing.files.includes(file)) existing.files.push(file);
+        if (!existingFiles.has(file)) existing.files.push(file);
       }
     }
 

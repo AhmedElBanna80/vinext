@@ -57,7 +57,11 @@ describe("Nitro outputFileTracingIncludes", () => {
         "next.config.mjs": `export default {
   serverExternalPackages: ["data-pkg"],
   outputFileTracingIncludes: {
-    "/": ["./node_modules/data-pkg/data/*.txt", "./node_modules/@scope/extra/**"],
+    "/": [
+      "./node_modules/data-pkg/data/*.txt",
+      "./node_modules/@scope/extra/**",
+      "./node_modules/.prisma/client/**",
+    ],
   },
   outputFileTracingExcludes: {
     "/": ["./node_modules/data-pkg/data/skip.txt"],
@@ -85,6 +89,10 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
           version: "2.0.0",
         }),
         "node_modules/@scope/extra/types/index.d.ts": "export {};",
+        // Generated client directories such as Prisma's have no package.json
+        // at their node_modules root.
+        "node_modules/.prisma/client/index.js": "module.exports = {};",
+        "node_modules/.prisma/client/schema.prisma": "generator client {}",
       });
 
       const builder = await createBuilder({
@@ -101,8 +109,32 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
       expect(await exists(path.join(traced, "data-pkg", "data", "b.txt"))).toBe(true);
       expect(await exists(path.join(traced, "data-pkg", "data", "skip.txt"))).toBe(false);
       expect(await exists(path.join(traced, "@scope", "extra", "types", "index.d.ts"))).toBe(true);
+      expect(await exists(path.join(traced, ".prisma", "client", "schema.prisma"))).toBe(true);
     } finally {
       await fs.rm(root, { recursive: true, force: true }).catch(() => {});
     }
   }, 60_000);
+
+  it("warns when included files are outside node_modules", async () => {
+    const { createNitroTraceIncludesHook } =
+      await import("../packages/vinext/src/build/nitro-trace-includes.js");
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-outside-"));
+    try {
+      await writeFiles(root, { "content/a.md": "a", "content/b.md": "b" });
+      const warnings: string[] = [];
+      const hook = createNitroTraceIncludesHook(root, ["./content/*.md"], [], (message) =>
+        warnings.push(message),
+      );
+      expect(hook).not.toBeNull();
+      const tracedPackages = {};
+      hook!(tracedPackages);
+      expect(tracedPackages).toEqual({});
+      expect(warnings).toEqual([
+        "[vinext] outputFileTracingIncludes matched 2 file(s) outside node_modules. " +
+          "Nitro's traced output only contains node_modules, so these files are not copied.",
+      ]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
 });

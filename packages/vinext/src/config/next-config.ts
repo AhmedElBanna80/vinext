@@ -586,7 +586,9 @@ export type ResolvedNextConfig = {
   /**
    * Project-root-relative globs from every route key of
    * `outputFileTracingIncludes` / `outputFileTracingExcludes`. vinext emits a
-   * single server bundle, so the per-route keys are merged.
+   * single server bundle, so the per-route keys are merged: an include under
+   * any key is added to, and an exclude under any key removed from, the whole
+   * traced output. Next.js applies each key only to the routes it matches.
    */
   outputFileTracingIncludes: string[];
   outputFileTracingExcludes: string[];
