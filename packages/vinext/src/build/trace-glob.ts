@@ -167,11 +167,16 @@ function parseExtglob(
   }
 }
 
+/**
+ * Parse one path segment into regex source. `endsPattern` marks the last
+ * segment of a picomatch pattern, where a negated extglob is anchored.
+ */
 function parseSegment(
   segment: string,
   start: number,
   engine: Engine,
   inExtglob = false,
+  endsPattern = false,
 ): ParsedSegment {
   let source = "";
   let magic = false;
@@ -188,12 +193,24 @@ function parseSegment(
       const group = parseExtglob(segment, index + 2, engine);
       if (group) {
         const alternatives = group.alternatives.join("|");
-        source +=
-          char === "!"
-            ? `(?:(?!(?:${alternatives})(?:/|$))[^/]*?)`
-            : `(?:${alternatives})${char === "@" ? "" : char}`;
         magic = true;
         index = group.end + 1;
+        if (char !== "!") {
+          source += `(?:${alternatives})${char === "@" ? "" : char}`;
+          continue;
+        }
+        if (engine === "glob" && !inExtglob) {
+          // minimatch: no alternative may match together with the rest of the
+          // segment, so `!(a)*` rejects `ab` as well as `a`.
+          const rest = parseSegment(segment, index, engine);
+          source += `(?:(?!(?:${alternatives})${rest.source}$)[^/]*?)${rest.source}`;
+          return { source, magic, end: rest.end };
+        }
+        // picomatch only anchors the lookahead at the end of the pattern.
+        source +=
+          endsPattern && !inExtglob && index === segment.length
+            ? `(?:(?!(?:${alternatives})$))[^/]*?`
+            : `(?:(?!(?:${alternatives}))[^/]*?)`;
         continue;
       }
     }
@@ -254,7 +271,7 @@ function containsSource(pattern: string, rooted: boolean): string {
       return;
     }
     if (index > 0 && !(index === 1 && segments[0] === "**")) source += "/";
-    source += parseSegment(segment, 0, "picomatch").source;
+    source += parseSegment(segment, 0, "picomatch", false, index === segments.length - 1).source;
   });
   return source;
 }

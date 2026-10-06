@@ -198,7 +198,9 @@ function selectFiles(options: NitroTraceIncludesOptions): TraceSelection {
     for (const glob of group.includes) {
       let files = expanded.get(glob);
       if (!files) {
-        files = globFiles(root, glob);
+        // Like Next.js, read Windows separators (globs built with
+        // `path.relative`) as `/`.
+        files = globFiles(root, toSlash(glob));
         expanded.set(glob, files);
       }
       for (const file of files) {
