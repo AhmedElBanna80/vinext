@@ -1612,9 +1612,6 @@ type NitroSetupContext = {
       };
     };
   };
-  hooks?: {
-    hook(name: "compiled", handler: () => void | Promise<void>): unknown;
-  };
   logger?: {
     warn?: (message: string) => void;
   };
@@ -1690,6 +1687,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let warnedInlineNextConfigOverride = false;
   let hasNitroPlugin = false;
   let nitroHostRuntime: "node" | "worker" = "node";
+  let writeUntracedNitroIncludes: (() => void) | undefined;
   let resolvedServerExternalPackages: string[] = [];
   let registerNodeOpenTelemetryLoader = false;
   let pagesTsconfigAliases: Record<string, string> = {};
@@ -7940,6 +7938,11 @@ export const loadServerActionClient = ${
     },
     {
       name: "vinext:nitro-route-rules",
+      // Runs after Nitro's dependency trace (its externals plugin's `buildEnd`)
+      // and before Nitro's `compiled` hook, where presets package serverDir.
+      writeBundle() {
+        if (this.environment?.name === "nitro") writeUntracedNitroIncludes?.();
+      },
       nitro: {
         setup: async (nitro: NitroSetupContext) => {
           nitroBuildDir = nitro.options.buildDir
@@ -7975,13 +7978,16 @@ export const loadServerActionClient = ${
               await userTracedPackages?.(tracedPackages);
             };
             // Nitro skips the dependency trace, and so the hook above, when the
-            // server bundle has no traced externals. Worker presets have no
-            // node_modules output at all.
-            if (nitro.options.node !== false && nitro.options.preset !== "nitro-prerender") {
-              nitro.hooks?.hook("compiled", () => {
-                const serverDir = nitro.options.output?.serverDir;
-                if (serverDir) traceIncludes.writeUntraced(serverDir);
-              });
+            // server bundle has no traced externals; `writeBundle` below copies
+            // the included files then. Worker presets have no node_modules
+            // output at all.
+            const serverDir = nitro.options.output?.serverDir;
+            if (
+              serverDir &&
+              nitro.options.node !== false &&
+              nitro.options.preset !== "nitro-prerender"
+            ) {
+              writeUntracedNitroIncludes = () => traceIncludes.writeUntraced(serverDir);
             }
           }
 

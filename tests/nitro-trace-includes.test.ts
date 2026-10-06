@@ -39,7 +39,7 @@ const pkg = (name: string, version: string) => JSON.stringify({ name, version, m
 async function buildNitroApp(
   root: string,
   files: Record<string, string>,
-  plugins: Plugin[] = [],
+  options: { plugins?: Plugin[]; nitro?: Record<string, unknown> } = {},
 ): Promise<string> {
   const vinext = (await import("../packages/vinext/src/index.js")).default;
   const nitroModule = (await import(
@@ -65,13 +65,22 @@ async function buildNitroApp(
     "node_modules/.prisma/client/schema.prisma": "generator client {}",
     "node_modules/@scope/extra/package.json": pkg("@scope/extra", "2.0.0"),
     "node_modules/@scope/extra/types/index.d.ts": "export {};",
+    "node_modules/pkg/package.json": pkg("pkg", "1.0.0"),
+    "node_modules/pkg/index.js": "module.exports = 'pkg';",
     ...files,
   });
+  // Next.js test/integration/build-trace-extra-entries: an include through a
+  // symlinked package keeps the link name.
+  await fs.symlink("pkg", path.join(nodeModules, "pkg-behind-symlink"), "junction");
 
   const builder = await createBuilder({
     root,
     configFile: false,
-    plugins: [...plugins, vinext({ appDir: root }), nitroModule.nitro({ preset: "node-server" })],
+    plugins: [
+      ...(options.plugins ?? []),
+      vinext({ appDir: root }),
+      nitroModule.nitro({ preset: "node-server", ...options.nitro }),
+    ],
     logLevel: "silent",
   });
   await builder.buildApp();
@@ -100,6 +109,7 @@ describe("Nitro outputFileTracingIncludes", () => {
       "./node_modules/@scope/extra/**",
       "./node_modules/.prisma/client/**",
       "./node_modules/helper/**",
+      "./node_modules/pkg-behind-symlink/*",
     ],
   },
   outputFileTracingExcludes: {
@@ -127,7 +137,7 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
           "node_modules/helper/index.js": "module.exports = 2;",
           "node_modules/helper/extra.txt": "extra",
         },
-        [lateFilePlugin],
+        { plugins: [lateFilePlugin] },
       );
 
       expect(await exists(path.join(traced, "data-pkg", "data", "a.txt"))).toBe(true);
@@ -139,6 +149,8 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
       expect(await exists(path.join(traced, "data-pkg", "index.js"))).toBe(true);
       expect(await exists(path.join(traced, "@scope", "extra", "types", "index.d.ts"))).toBe(true);
       expect(await exists(path.join(traced, ".prisma", "client", "schema.prisma"))).toBe(true);
+      expect(await exists(path.join(traced, "pkg-behind-symlink", "index.js"))).toBe(true);
+      expect(await exists(path.join(traced, "pkg"))).toBe(false);
       // The traced copy of helper stays the one the output resolves.
       const helperPkg = JSON.parse(
         await fs.readFile(path.join(traced, "helper", "package.json"), "utf8"),
@@ -153,20 +165,44 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
   it("copies included files when Nitro traces no external packages", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-untraced-"));
     try {
-      const traced = await buildNitroApp(root, {
-        "next.config.mjs": `export default {
+      // Presets package serverDir in Nitro `compiled` hooks (Vercel copies it
+      // into each function), and those run before module hooks.
+      let shippedBeforeCompiled = false;
+      const traced = await buildNitroApp(
+        root,
+        {
+          "next.config.mjs": `export default {
   outputFileTracingIncludes: {
-    "/": ["./node_modules/@scope/extra/**", "./node_modules/.prisma/client/**"],
+    "/": [
+      "./node_modules/@scope/extra/**",
+      "./node_modules/.prisma/client/**",
+      "./node_modules/pkg-behind-symlink/*",
+    ],
   },
   outputFileTracingExcludes: { "/": ["./node_modules/.prisma/client/index.js"] },
 };`,
-        "app/route.ts": `export function GET() { return new Response("ok"); }`,
-      });
+          "app/route.ts": `export function GET() { return new Response("ok"); }`,
+        },
+        {
+          nitro: {
+            hooks: {
+              async compiled() {
+                shippedBeforeCompiled = await exists(
+                  path.join(root, ".output/server/node_modules/@scope/extra/types/index.d.ts"),
+                );
+              },
+            },
+          },
+        },
+      );
 
+      expect(shippedBeforeCompiled).toBe(true);
       expect(await exists(path.join(traced, "@scope", "extra", "package.json"))).toBe(true);
       expect(await exists(path.join(traced, "@scope", "extra", "types", "index.d.ts"))).toBe(true);
       expect(await exists(path.join(traced, ".prisma", "client", "schema.prisma"))).toBe(true);
       expect(await exists(path.join(traced, ".prisma", "client", "index.js"))).toBe(false);
+      expect(await exists(path.join(traced, "pkg-behind-symlink", "index.js"))).toBe(true);
+      expect(await exists(path.join(traced, "pkg"))).toBe(false);
     } finally {
       await fs.rm(root, { recursive: true, force: true }).catch(() => {});
     }

@@ -43,8 +43,10 @@ export type TracedPackages = Record<
 
 type PackageFiles = {
   name: string;
+  /** Package root as matched, so symlinked packages keep their link name. */
   path: string;
-  files: string[];
+  /** Matched paths (output layout) with their real paths (identity). */
+  files: Array<{ path: string; real: string }>;
 };
 
 export type NitroTraceIncludes = {
@@ -57,22 +59,27 @@ export type NitroTraceIncludes = {
   writeUntraced(serverDir: string): void;
 };
 
-// Nitro's tracer reports forward-slash real paths, so compare in that form.
+// Nitro's tracer reports forward-slash paths, so compare in that form.
 const NODE_MODULES_SEGMENT = "/node_modules/";
 
-function globFiles(root: string, patterns: readonly string[]): string[] {
-  if (patterns.length === 0) return [];
-  const files = new Set<string>();
+/**
+ * Expand globs from the project root into matched file paths mapped to their
+ * real paths. Like Next.js, the matched path decides where a file lands, so a
+ * `node_modules/<link>` symlink keeps its link name.
+ */
+function globFiles(root: string, patterns: readonly string[]): Map<string, string> {
+  const files = new Map<string, string>();
+  if (patterns.length === 0) return files;
   for (const match of fs.globSync([...patterns], { cwd: root })) {
     const absolute = path.resolve(root, match);
     try {
       if (!fs.statSync(absolute).isFile()) continue;
-      files.add(toSlash(fs.realpathSync(absolute)));
+      files.set(toSlash(absolute), toSlash(fs.realpathSync(absolute)));
     } catch {
       // Broken symlink or file removed during the build.
     }
   }
-  return [...files];
+  return files;
 }
 
 /** Files selected by each route key's includes, minus that key's excludes. */
@@ -80,20 +87,18 @@ function collectIncludedFiles(
   root: string,
   includes: Readonly<Record<string, readonly string[]>>,
   excludes: Readonly<Record<string, readonly string[]>>,
-): string[] {
-  const files = new Set<string>();
+): Map<string, string> {
+  const files = new Map<string, string>();
   for (const [routeGlob, includeGlobs] of Object.entries(includes)) {
-    const excluded = new Set(
-      globFiles(root, Object.hasOwn(excludes, routeGlob) ? excludes[routeGlob] : []),
-    );
-    for (const file of globFiles(root, includeGlobs)) {
-      if (!excluded.has(file)) files.add(file);
+    const excluded = globFiles(root, Object.hasOwn(excludes, routeGlob) ? excludes[routeGlob] : []);
+    for (const [file, real] of globFiles(root, includeGlobs)) {
+      if (!excluded.has(file)) files.set(file, real);
     }
   }
-  return [...files];
+  return files;
 }
 
-/** Split a real `node_modules` file path into its package name and root. */
+/** Split a `node_modules` file path into its package name and root. */
 function packageOfFile(file: string): { name: string; path: string } | null {
   const index = file.lastIndexOf(NODE_MODULES_SEGMENT);
   if (index === -1) return null;
@@ -107,13 +112,13 @@ function packageOfFile(file: string): { name: string; path: string } | null {
   };
 }
 
-function groupByPackage(files: readonly string[]): {
+function groupByPackage(files: ReadonlyMap<string, string>): {
   packages: PackageFiles[];
   outsideNodeModules: number;
 } {
   const packages = new Map<string, PackageFiles>();
   let outsideNodeModules = 0;
-  for (const file of files) {
+  for (const [file, real] of files) {
     const pkg = packageOfFile(file);
     if (!pkg) {
       outsideNodeModules++;
@@ -124,7 +129,7 @@ function groupByPackage(files: readonly string[]): {
       entry = { ...pkg, files: [] };
       packages.set(pkg.path, entry);
     }
-    entry.files.push(file);
+    entry.files.push({ path: file, real });
   }
   return { packages: [...packages.values()], outsideNodeModules };
 }
@@ -180,7 +185,13 @@ export function createNitroTraceIncludes(
         const pkgJSON = readPackageJson(pkg);
         tracedPackages[pkg.name] = {
           name: pkg.name,
-          versions: { [pkgJSON.version || "0.0.0"]: { path: pkg.path, files: pkg.files, pkgJSON } },
+          versions: {
+            [pkgJSON.version || "0.0.0"]: {
+              path: pkg.path,
+              files: pkg.files.map((file) => file.path),
+              pkgJSON,
+            },
+          },
         };
         continue;
       }
@@ -192,9 +203,12 @@ export function createNitroTraceIncludes(
         otherCopies.push(pkg.path);
         continue;
       }
+      // nf3 lists real paths.
       const existingFiles = new Set(existing.files);
       for (const file of pkg.files) {
-        if (!existingFiles.has(file)) existing.files.push(file);
+        if (existingFiles.has(file.real)) continue;
+        existingFiles.add(file.real);
+        existing.files.push(file.path);
       }
     }
     if (otherCopies.length > 0) {
