@@ -361,6 +361,36 @@ describe("Image SSR rendering", () => {
     expect(props.srcSet).toBe(srcSet);
   });
 
+  // Next.js marks data:/blob: sources unoptimized before generateImgAttrs.
+  it("never passes data: or blob: sources to a custom loader", () => {
+    const loader = vi.fn(({ src, width }: { src: string; width: number }) => `${src}?w=${width}`);
+    for (const src of ["data:image/png;base64,iVBORw0KGgo=", "blob:https://example.com/uuid"]) {
+      const imageProps = { alt: "inline", src, width: 100, height: 100, loader };
+
+      const html = ReactDOMServer.renderToString(React.createElement(Image, imageProps));
+      expect(html).toContain(`src="${src}"`);
+      expect(html).not.toContain("srcSet");
+
+      const { props } = getImageProps(imageProps);
+      expect(props.src).toBe(src);
+      expect(props.srcSet).toBeUndefined();
+    }
+    expect(loader).not.toHaveBeenCalled();
+  });
+
+  // Next.js keeps `src` after `sizes`/`srcSet` so Safari doesn't fetch it early.
+  it("orders src after srcSet and sizes for custom loaders", () => {
+    const loader = ({ src, width }: { src: string; width: number }) => `${src}?w=${width}`;
+    const imageProps = { alt: "order", src: "/photo.jpg", width: 100, height: 100, loader };
+
+    const html = ReactDOMServer.renderToString(React.createElement(Image, imageProps));
+    expect(html.indexOf(" src=")).toBeGreaterThan(html.indexOf(" srcSet="));
+
+    const keys = Object.keys(getImageProps(imageProps).props);
+    expect(keys.indexOf("src")).toBeGreaterThan(keys.indexOf("srcSet"));
+    expect(keys.indexOf("src")).toBeGreaterThan(keys.indexOf("sizes"));
+  });
+
   it("renders StaticImageData (import result)", () => {
     const staticImage: StaticImageData = {
       src: "/_next/static/media/test.abc123.png",

@@ -452,6 +452,10 @@ function resolveImageLoader(src: string, loader: ImageLoader | undefined): Image
   return effectiveLoader;
 }
 
+function isInlineSrc(src: string): boolean {
+  return src.startsWith("data:") || src.startsWith("blob:");
+}
+
 const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
   {
     src: srcProp,
@@ -615,7 +619,9 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
         }
       : undefined;
 
-  if (_unoptimized === true || __globallyUnoptimized) {
+  // Next.js treats data:/blob: sources as unoptimized, so even a custom loader
+  // never sees them.
+  if (_unoptimized === true || __globallyUnoptimized || (effectiveLoader && isInlineSrc(src))) {
     // Unoptimized images are fetched directly by the browser, so intentionally
     // skip remote URL validation: there is no server-side optimizer fetch and
     // therefore no SSRF surface. This matches Next.js behavior.
@@ -680,7 +686,6 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
     return (
       <img
         ref={mergedRef}
-        src={resolvedSrc}
         alt={alt}
         width={fill ? undefined : imgWidth}
         height={fill ? undefined : imgHeight}
@@ -688,6 +693,9 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
         decoding="async"
         srcSet={loaderAttributes.srcSet}
         sizes={loaderAttributes.sizes}
+        // After srcSet/sizes, as in Next.js: Safari would otherwise start
+        // fetching `src` before it sees the responsive candidates.
+        src={resolvedSrc}
         className={className}
         onLoad={handleLoad}
         onError={handleError}
@@ -906,7 +914,7 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
   const effectiveLoader = resolveImageLoader(src, loader);
   const shouldPreload = _preload === true || priority === true;
 
-  if (_unoptimized === true || __globallyUnoptimized) {
+  if (_unoptimized === true || __globallyUnoptimized || (effectiveLoader && isInlineSrc(src))) {
     // As in the component path, unoptimized images never reach the server-side
     // optimizer, so remote URL validation is intentionally unnecessary.
     const renderedSrc = overrideSrc || src;
@@ -1008,7 +1016,6 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
       : undefined;
 
   const imageProps: ImgProps = {
-    src: optimizedSrc,
     alt,
     width: fill ? undefined : imgWidth,
     height: fill ? undefined : imgHeight,
@@ -1017,6 +1024,9 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
     decoding: "async" as const,
     srcSet,
     sizes: sizes ?? (fill ? "100vw" : undefined),
+    // After srcSet/sizes, matching Next.js's prop order (Safari fetches `src`
+    // early if React applies it first).
+    src: optimizedSrc,
     className,
     style: fill ? getFillStyle(style, blurStyle) : { ...blurStyle, ...style },
     ...rest,
