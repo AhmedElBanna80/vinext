@@ -5539,6 +5539,45 @@ describe("createAppRscHandler", () => {
     expect(response.status).toBe(302);
   });
 
+  it("serves /_next/image from the Nitro app in production with x-nextjs-cache: MISS", async () => {
+    const nitroGlobal = globalThis as { __nitro__?: unknown };
+    const previous = nitroGlobal.__nitro__;
+    const fetchAsset = vi.fn(
+      async (_request: Request) =>
+        new Response("img", { status: 200, headers: { "Content-Type": "image/jpeg" } }),
+    );
+    nitroGlobal.__nitro__ = { default: { fetch: fetchAsset } };
+    try {
+      const handler = createHandler({ isDev: false });
+      const response = await handler(
+        new Request("https://example.test/docs/_next/image?url=%2Fimg.jpg&w=640&q=75"),
+        null,
+      );
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("img");
+      expect(response.headers.get("x-nextjs-cache")).toBe("MISS");
+      expect(response.headers.get("Cache-Control")).toBe("public, max-age=31536000, immutable");
+      expect(fetchAsset.mock.calls[0]?.[0].url).toBe("https://example.test/img.jpg");
+
+      fetchAsset.mockResolvedValueOnce(new Response("", { status: 404 }));
+      const missing = await handler(
+        new Request("https://example.test/docs/_next/image?url=%2Fnope.jpg&w=640&q=75"),
+        null,
+      );
+      expect(missing.status).toBe(404);
+      expect(missing.headers.has("x-nextjs-cache")).toBe(false);
+
+      // Dev keeps redirecting to the source asset.
+      const dev = await createHandler({ isDev: true })(
+        new Request("https://example.test/docs/_next/image?url=%2Fimg.jpg&w=640&q=75"),
+        null,
+      );
+      expect(dev.status).toBe(302);
+    } finally {
+      nitroGlobal.__nitro__ = previous;
+    }
+  });
+
   it("wraps dispatch responses with request-scoped finalization", async () => {
     const dispatchMatchedPage = vi.fn(async () => new Response("page", { status: 200 }));
     const handler = createHandler({ dispatchMatchedPage });
