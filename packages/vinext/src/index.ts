@@ -315,6 +315,10 @@ import {
 } from "./plugins/import-meta-url.js";
 import { createWorkerImageImportsPlugin } from "./plugins/worker-image-imports.js";
 import { createRequireContextPlugin } from "./plugins/require-context.js";
+import {
+  commonJsEsmFacadeOptimizeDepsPlugin,
+  stripEsmCommonJsExportFacade,
+} from "./plugins/commonjs-esm-facade.js";
 import { COMMONJS_SYNTAX_CODE_FILTER } from "./plugins/commonjs-syntax.js";
 import {
   createRequireConditionResolutionPlugin,
@@ -2228,34 +2232,31 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       const previous = transformBundledCommonJsDependencies;
       transformProjectLocalCommonJs = projectLocal && isDev;
       transformBundledCommonJsDependencies = bundledDependency;
+      // vite-plugin-commonjs prepends its CJS->ESM interop runtime (the
+      // `module`/`exports` facade) to the source it transforms. If `code`
+      // starts with a hashbang line, that prepend pushes `#!` out of
+      // byte-0, which later fails to parse ("Invalid Character '!'") once
+      // bundled -- `#!` is only valid Hashbang grammar at the very start of
+      // the file. Strip it before handing the source to the transform and
+      // splice it back onto whatever comes back.
+      const hashbang = /^#![^\n]*\n/.exec(code)?.[0] ?? "";
+      let result: ReturnType<typeof commonJsTransform>;
       try {
         // Do not await here: the filter is consulted synchronously while this
         // environment-scoped flag is set. The remaining async transform work
         // does not read it, so concurrent module transforms cannot cross-talk.
-        //
-        // vite-plugin-commonjs prepends its CJS->ESM interop runtime (the
-        // `module`/`exports` facade) to the source it transforms. If `code`
-        // starts with a hashbang line, that prepend pushes `#!` out of
-        // byte-0, which later fails to parse ("Invalid Character '!'") once
-        // bundled -- `#!` is only valid Hashbang grammar at the very start of
-        // the file. Strip it before handing the source to the transform and
-        // splice it back onto whatever comes back.
-        const hashbangMatch = /^#![^\n]*\n/.exec(code);
-        if (!hashbangMatch) return commonJsTransform.call(this, code, id, ...args);
-        const hashbang = hashbangMatch[0];
-        const transformed = commonJsTransform.call(this, code.slice(hashbang.length), id, ...args);
-        return Promise.resolve(transformed).then((result) => {
-          if (result == null) return result;
-          if (typeof result === "string") return hashbang + result;
-          if (typeof result === "object" && typeof result.code === "string") {
-            return { ...result, code: hashbang + result.code };
-          }
-          return result;
-        });
+        result = commonJsTransform.call(this, code.slice(hashbang.length), id, ...args);
       } finally {
         transformProjectLocalCommonJs = previousProjectLocal;
         transformBundledCommonJsDependencies = previous;
       }
+      return Promise.resolve(result).then((transformed) => {
+        if (typeof transformed !== "object" || typeof transformed?.code !== "string") {
+          return typeof transformed === "string" ? hashbang + transformed : transformed;
+        }
+        const stripped = stripEsmCommonJsExportFacade(transformed.code);
+        return { ...transformed, code: hashbang + (stripped ?? transformed.code) };
+      });
     };
     // Modules without any syntax vite-plugin-commonjs could rewrite never
     // reach JavaScript, so it does not strip and parse them for nothing.
@@ -3779,7 +3780,8 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           ...depOptimizeNodeEnvOptions,
           rolldownOptions: {
             ...depOptimizeNodeEnvOptions.rolldownOptions,
-            plugins: [depOptimizeAliasPlugin],
+            // vite-plugin-commonjs's pre-bundle plugin runs in this optimizer.
+            plugins: [depOptimizeAliasPlugin, commonJsEsmFacadeOptimizeDepsPlugin],
           },
         };
         pagesOptimizeEntries = !hasAppDir
