@@ -18,7 +18,7 @@ type TestResolve = (
 ) => Promise<string | undefined>;
 type TestFilter = (id: string) => boolean | undefined;
 
-const TEST_ENVIRONMENT = { config: { resolve: { external: [] } } };
+const TEST_ENVIRONMENT = { config: { resolve: { external: [] }, build: {} } };
 
 function createPlugin(
   resolve: TestResolve,
@@ -294,9 +294,37 @@ describe("vinext:require-condition-resolution", () => {
   // externalize node_modules packages by default; explicit externals still win.
   it.each([
     ["bundles the require target of a default-externalized package", {}, true],
-    ["keeps a package listed in resolve.external external", { external: ["lib-cjs"] }, false],
-    ["keeps packages external when resolve.external is true", { external: true as const }, false],
-  ])("%s", async (_name, resolve, rewritten) => {
+    [
+      "bundles past a bundler external that does not match",
+      { build: { rollupOptions: { external: [/^nitro(\/|$)/] } } },
+      true,
+    ],
+    [
+      "keeps a package listed in resolve.external external",
+      { resolve: { external: ["lib-cjs"] } },
+      false,
+    ],
+    [
+      "keeps packages external when resolve.external is true",
+      { resolve: { external: true as const } },
+      false,
+    ],
+    [
+      "keeps a string bundler external external",
+      { build: { rolldownOptions: { external: ["lib-cjs"] } } },
+      false,
+    ],
+    [
+      "keeps a RegExp bundler external external",
+      { build: { rollupOptions: { external: /^lib-/ } } },
+      false,
+    ],
+    [
+      "keeps a function bundler external external",
+      { build: { rolldownOptions: { external: (id: string) => id === "lib-cjs" } } },
+      false,
+    ],
+  ])("%s", async (_name, environment, rewritten) => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vinext-require-condition-")));
     try {
       const packageDir = path.join(root, "node_modules", "lib-cjs");
@@ -317,7 +345,7 @@ describe("vinext:require-condition-resolution", () => {
         root,
         configFile: false,
         logLevel: "silent",
-        environments: { ssr: { resolve } },
+        environments: { ssr: environment },
       });
       const plugin = createRequireConditionResolutionPlugin(createIdResolver, () => undefined);
       const configResolved = plugin.configResolved;

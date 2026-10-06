@@ -1,7 +1,7 @@
 import MagicString from "magic-string";
 import { readFile } from "node:fs/promises";
 import path from "pathslash";
-import { createIdResolver, parseAst, type ESTree, type Plugin } from "vite";
+import { createIdResolver, parseAst, type ESTree, type Plugin, type ResolvedConfig } from "vite";
 import {
   collectBindingNames,
   forEachAstChild,
@@ -157,6 +157,23 @@ function collectLiteralRequires(code: string, id: string): LiteralRequire[] {
   return requires;
 }
 
+type BundlerExternal = NonNullable<ResolvedConfig["build"]["rolldownOptions"]>["external"];
+
+// Mirror the bundler's check of an unresolved import against `external`.
+function isBundlerExternal(
+  external: BundlerExternal,
+  specifier: string,
+  importer: string,
+): boolean {
+  if (typeof external === "function") return Boolean(external(specifier, importer, false));
+  const patterns = Array.isArray(external) ? external : [external];
+  return patterns.some((pattern) =>
+    typeof pattern === "string"
+      ? pattern === specifier
+      : pattern instanceof RegExp && pattern.test(specifier),
+  );
+}
+
 /**
  * Resolve literal package `require()` calls while Vite still knows they are
  * CommonJS references. `vite-plugin-commonjs` subsequently hoists each call
@@ -244,17 +261,23 @@ export function createRequireConditionResolutionPlugin(
           return null;
         }
         const requires = collectLiteralRequires(code, id);
+        if (requires.length === 0 || !defaultResolvers || !bundlingResolvers) return null;
         // `resolve.external: true` asks for every dependency to stay external,
         // so don't pull require targets into the bundle there.
-        const resolvers =
-          this.environment.config.resolve.external === true ? defaultResolvers : bundlingResolvers;
-        if (requires.length === 0 || !resolvers) return null;
+        const keepExternals = this.environment.config.resolve.external === true;
+        const bundlerExternal = this.environment.config.build.rolldownOptions?.external;
 
         const output = new MagicString(code);
         let changed = false;
         // Synthetic script modules intentionally pass through this transform
         // again so nested package require() calls retain their own conditions.
         for (const { argument, specifier } of requires) {
+          // The rewrite replaces the bare specifier, so a bundler external
+          // matching it would no longer apply; keep the default resolution.
+          const resolvers =
+            keepExternals || isBundlerExternal(bundlerExternal, specifier, id)
+              ? defaultResolvers
+              : bundlingResolvers;
           const [requireResolution, importResolution] = await Promise.all([
             resolvers.require(this.environment, specifier, id),
             resolvers.import(this.environment, specifier, id),
