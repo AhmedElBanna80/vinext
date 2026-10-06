@@ -784,6 +784,17 @@ function warnConfigLoadFailure(filename: string, err: Error): void {
 }
 
 /**
+ * The `defaultConfig` handed to a function-form next.config. Next.js passes
+ * its full `defaultConfig` (packages/next/src/server/config-shared.ts); vinext
+ * passes the subset configs are known to read, with values matching Next.js,
+ * so `[...defaultConfig.pageExtensions, "page.js"]` works. Fresh per call so a
+ * config that mutates it cannot leak into later loads.
+ */
+function createFunctionConfigDefaults(): NextConfig {
+  return { pageExtensions: [...DEFAULT_PAGE_EXTENSIONS] };
+}
+
+/**
  * Resolve a Next-style config value, calling it if it's a function-form config
  * (Next.js supports `module.exports = (phase, opts) => config`).
  */
@@ -793,12 +804,7 @@ async function resolveConfigValue(
 ): Promise<NextConfig> {
   if (typeof config === "function") {
     const result = await config(phase, {
-      // Next.js passes the function-form config its real defaults (see
-      // config-shared.js's `defaultConfig`), not an empty object -- a config
-      // like `(phase, { defaultConfig }) => ({ pageExtensions: [...defaultConfig.pageExtensions, 'page.js'] })`
-      // (the compat suite's custom-page-extension fixture) otherwise throws
-      // `defaultConfig.pageExtensions is not iterable`.
-      defaultConfig: { pageExtensions: [...DEFAULT_PAGE_EXTENSIONS] },
+      defaultConfig: createFunctionConfigDefaults(),
     });
     return result as NextConfig;
   }
@@ -1208,7 +1214,7 @@ async function loadNextConfigWithPackageIdentity(
               `const cjsExports = cjsModule && cjsModule.exports;\n` +
               `const cjsValue = cjsExports != null && (cjsExports !== cjsInitial || (typeof cjsExports === "object" && Object.keys(cjsExports).length > 0)) ? cjsExports : undefined;\n` +
               `const value = cjsValue ?? configModule.default ?? configModule;\n` +
-              `export default typeof value === "function" ? await value(${phaseLiteral}, { defaultConfig: { pageExtensions: ${JSON.stringify([...DEFAULT_PAGE_EXTENSIONS])} } }) : value;\n`
+              `export default typeof value === "function" ? await value(${phaseLiteral}, { defaultConfig: ${JSON.stringify(createFunctionConfigDefaults())} }) : value;\n`
             );
           },
         },
