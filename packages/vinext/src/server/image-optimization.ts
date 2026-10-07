@@ -17,7 +17,6 @@
  * as-is (no transformation) with security headers applied.
  */
 
-import { NEXTJS_CACHE_HEADER } from "./headers.js";
 import { badRequestResponse } from "./http-error-responses.js";
 
 /** The pathname that triggers image optimization (matches Next.js). */
@@ -252,10 +251,6 @@ export function isSafeImageContentType(
  * When an ImageConfig is provided, uses its values for CSP and Content-Disposition.
  */
 function setImageSecurityHeaders(headers: Headers, config?: ImageConfig): void {
-  // vinext keeps no image cache of its own: every 200 response is produced by
-  // this handler, which is what Next.js reports as a cache MISS. (HIT/STALE
-  // would need a cache that remembers a previous optimization.)
-  headers.set(NEXTJS_CACHE_HEADER, "MISS");
   headers.set(
     "Content-Security-Policy",
     config?.contentSecurityPolicy ?? IMAGE_CONTENT_SECURITY_POLICY,
@@ -478,73 +473,4 @@ export function handleConfiguredImageOptimization(
     allowedWidths,
     imageConfig,
   );
-}
-
-/** Next.js default `images.minimumCacheTTL` (4 hours). */
-export const DEFAULT_IMAGE_MINIMUM_CACHE_TTL = 14400;
-
-/**
- * Source headers kept when an image is read through the Nitro app. Next.js
- * forwards only the content type, cache control and ETag of an internal image
- * response and drops everything else, so a middleware `Set-Cookie` or similar
- * never ends up on a publicly cached image.
- */
-const NITRO_IMAGE_SOURCE_HEADERS = [
-  "Content-Type",
-  "Content-Length",
-  "ETag",
-  "Last-Modified",
-  "Cache-Control",
-];
-
-/**
- * Serve `/_next/image` in a Nitro production build, where there is no `ASSETS`
- * binding: the source image is read through the Nitro app's `fetch` and answered
- * directly instead of redirecting to it.
- *
- * Like Next.js, the source request carries none of the client's headers, only
- * allowlisted source headers are kept, and the response uses
- * `public, max-age=<max(source max-age, minimumCacheTTL)>, must-revalidate`
- * (`immutable` only for hashed `/_next/static/media` sources).
- */
-export async function handleNitroImageOptimization(
-  request: Request,
-  nitroFetch: (request: Request) => Promise<Response>,
-  allowedWidths?: number[],
-  imageConfig?: ImageConfig,
-  basePath = "",
-): Promise<Response> {
-  const origin = new URL(request.url).origin;
-  let sourceMaxAge = 0;
-  const response = await handleConfiguredImageOptimization(
-    request,
-    async (assetPath) => {
-      const source = await nitroFetch(new Request(new URL(assetPath, origin)));
-      const headers = new Headers();
-      for (const name of NITRO_IMAGE_SOURCE_HEADERS) {
-        const value = source.headers.get(name);
-        if (value !== null) headers.set(name, value);
-      }
-      const match = /max-age=(\d+)/i.exec(headers.get("Cache-Control") ?? "");
-      sourceMaxAge = match ? Number.parseInt(match[1], 10) : 0;
-      return new Response(source.body, { status: source.status, headers });
-    },
-    allowedWidths,
-    imageConfig,
-  );
-  if (response.status !== 200) return response;
-  // Resolve `..` and percent-encoding the way the source fetch does, so a
-  // traversal out of the hashed directory is not treated as hashed media.
-  const sourceUrl = new URL(new URL(request.url).searchParams.get("url") ?? "", "http://n")
-    .pathname;
-  const isStatic =
-    sourceUrl.startsWith(`${basePath}/_next/static/media`) ||
-    sourceUrl.startsWith(`${basePath}/_next/static/immutable/media`);
-  response.headers.set(
-    "Cache-Control",
-    isStatic
-      ? IMAGE_CACHE_CONTROL
-      : `public, max-age=${Math.max(sourceMaxAge, DEFAULT_IMAGE_MINIMUM_CACHE_TTL)}, must-revalidate`,
-  );
-  return response;
 }

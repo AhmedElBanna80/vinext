@@ -103,7 +103,6 @@ import { parseNextHttpErrorDigest } from "./next-error-digest.js";
 import {
   DEFAULT_DEVICE_SIZES,
   DEFAULT_IMAGE_SIZES,
-  handleNitroImageOptimization,
   isImageOptimizationPath,
   resolveDevImageRedirect,
   type ImageConfig,
@@ -784,14 +783,6 @@ function markUnverifiedInterceptionResponseUncacheable(response: Response): Resp
     });
   }
   return markedResponse;
-}
-
-/** The Nitro app's `fetch`, when this server is running under Nitro. */
-function getNitroAppFetch(): ((request: Request) => Promise<Response>) | undefined {
-  const app = (
-    globalThis as { __nitro__?: { default?: { fetch?: (request: Request) => Promise<Response> } } }
-  ).__nitro__?.default;
-  return typeof app?.fetch === "function" ? app.fetch.bind(app) : undefined;
 }
 
 async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
@@ -1554,25 +1545,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     );
     if (!imageRedirect)
       return new Response("Invalid image optimization parameters", { status: 400 });
-    // Production under Nitro: no worker `ASSETS` binding exists, but Nitro
-    // publishes its app on `globalThis.__nitro__` and that app serves the
-    // public assets. Answer from here instead of redirecting, so the response
-    // carries the image headers (including `x-nextjs-cache`) like Next.js.
-    const nitroFetch = options.isDev ? undefined : getNitroAppFetch();
-    const assetUrl = new URL(imageRedirect, url.origin);
-    if (nitroFetch && !isImageOptimizationPath(assetUrl.pathname)) {
-      return handleNitroImageOptimization(
-        request,
-        nitroFetch,
-        [
-          ...(options.imageConfig?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
-          ...(options.imageConfig?.imageSizes ?? DEFAULT_IMAGE_SIZES),
-        ],
-        options.imageConfig,
-        options.basePath,
-      );
-    }
-    return Response.redirect(assetUrl.href, 302);
+    return Response.redirect(new URL(imageRedirect, url.origin).href, 302);
   }
 
   const metadataRouteResponse = await renderMetadataRouteIfMatched();
