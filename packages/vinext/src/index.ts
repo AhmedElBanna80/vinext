@@ -1311,6 +1311,11 @@ const _appRscCombinedHandlerPath = resolveShimModulePath(_serverDir, "app-rsc-co
 const _appRscHandlerPath = resolveShimModulePath(_serverDir, "app-rsc-handler");
 const _pagesClientAssetsPath = resolveShimModulePath(_serverDir, "pages-client-assets");
 const _imageLoaderFilePath = resolveShimModulePath(_shimsDir, "image-loader-file");
+// Source checkouts resolve to TypeScript and must stay in Vite's graph so tests
+// do not execute a stale dist build. Published packages resolve to emitted JS,
+// which Node can load natively outside the RSC transform graph.
+const _canExternalizeAppRscHandler =
+  _appRscHandlerPath.endsWith(".js") && _appRscCombinedHandlerPath.endsWith(".js");
 
 /**
  * Resolve the module behind `vinext/shims/image-loader-file`. Ported from
@@ -1333,11 +1338,6 @@ function resolveImageLoaderFile(images: NextConfig["images"], root: string): str
   }
   return absolutePath;
 }
-// Source checkouts resolve to TypeScript and must stay in Vite's graph so tests
-// do not execute a stale dist build. Published packages resolve to emitted JS,
-// which Node can load natively outside the RSC transform graph.
-const _canExternalizeAppRscHandler =
-  _appRscHandlerPath.endsWith(".js") && _appRscCombinedHandlerPath.endsWith(".js");
 
 function isValidExportIdentifier(name: string): boolean {
   return /^[$A-Z_a-z][$\w]*$/.test(name);

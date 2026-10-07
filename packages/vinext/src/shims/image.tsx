@@ -652,61 +652,27 @@ const Image = forwardRef<HTMLImageElement, InternalImageProps>(function Image(
 
   // Next.js treats data:/blob: sources as unoptimized, so even a custom loader
   // never sees them.
-  if (_unoptimized === true || __globallyUnoptimized || (effectiveLoader && isInlineSrc(src))) {
+  const unoptimized =
+    _unoptimized === true || __globallyUnoptimized || (!!effectiveLoader && isInlineSrc(src));
+  if (unoptimized || effectiveLoader) {
     // Unoptimized images are fetched directly by the browser, so intentionally
     // skip remote URL validation: there is no server-side optimizer fetch and
-    // therefore no SSRF surface. This matches Next.js behavior.
-    const renderedSrc = overrideSrc || src;
-    const sanitizedBlur = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;
-    const blurStyle =
-      !blurComplete && placeholder === "blur" && sanitizedBlur
-        ? {
-            backgroundImage: `url(${sanitizedBlur})`,
-            backgroundSize: "cover",
-            backgroundRepeat: "no-repeat",
-            backgroundPosition: "center",
-          }
+    // therefore no SSRF surface. This matches Next.js behavior. A custom
+    // loader (the `loader` prop, or `images.loaderFile` when no prop is given)
+    // owns the URL the same way, and gets the built-in loader's per-width
+    // srcSet. `quality` is passed through as given (possibly undefined); only
+    // the built-in loader defaults it to 75.
+    const loaderAttributes =
+      effectiveLoader && !unoptimized
+        ? generateLoaderAttributes(
+            effectiveLoader,
+            src,
+            fill ? undefined : imgWidth,
+            typeof quality === "string" ? Number(quality) : quality,
+            sizes,
+          )
         : undefined;
-    preloadImageResource({
-      shouldPreload,
-      src: renderedSrc,
-      fetchPriority: priorityFetchPriority,
-    });
-    return (
-      <img
-        ref={mergedRef}
-        src={renderedSrc}
-        alt={alt}
-        width={fill ? undefined : imgWidth}
-        height={fill ? undefined : imgHeight}
-        loading={imageLoading}
-        fetchPriority={priorityFetchPriority}
-        decoding="async"
-        className={className}
-        data-nimg={fill ? "fill" : "1"}
-        onLoad={handleLoad}
-        onError={handleError}
-        style={fill ? getFillStyle(style, blurStyle) : { ...blurStyle, ...style }}
-        {...rest}
-      />
-    );
-  }
-
-  // A custom loader — either the `loader` prop, or `images.loaderFile` from
-  // next.config.js when no per-image prop was given — takes full
-  // responsibility for the URL, bypassing remotePatterns validation and the
-  // /_next/image endpoint. `quality` is passed through as given (possibly
-  // undefined); only the built-in loader defaults it to 75.
-  if (effectiveLoader) {
-    const resolvedQuality = typeof quality === "string" ? Number(quality) : quality;
-    const loaderAttributes = generateLoaderAttributes(
-      effectiveLoader,
-      src,
-      fill ? undefined : imgWidth,
-      resolvedQuality,
-      sizes,
-    );
-    const resolvedSrc = overrideSrc || loaderAttributes.src;
+    const resolvedSrc = overrideSrc || (loaderAttributes ? loaderAttributes.src : src);
     const sanitizedBlur = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;
     const blurStyle =
       !blurComplete && placeholder === "blur" && sanitizedBlur
@@ -720,8 +686,8 @@ const Image = forwardRef<HTMLImageElement, InternalImageProps>(function Image(
     preloadImageResource({
       shouldPreload,
       src: resolvedSrc,
-      srcSet: loaderAttributes.srcSet,
-      sizes: loaderAttributes.sizes,
+      srcSet: loaderAttributes?.srcSet,
+      sizes: loaderAttributes?.sizes,
       fetchPriority: priorityFetchPriority,
     });
     return (
@@ -733,8 +699,8 @@ const Image = forwardRef<HTMLImageElement, InternalImageProps>(function Image(
         loading={imageLoading}
         fetchPriority={priorityFetchPriority}
         decoding="async"
-        srcSet={loaderAttributes.srcSet}
-        sizes={loaderAttributes.sizes}
+        srcSet={loaderAttributes?.srcSet}
+        sizes={loaderAttributes?.sizes}
         // After srcSet/sizes, as in Next.js: Safari would otherwise start
         // fetching `src` before it sees the responsive candidates.
         src={resolvedSrc}
