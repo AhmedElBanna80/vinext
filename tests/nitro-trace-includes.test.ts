@@ -124,6 +124,7 @@ describe("Nitro outputFileTracingIncludes", () => {
       "./node_modules/helper/**",
       "./node_modules/pkg-behind-symlink/*",
       "./node_modules/@native/core-*/**",
+      "./node_modules/data-pkg/node_modules/nested-data/*",
     ],
     "/api/*": ["./node_modules/api-only/**"],
     "/no-such-route": ["./node_modules/unmatched/**"],
@@ -167,6 +168,12 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
           "node_modules/helper/package.json": pkg("helper", "2.0.0"),
           "node_modules/helper/index.js": "module.exports = 2;",
           "node_modules/helper/extra.txt": "extra",
+          // Nested, and not traced by Nitro.
+          "node_modules/data-pkg/node_modules/nested-data/package.json": pkg(
+            "nested-data",
+            "1.0.0",
+          ),
+          "node_modules/data-pkg/node_modules/nested-data/data.json": "{}",
         },
         { plugins: [lateFilePlugin] },
       );
@@ -201,6 +208,11 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
       );
       expect(helperPkg.version).toBe("1.0.0");
       expect(await exists(path.join(traced, "helper", "extra.txt"))).toBe(false);
+      // A nested package keeps its place under its parent.
+      expect(
+        await exists(path.join(traced, "data-pkg", "node_modules", "nested-data", "data.json")),
+      ).toBe(true);
+      expect(await exists(path.join(traced, "nested-data"))).toBe(false);
     } finally {
       await fs.rm(root, { recursive: true, force: true }).catch(() => {});
     }
@@ -221,11 +233,15 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
       "./node_modules/@scope/extra/**",
       "./node_modules/.prisma/client/**",
       "./node_modules/pkg-behind-symlink/*",
+      "./node_modules/parent/node_modules/child/data.json",
     ],
   },
   outputFileTracingExcludes: { "/": ["./node_modules/.prisma/client/index.js"] },
 };`,
           "app/route.ts": `export function GET() { return new Response("ok"); }`,
+          "node_modules/parent/package.json": pkg("parent", "1.0.0"),
+          "node_modules/parent/node_modules/child/package.json": pkg("child", "1.0.0"),
+          "node_modules/parent/node_modules/child/data.json": "{}",
         },
         {
           nitro: {
@@ -247,6 +263,11 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
       expect(await exists(path.join(traced, ".prisma", "client", "index.js"))).toBe(false);
       expect(await exists(path.join(traced, "pkg-behind-symlink", "index.js"))).toBe(true);
       expect(await exists(path.join(traced, "pkg"))).toBe(false);
+      // A nested package keeps its place under its parent.
+      expect(await exists(path.join(traced, "parent", "node_modules", "child", "data.json"))).toBe(
+        true,
+      );
+      expect(await exists(path.join(traced, "child"))).toBe(false);
     } finally {
       await fs.rm(root, { recursive: true, force: true }).catch(() => {});
     }
@@ -354,6 +375,13 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
         "app/blog/[slug]/page.tsx": page,
         "app/api/hello/route.ts": "export function GET() {}",
         "app/sitemap.ts": "export default function sitemap() { return []; }",
+        "app/products/sitemap.ts":
+          "export async function generateSitemaps() { return [{ id: 0 }]; }\n" +
+          "export default function sitemap() { return []; }",
+        "app/products/icon.tsx":
+          "export function generateImageMetadata() { return [{ id: 'small' }]; }\n" +
+          "export default function Icon() { return null; }",
+        "app/products/opengraph-image.tsx": "export default function Image() { return null; }",
         "pages/legacy.tsx": page,
         "pages/docs/index.tsx": page,
         "pages/api/x.ts": "export default function handler() {}",
@@ -372,6 +400,9 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
           "/app/blog/[slug]",
           "/app/api/hello",
           "/app/sitemap.xml",
+          "/app/products/sitemap/[__metadata_id__]",
+          "/app/products/icon/[__metadata_id__]",
+          "/app/products/opengraph-image",
           "/app/_not-found",
           "/app/_global-error",
           "/pages/legacy",

@@ -47,7 +47,8 @@ beforeAll(async () => {
   await write("file-1.txt");
   await write("file-2.txt");
   await write("file-10.txt");
-  for (const name of ["aa", "ab", "b", "a.js", "b.js", "c.js"]) await write(`neg/${name}`);
+  for (const name of ["a", "aa", "ab", "b", "xa", "xb", "a.js", "b.js", "c.js", "ac", "bc"])
+    await write(`neg/${name}`);
   await fs.mkdir(path.join(root, "node_modules/@native"), { recursive: true });
   await fs.symlink(
     "../.pnpm/@native+core-x@1.0.0/node_modules/@native/core-x",
@@ -101,6 +102,10 @@ describe("globFiles", () => {
     "neg/!(a)",
     "neg/!(*.js)",
     "neg/@(a|b)*",
+    "neg/x!(a)*",
+    "neg/!(!(a))",
+    "neg/!(a|!(b))",
+    "neg/!(a)c",
   ];
 
   it.each(patterns)("matches node-glob { nodir, dot } for %s", (pattern) => {
@@ -144,6 +149,8 @@ describe("createContainsMatcher", () => {
     "/pages/docs",
     "/pages/_app",
     "/app/products/[id]",
+    "ab",
+    "a",
   ];
   const keys = [
     "/",
@@ -176,6 +183,9 @@ describe("createContainsMatcher", () => {
     "/app/!(api)",
     "/app/!(api)/*",
     "/pages/!(_app)*",
+    "!(!(a))",
+    "/app/x!(a)*",
+    "!(a)b",
   ];
 
   it.each(keys)("matches picomatch { dot, contains } for route key %s", (key) => {

@@ -1688,7 +1688,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let warnedInlineNextConfigOverride = false;
   let hasNitroPlugin = false;
   let nitroHostRuntime: "node" | "worker" = "node";
-  let writeUntracedNitroIncludes: (() => void) | undefined;
+  let writeNitroTraceIncludes: (() => void) | undefined;
   let resolvedServerExternalPackages: string[] = [];
   let registerNodeOpenTelemetryLoader = false;
   let pagesTsconfigAliases: Record<string, string> = {};
@@ -7953,7 +7953,7 @@ export const loadServerActionClient = ${
       // Runs after Nitro's dependency trace (its externals plugin's `buildEnd`)
       // and before Nitro's `compiled` hook, where presets package serverDir.
       writeBundle() {
-        if (this.environment?.name === "nitro") writeUntracedNitroIncludes?.();
+        if (this.environment?.name === "nitro") writeNitroTraceIncludes?.();
       },
       nitro: {
         setup: async (nitro: NitroSetupContext) => {
@@ -8002,7 +8002,8 @@ export const loadServerActionClient = ${
             };
             // Nitro skips the dependency trace, and so the hook above, when the
             // server bundle has no traced externals; `writeBundle` below copies
-            // the included files then. Worker presets have no node_modules
+            // the included files then, and the files of nested packages the
+            // hook could not hand to Nitro. Worker presets have no node_modules
             // output at all.
             const serverDir = nitro.options.output?.serverDir;
             if (
@@ -8010,7 +8011,7 @@ export const loadServerActionClient = ${
               nitro.options.node !== false &&
               nitro.options.preset !== "nitro-prerender"
             ) {
-              writeUntracedNitroIncludes = () => traceIncludes.writeUntraced(serverDir);
+              writeNitroTraceIncludes = () => traceIncludes.write(serverDir);
             }
           }
 

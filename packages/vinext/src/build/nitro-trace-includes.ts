@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path, { toSlash } from "pathslash";
 import { createValidFileMatcher } from "../routing/file-matcher.js";
+import type { MetadataFileRoute } from "../server/metadata-routes.js";
+import { hasExportedName } from "./report.js";
 import { createContainsMatcher, createPathMatcher, globFiles } from "./trace-glob.js";
 
 /**
@@ -14,7 +16,10 @@ import { createContainsMatcher, createPathMatcher, globFiles } from "./trace-glo
  * through the `traceOpts.hooks.tracedPackages` hook before it writes the
  * output, so included files inside `node_modules` are added there. When the
  * server bundle has no traced externals Nitro skips the trace (and the hook),
- * so the included files are copied after the build instead.
+ * so the included files are copied after the build instead. Included files of
+ * a nested package (`parent/node_modules/child`) that Nitro did not trace are
+ * also copied after the build, to the same nested path, because Nitro writes
+ * the packages it is given at the top level.
  *
  * Next.js matches every route key against each server route and writes one
  * trace per route: the route's traced files plus the files of every matching
@@ -50,6 +55,11 @@ type PackageFiles = {
   name: string;
   /** Package root as matched, so symlinked packages keep their link name. */
   path: string;
+  /**
+   * Output directory under `node_modules` for a package nested in another
+   * package's `node_modules` (`parent/node_modules/child`), else `null`.
+   */
+  nested: string | null;
   /** Matched paths (output layout) with their real paths (identity). */
   files: Array<{ path: string; real: string }>;
 };
@@ -58,10 +68,11 @@ export type NitroTraceIncludes = {
   /** Nitro `traceOpts.hooks.tracedPackages` hook. */
   tracedPackages(tracedPackages: TracedPackages): void;
   /**
-   * Copy the included files into `<serverDir>/node_modules` when Nitro did
-   * not run its dependency trace for this build.
+   * Copy included files into `<serverDir>/node_modules` after Nitro wrote its
+   * traced output: files of nested packages Nitro did not trace, and every
+   * included file when Nitro did not run its dependency trace for this build.
    */
-  writeUntraced(serverDir: string): void;
+  write(serverDir: string): void;
 };
 
 export type NitroTraceIncludesOptions = {
@@ -99,6 +110,29 @@ function normalizePagePath(page: string, isDynamic: boolean): string {
 }
 
 /**
+ * Next.js names a metadata route that exports `generateSitemaps` or
+ * `generateImageMetadata` `<path>/[__metadata_id__]`, without the sitemap's
+ * `.xml`, and other metadata routes by their served path.
+ */
+function metadataRouteName(route: MetadataFileRoute): string {
+  if (!route.isDynamic) return route.servedUrl;
+  let code: string;
+  try {
+    code = fs.readFileSync(route.filePath, "utf8");
+  } catch {
+    return route.servedUrl;
+  }
+  if (
+    !hasExportedName(code, "generateSitemaps") &&
+    !hasExportedName(code, "generateImageMetadata")
+  ) {
+    return route.servedUrl;
+  }
+  const base = route.type === "sitemap" ? route.servedUrl.replace(/\.xml$/, "") : route.servedUrl;
+  return `${base}/[__metadata_id__]`;
+}
+
+/**
  * Name each server route the way Next.js's build trace step does before
  * matching route keys: the entry name normalized with `normalizeAppPath` for
  * App Router entries (`app/(group)/api/hello/route` is `/app/api/hello`) and
@@ -127,8 +161,12 @@ export async function collectTraceRouteNames(options: {
       const entry = matcher.stripExtension(toSlash(path.relative(appDir, file)));
       names.add(normalizeAppPath(`app/${entry}`));
     }
-    // Metadata routes are `app/<served path>/route` entries.
-    for (const route of scanMetadataFiles(appDir)) names.add(`/app${route.servedUrl}`);
+    // Metadata routes are `app/<served path>/route` entries, or
+    // `app/<path>/[__metadata_id__]/route` when they generate several files
+    // (Next.js `normalizeMetadataPageToRoute`).
+    for (const route of scanMetadataFiles(appDir)) {
+      names.add(`/app${metadataRouteName(route)}`);
+    }
     names.add("/app/_not-found");
     names.add("/app/_global-error");
   }
@@ -219,17 +257,31 @@ function selectFiles(options: NitroTraceIncludesOptions): TraceSelection {
   };
 }
 
-/** Split a `node_modules` file path into its package name and root. */
-function packageOfFile(file: string): { name: string; path: string } | null {
-  const index = file.lastIndexOf(NODE_MODULES_SEGMENT);
-  if (index === -1) return null;
-  const base = file.slice(0, index + NODE_MODULES_SEGMENT.length);
+function splitPackageName(segments: readonly string[]): string[] {
+  return segments[0]?.startsWith("@") ? segments.slice(0, 2) : segments.slice(0, 1);
+}
+
+/**
+ * Split a `node_modules` file path into its package name and root. A package
+ * inside another package's `node_modules` keeps that layout (`nested`), like
+ * Next.js's trace. pnpm's `.pnpm` store is the exception: nf3 writes those
+ * packages at the top level, so they are read from the last boundary.
+ */
+function packageOfFile(file: string): Omit<PackageFiles, "files"> | null {
+  const first = file.indexOf(NODE_MODULES_SEGMENT);
+  if (first === -1) return null;
+  const last = file.lastIndexOf(NODE_MODULES_SEGMENT);
+  const outerBase = file.slice(0, first + NODE_MODULES_SEGMENT.length);
+  const isPnpmStore = file.startsWith(".pnpm/", outerBase.length);
+  const base = file.slice(0, last + NODE_MODULES_SEGMENT.length);
   const segments = file.slice(base.length).split("/");
-  const nameSegments = segments[0]?.startsWith("@") ? segments.slice(0, 2) : segments.slice(0, 1);
+  const nameSegments = splitPackageName(segments);
   if (nameSegments.length === 0 || nameSegments.length === segments.length) return null;
+  const pkgPath = path.join(base, ...nameSegments);
   return {
     name: nameSegments.join("/"),
-    path: path.join(base, ...nameSegments),
+    path: pkgPath,
+    nested: first !== last && !isPnpmStore ? path.relative(outerBase, pkgPath) : null,
   };
 }
 
@@ -302,9 +354,12 @@ export function createNitroTraceIncludes(
   const { includes, excludes, warn } = options;
   if (Object.keys(includes).length === 0 && Object.keys(excludes).length === 0) return null;
   let applied = false;
+  /** Included files to copy after Nitro writes, by output path. */
+  let pendingCopies = new Map<string, string>();
 
   const apply = (tracedPackages: TracedPackages): void => {
     applied = true;
+    pendingCopies = new Map();
     const { included, isTracedFileExcluded } = selectFiles(options);
     removeExcludedTracedFiles(tracedPackages, isTracedFileExcluded);
 
@@ -319,6 +374,29 @@ export function createNitroTraceIncludes(
     const otherCopies: string[] = [];
     for (const pkg of packages) {
       const versions = Object.values(tracedPackages[pkg.name]?.versions ?? {});
+      // nf3 links the first version without trace parents as the package
+      // root, so adding another copy could replace the copy the server bundle
+      // actually resolves. Extend a copy Nitro already traced, which nf3
+      // places where the bundle resolves it.
+      const existing = versions.find((version) => samePath(version.path, pkg.path));
+      if (existing) {
+        // nf3 lists real paths.
+        const existingFiles = new Set(existing.files);
+        for (const file of pkg.files) {
+          if (existingFiles.has(file.real)) continue;
+          existingFiles.add(file.real);
+          existing.files.push(file.path);
+        }
+        continue;
+      }
+      // nf3 writes every package it is given at the top level, so a nested
+      // package keeps its layout by being copied after Nitro writes instead.
+      if (pkg.nested !== null) {
+        for (const file of pkg.files) {
+          pendingCopies.set(path.join(pkg.nested, path.relative(pkg.path, file.path)), file.path);
+        }
+        continue;
+      }
       if (versions.length === 0) {
         const pkgJSON = readPackageJson(pkg);
         tracedPackages[pkg.name] = {
@@ -333,21 +411,7 @@ export function createNitroTraceIncludes(
         };
         continue;
       }
-      // nf3 links the first version without trace parents as the package
-      // root, so adding another copy could replace the copy the server bundle
-      // actually resolves. Only extend a copy Nitro already traced.
-      const existing = versions.find((version) => samePath(version.path, pkg.path));
-      if (!existing) {
-        otherCopies.push(pkg.path);
-        continue;
-      }
-      // nf3 lists real paths.
-      const existingFiles = new Set(existing.files);
-      for (const file of pkg.files) {
-        if (existingFiles.has(file.real)) continue;
-        existingFiles.add(file.real);
-        existing.files.push(file.path);
-      }
+      otherCopies.push(pkg.path);
     }
     if (otherCopies.length > 0) {
       warn(
@@ -357,25 +421,31 @@ export function createNitroTraceIncludes(
     }
   };
 
+  const copy = (from: string, to: string): void => {
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    fs.copyFileSync(from, to);
+  };
+
   return {
     tracedPackages: apply,
-    writeUntraced(serverDir) {
-      if (applied) return;
-      const tracedPackages: TracedPackages = {};
-      apply(tracedPackages);
+    write(serverDir) {
       const outDir = path.join(serverDir, "node_modules");
-      for (const pkg of Object.values(tracedPackages)) {
-        for (const version of Object.values(pkg.versions)) {
-          const files = new Set(version.files);
-          const packageJson = path.join(version.path, "package.json");
-          if (fs.existsSync(packageJson)) files.add(packageJson);
-          for (const file of files) {
-            const target = path.join(outDir, pkg.name, path.relative(version.path, file));
-            fs.mkdirSync(path.dirname(target), { recursive: true });
-            fs.copyFileSync(file, target);
+      if (!applied) {
+        // Nitro did not trace, so write what nf3 would have written.
+        const tracedPackages: TracedPackages = {};
+        apply(tracedPackages);
+        for (const pkg of Object.values(tracedPackages)) {
+          for (const version of Object.values(pkg.versions)) {
+            const files = new Set(version.files);
+            const packageJson = path.join(version.path, "package.json");
+            if (fs.existsSync(packageJson)) files.add(packageJson);
+            for (const file of files) {
+              copy(file, path.join(outDir, pkg.name, path.relative(version.path, file)));
+            }
           }
         }
       }
+      for (const [target, file] of pendingCopies) copy(file, path.join(outDir, target));
     },
   };
 }

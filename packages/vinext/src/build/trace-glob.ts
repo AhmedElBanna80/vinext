@@ -150,15 +150,22 @@ function parseClass(
   return null;
 }
 
+type SegmentContext = {
+  engine: Engine;
+  /** The segment is the last of a picomatch pattern. */
+  endsPattern: boolean;
+};
+
 function parseExtglob(
   segment: string,
   start: number,
-  engine: Engine,
+  context: SegmentContext,
+  after: string,
 ): { alternatives: string[]; end: number } | null {
   const alternatives: string[] = [];
   let index = start;
   for (;;) {
-    const part = parseSegment(segment, index, engine, true);
+    const part = parseSegment(segment, index, context, true, after);
     alternatives.push(part.source);
     index = part.end;
     if (index >= segment.length) return null;
@@ -168,15 +175,16 @@ function parseExtglob(
 }
 
 /**
- * Parse one path segment into regex source. `endsPattern` marks the last
- * segment of a picomatch pattern, where a negated extglob is anchored.
+ * Parse one path segment (or, inside an extglob, one alternative) into regex
+ * source. `after` is the source that follows the enclosing extglob up to the
+ * end of the segment, which a negated extglob must also fail to match with.
  */
 function parseSegment(
   segment: string,
   start: number,
-  engine: Engine,
+  context: SegmentContext,
   inExtglob = false,
-  endsPattern = false,
+  after = "",
 ): ParsedSegment {
   let source = "";
   let magic = false;
@@ -190,33 +198,31 @@ function parseSegment(
       continue;
     }
     if ("@?+*!".includes(char) && segment[index + 1] === "(") {
-      const group = parseExtglob(segment, index + 2, engine);
-      if (group) {
+      const probe = parseExtglob(segment, index + 2, context, after);
+      if (probe) {
+        const rest = parseSegment(segment, probe.end + 1, context, inExtglob, after);
+        const group = parseExtglob(segment, index + 2, context, rest.source + after) ?? probe;
         const alternatives = group.alternatives.join("|");
-        magic = true;
-        index = group.end + 1;
         if (char !== "!") {
           source += `(?:${alternatives})${char === "@" ? "" : char}`;
-          continue;
-        }
-        if (engine === "glob" && !inExtglob) {
+        } else if (context.engine === "glob") {
           // minimatch: no alternative may match together with the rest of the
           // segment, so `!(a)*` rejects `ab` as well as `a`.
-          const rest = parseSegment(segment, index, engine);
-          source += `(?:(?!(?:${alternatives})${rest.source}$)[^/]*?)${rest.source}`;
-          return { source, magic, end: rest.end };
+          source += `(?:(?!(?:${alternatives})${rest.source}${after}$)[^/]*?)`;
+        } else {
+          // picomatch only anchors the lookahead when nothing but closing
+          // parentheses follows in the pattern.
+          source +=
+            context.endsPattern && /^\)*$/.test(segment.slice(probe.end + 1))
+              ? `(?:(?!(?:${alternatives})$))[^/]*?`
+              : `(?:(?!(?:${alternatives}))[^/]*?)`;
         }
-        // picomatch only anchors the lookahead at the end of the pattern.
-        source +=
-          endsPattern && !inExtglob && index === segment.length
-            ? `(?:(?!(?:${alternatives})$))[^/]*?`
-            : `(?:(?!(?:${alternatives}))[^/]*?)`;
-        continue;
+        return { source: source + rest.source, magic: true, end: rest.end };
       }
     }
     if (char === "*") {
       // A segment-leading wildcard matches at least one character.
-      source += index === start ? "(?=.)[^/]*" : "[^/]*";
+      source += index === 0 ? "(?=.)[^/]*" : "[^/]*";
       while (segment[index + 1] === "*") index++;
       magic = true;
       index++;
@@ -229,7 +235,7 @@ function parseSegment(
       continue;
     }
     if (char === "[") {
-      const charClass = parseClass(segment, index, engine);
+      const charClass = parseClass(segment, index, context.engine);
       if (charClass) {
         source += charClass.source;
         magic = true;
@@ -271,7 +277,8 @@ function containsSource(pattern: string, rooted: boolean): string {
       return;
     }
     if (index > 0 && !(index === 1 && segments[0] === "**")) source += "/";
-    source += parseSegment(segment, 0, "picomatch", false, index === segments.length - 1).source;
+    const context = { engine: "picomatch", endsPattern: index === segments.length - 1 } as const;
+    source += parseSegment(segment, 0, context).source;
   });
   return source;
 }
@@ -363,7 +370,7 @@ export function globFiles(cwd: string, pattern: string): string[] {
     if (expanded.endsWith("/")) continue;
     const parts: GlobPart[] = expanded.split("/").map((segment) => {
       if (segment === "**") return { kind: "globstar" };
-      const parsed = parseSegment(segment, 0, "glob");
+      const parsed = parseSegment(segment, 0, { engine: "glob", endsPattern: false });
       if (!parsed.magic) return { kind: "literal", value: unescapeGlob(segment) };
       return { kind: "pattern", regex: toRegExp(`^${parsed.source}$`, segment) };
     });
