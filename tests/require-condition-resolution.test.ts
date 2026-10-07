@@ -439,11 +439,12 @@ describe("vinext:require-condition-resolution", () => {
         },
       ],
     ],
-    // Vite leaves `packageJsonPath` off its resolutions with the legacy interop.
+    // Without Vite's `packageJsonPath` tag, its externalization looks exactly
+    // like a plugin's, so the call keeps the environment's resolution.
     [
-      "bundles the require target with the legacy CJS interop",
+      "leaves the call under the legacy CJS interop",
       {},
-      true,
+      false,
       [],
       { legacy: { inconsistentCjsInterop: true } },
     ],

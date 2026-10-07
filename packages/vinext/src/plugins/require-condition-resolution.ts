@@ -288,9 +288,6 @@ export function createRequireConditionResolutionPlugin(
             : bundlerExternals.has(this.environment)
               ? bundlerExternals.get(this.environment)
               : this.environment.config.build.rolldownOptions?.external;
-        // Vite only tags its resolutions with `packageJsonPath` without the
-        // legacy CJS interop.
-        const tagsPackageJson = !this.environment.config.legacy?.inconsistentCjsInterop;
 
         const output = new MagicString(code);
         let changed = false;
@@ -326,17 +323,20 @@ export function createRequireConditionResolutionPlugin(
           // Only take over an import that would otherwise just be externalized
           // by Vite: the hoisted import must resolve to the bare id, external,
           // with the package.json Vite's resolver found. A plugin that resolves
-          // or externalizes it itself still wins. So does a bundler external
-          // matching the bare specifier, the only id it tests once Vite
-          // externalizes the package, or the synthetic id, which would become
-          // an import of a missing file. (Vite's dev resolver returns the
-          // package entry, so only builds get here.)
+          // or externalizes it itself still wins. Vite drops that tag under
+          // `legacy.inconsistentCjsInterop`, where its externalization cannot
+          // be told apart from a plugin's, so the call is left alone there.
+          // A bundler external also wins when it matches the bare specifier,
+          // the only id it tests once Vite externalizes the package, or the
+          // synthetic id, which would become an import of a missing file.
+          // (Vite's dev resolver returns the package entry, so only builds get
+          // here.)
           if (bundlesExternal) {
             const resolved = await this.resolve(specifier, id, { skipSelf: true });
             if (
               !resolved?.external ||
               resolved.id !== specifier ||
-              (tagsPackageJson && resolved.packageJsonPath === undefined) ||
+              resolved.packageJsonPath === undefined ||
               (bundlerExternal !== undefined &&
                 (isBundlerExternal(bundlerExternal, specifier, id) ||
                   isBundlerExternal(bundlerExternal, virtualId, id) ||
