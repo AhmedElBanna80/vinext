@@ -229,45 +229,131 @@ test("stores the 404 document of an ISR page without the query of the request th
 });
 
 // An html-limited bot blocks on metadata, so generateMetadata()'s notFound()
-// rejects the document's shell.
+// rejects the document's shell. Other user agents stream metadata, so it
+// doesn't. As in Next.js, the render is stored with the status the request
+// that rendered it gets, and served to everyone.
 const HTML_LIMITED_BOT = { "User-Agent": "Mozilla/5.0 (compatible; Twitterbot/1.0)" };
 
-test("doesn't store the 404 document of an ISR page whose generateMetadata() calls notFound()", async ({
+test("stores the 404 document of an ISR page whose generateMetadata() calls notFound() for an html-limited bot", async ({
   request,
 }) => {
   const pathname = "/nextjs-compat/isr-special-error/metadata-not-found";
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const response = await request.get(pathname, { headers: HTML_LIMITED_BOT });
-    expect(response.status()).toBe(404);
-    expect(response.headers()["x-vinext-cache"]).toBeUndefined();
-    expect(response.headers()["cache-control"] ?? "").not.toContain("s-maxage");
-    await response.text();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
+  const miss = await request.get(pathname, { headers: HTML_LIMITED_BOT });
+  expect(miss.status()).toBe(404);
+  await miss.text();
+
+  await expect
+    .poll(async () => {
+      const response = await request.get(pathname, { headers: HTML_LIMITED_BOT });
+      return [response.headers()["x-vinext-cache"], response.status()];
+    })
+    .toEqual(["HIT", 404]);
+  // Every user agent gets the stored 404.
+  const hit = await request.get(pathname);
+  expect(hit.status()).toBe(404);
+  expect(hit.headers()["x-vinext-cache"]).toBe("HIT");
+  expect(hit.headers()["cache-control"]).toContain("s-maxage=60");
+  const rsc = await request.get(`${pathname}.rsc`, { headers: RSC_HEADERS });
+  expect(rsc.status()).toBe(404);
+  expect(rsc.headers()["x-vinext-cache"]).toBe("HIT");
 });
 
-test("keeps the previous entry when generateMetadata() calls notFound() in a regeneration", async ({
+// Next.js stores the 404 document beside the payload of an html-limited bot's
+// RSC request too. An RSC miss writes no document, so a document request that
+// streams metadata would store a 200 beside that payload. The RSC miss stores
+// nothing instead, and the document request stores both entries.
+test("stores nothing from an html-limited bot's RSC request to an ISR page whose generateMetadata() calls notFound()", async ({
+  request,
+}) => {
+  const pathname = "/nextjs-compat/isr-special-error/metadata-not-found-rsc-first-bot";
+  const botRscOptions = { headers: { ...RSC_HEADERS, ...HTML_LIMITED_BOT }, maxRedirects: 0 };
+  const botMiss = await request.get(`${pathname}.rsc`, botRscOptions);
+  expect(botMiss.headers()["x-vinext-cache"]).toBe("MISS");
+  expect(await botMiss.text()).toContain("NEXT_HTTP_ERROR_FALLBACK;404");
+
+  // The bot's render stored nothing, so both requests miss.
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  const botRsc = await request.get(`${pathname}.rsc`, botRscOptions);
+  expect(botRsc.headers()["x-vinext-cache"]).toBe("MISS");
+  await botRsc.text();
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  const miss = await request.get(pathname);
+  expect(miss.status()).toBe(200);
+  expect(miss.headers()["x-vinext-cache"]).toBe("MISS");
+  await miss.text();
+
+  await expect
+    .poll(async () => {
+      const response = await request.get(pathname);
+      return [response.headers()["x-vinext-cache"], response.status()];
+    })
+    .toEqual(["HIT", 200]);
+  const rsc = await request.get(`${pathname}.rsc`, { headers: RSC_HEADERS });
+  expect(rsc.status()).toBe(200);
+  expect(rsc.headers()["x-vinext-cache"]).toBe("HIT");
+});
+
+test("stores the 200 document of an ISR page whose generateMetadata() calls notFound()", async ({
+  request,
+}) => {
+  const pathname = "/nextjs-compat/isr-special-error/metadata-not-found-streaming";
+  const miss = await request.get(pathname);
+  expect(miss.status()).toBe(200);
+  await miss.text();
+
+  await expect
+    .poll(async () => {
+      const response = await request.get(pathname);
+      return [response.headers()["x-vinext-cache"], response.status()];
+    })
+    .toEqual(["HIT", 200]);
+  const hit = await request.get(pathname);
+  const html = await hit.text();
+  expect(html).toContain("metadata not-found streaming page");
+  expect(html).toContain('<template data-dgst="NEXT_HTTP_ERROR_FALLBACK;404"');
+  expect(html).toContain('<meta name="robots" content="noindex"/>');
+  const rsc = await request.get(`${pathname}.rsc`, { headers: RSC_HEADERS });
+  expect(rsc.status()).toBe(200);
+  expect(rsc.headers()["x-vinext-cache"]).toBe("HIT");
+  expect(await rsc.text()).toContain("NEXT_HTTP_ERROR_FALLBACK;404");
+});
+
+// As in Next.js, a regeneration streams metadata as the request that
+// triggered it does, and replaces the entry with what it rendered.
+test("regenerates an ISR page whose generateMetadata() starts calling notFound() with the triggering request's status", async ({
   request,
 }) => {
   const pathname = "/nextjs-compat/isr-special-error/metadata-not-found-regen";
-  await expect
-    .poll(async () => (await request.get(pathname)).headers()["x-vinext-cache"])
-    .toBe("HIT");
+  const botPathname = `${pathname}-bot`;
+  for (const path of [pathname, botPathname]) {
+    await expect
+      .poll(async () => (await request.get(path)).headers()["x-vinext-cache"])
+      .toBe("HIT");
+  }
 
   await request.get("/api/isr-metadata-not-found-regen");
-  // The entry goes stale after a second, and the next request regenerates it.
+  // The entries go stale after a second, and the next requests regenerate them.
   await new Promise((resolve) => setTimeout(resolve, 1_500));
   const stale = await request.get(pathname);
   expect(stale.headers()["x-vinext-cache"]).toBe("STALE");
   await stale.text();
-  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  const botStale = await request.get(botPathname, { headers: HTML_LIMITED_BOT });
+  expect(botStale.headers()["x-vinext-cache"]).toBe("STALE");
+  await botStale.text();
 
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const response = await request.get(pathname);
-    expect(response.status()).toBe(200);
-    expect(await response.text()).toContain("metadata not-found regen page");
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
+  // A regeneration that a normal user agent triggered stores the 200 document
+  // with the digest.
+  await expect
+    .poll(async () => {
+      const response = await request.get(pathname);
+      const html = await response.text();
+      return [response.status(), html.includes('data-dgst="NEXT_HTTP_ERROR_FALLBACK;404"')];
+    })
+    .toEqual([200, true]);
+  // One that an html-limited bot triggered stores the 404.
+  await expect
+    .poll(async () => (await request.get(botPathname, { headers: HTML_LIMITED_BOT })).status())
+    .toBe(404);
 });
 
 // As in Next.js, a route that doesn't exist is never cached.
@@ -282,4 +368,64 @@ test("sends an unmatched route's 404 with the never-cache policy", async ({ requ
       "private, no-cache, no-store, max-age=0, must-revalidate",
     );
   }
+});
+
+// A special error that a Suspense boundary, here a loading.tsx, catches
+// doesn't reject the shell. As in Next.js, the document streams as a 200 with
+// the digest, and the ISR cache stores it, and its RSC payload, as a 200.
+test.describe("an ISR page whose special error its loading.tsx catches", () => {
+  const cases = [
+    {
+      pathname: "/nextjs-compat/isr-special-error/loading-not-found",
+      digest: "NEXT_HTTP_ERROR_FALLBACK;404",
+      head: '<meta name="robots" content="noindex"/>',
+    },
+    {
+      pathname: "/nextjs-compat/isr-special-error/loading-redirect",
+      digest: "NEXT_REDIRECT;",
+      head: '<meta id="__next-page-redirect" http-equiv="refresh" content="1;url=/nextjs-compat/nav-redirect-result"/>',
+    },
+  ];
+
+  test("streams and stores the document as a 200 with the digest", async ({ request }) => {
+    for (const { pathname, digest, head } of cases) {
+      // The first request may already hit an entry stored by an earlier run.
+      const first = await request.get(pathname, { maxRedirects: 0 });
+      expect(first.status(), pathname).toBe(200);
+      expect(first.headers()["location"], pathname).toBeUndefined();
+      const firstHtml = await first.text();
+      expect(firstHtml, pathname).toContain(`<template data-dgst="${digest}`);
+      expect(firstHtml, pathname).toContain(head);
+
+      await expect
+        .poll(async () => {
+          const response = await request.get(pathname, { maxRedirects: 0 });
+          return [response.headers()["x-vinext-cache"], response.status()];
+        })
+        .toEqual(["HIT", 200]);
+      const hit = await request.get(pathname, { maxRedirects: 0 });
+      expect(hit.headers()["cache-control"], pathname).toContain("s-maxage=60");
+      const hitHtml = await hit.text();
+      expect(hitHtml, pathname).toContain(`<template data-dgst="${digest}`);
+      expect(hitHtml, pathname).toContain(head);
+
+      const rsc = await request.get(`${pathname}.rsc`, { headers: RSC_HEADERS, maxRedirects: 0 });
+      expect(rsc.status(), pathname).toBe(200);
+      expect(rsc.headers()["x-vinext-cache"], pathname).toBe("HIT");
+      expect(rsc.headers()["location"], pathname).toBeUndefined();
+      expect(await rsc.text(), pathname).toContain(digest);
+    }
+  });
+
+  test("the client renders the not-found boundary", async ({ page }) => {
+    await page.goto(cases[0]!.pathname);
+    await expect(page.locator("body")).toContainText("404");
+    expect(new URL(page.url()).pathname).toBe(cases[0]!.pathname);
+  });
+
+  test("the client follows the redirect", async ({ page }) => {
+    await page.goto(cases[1]!.pathname);
+    await expect(page.locator("#result-page")).toHaveText("Result Page");
+    expect(new URL(page.url()).pathname).toBe("/nextjs-compat/nav-redirect-result");
+  });
 });

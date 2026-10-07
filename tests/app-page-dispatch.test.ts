@@ -3666,7 +3666,8 @@ describe("app page dispatch", () => {
     await scheduledRender();
 
     expect(capturedWaitForAllReady).toBe(true);
-    expect(capturedServeStreamingMetadata).toBe(false);
+    // A request without a user agent streams metadata.
+    expect(capturedServeStreamingMetadata).toBe(true);
     expect(capturedFallbackToErrorDocument).toBeUndefined();
     expect(createRscOnErrorHandler).toHaveBeenCalledWith("/posts/hello", "/posts/[slug]", {
       revalidateReason: "stale",
@@ -3914,14 +3915,17 @@ describe("app page dispatch", () => {
     expect(isrSet.mock.calls.map(([, value]) => value.status)).not.toContain(307);
   });
 
-  it("does not store generateMetadata()'s special error from a stale regeneration", async () => {
-    // Next.js stores it with the status the triggering request's metadata
-    // streaming gives it: a 200 for most user agents.
+  it("stores generateMetadata()'s special error that rejects a regeneration's shell with its status", async () => {
+    // As in Next.js, a regeneration that an html-limited bot triggers blocks
+    // on metadata, so the error rejects its shell, and it stores the 404.
     const metadataNotFoundDigest = "NEXT_HTTP_ERROR_FALLBACK;404";
     let scheduledRender: unknown = null;
     const isrSet = vi.fn<DispatchOptions["isrSet"]>(async () => {});
     const { options } = createDispatchOptions({
       isProduction: true,
+      request: new Request("https://example.test/posts/hello", {
+        headers: { "user-agent": "Mozilla/5.0 (compatible; Twitterbot/1.0)" },
+      }),
       isrGet: vi.fn(async () =>
         buildISRCacheEntry(buildCachedAppPageValue("<html>stale</html>"), true),
       ),
@@ -3963,9 +3967,125 @@ describe("app page dispatch", () => {
       throw new Error("expected stale HTML response to schedule regeneration");
     }
 
-    await expect(scheduledRender()).rejects.toThrow("NEXT_HTTP_ERROR_FALLBACK;404");
-    expect(isrSet.mock.calls.map(([, value]) => value.status)).not.toContain(404);
+    await scheduledRender();
+    expect(isrSet.mock.calls.map(([key, value]) => [key, value.status])).toContainEqual([
+      expect.stringContaining("html:"),
+      404,
+    ]);
   });
+
+  // An RSC regeneration writes only the RSC entry. Storing the bot's 404 there
+  // would leave it beside the previous document, so it keeps the entry.
+  it("keeps the entry when generateMetadata()'s special error rejects an RSC regeneration's shell", async () => {
+    const metadataNotFoundDigest = "NEXT_HTTP_ERROR_FALLBACK;404";
+    let scheduledRender: unknown = null;
+    const isrSet = vi.fn<DispatchOptions["isrSet"]>(async () => {});
+    const { options } = createDispatchOptions({
+      isProduction: true,
+      isRscRequest: true,
+      request: new Request("https://example.test/posts/hello", {
+        headers: { "user-agent": "Mozilla/5.0 (compatible; Twitterbot/1.0)" },
+      }),
+      isrGet: vi.fn(async () =>
+        buildISRCacheEntry(
+          buildCachedAppPageValue(
+            "",
+            new TextEncoder().encode("stale-flight").buffer,
+            undefined,
+            buildQueryInvariantRenderObservation(),
+          ),
+          true,
+        ),
+      ),
+      isrSet,
+      loadSsrHandler: async () => ({
+        async handleSsr(_rscStream, _navigationContext, _fontData, captureOptions) {
+          if (captureOptions?.capturedRscDataRef && captureOptions.sideStream) {
+            captureOptions.capturedRscDataRef.value = new Response(
+              captureOptions.sideStream,
+            ).arrayBuffer();
+          }
+          throw Object.assign(new Error(metadataNotFoundDigest), {
+            digest: metadataNotFoundDigest,
+          });
+        },
+      }),
+      renderToReadableStream(_element, { onError }) {
+        onError(
+          Object.assign(new Error(metadataNotFoundDigest), {
+            digest: metadataNotFoundDigest,
+            [Symbol.for("vinext.appPage.metadataError")]: true,
+          }),
+          undefined,
+          undefined,
+        );
+        return createStream(["page-flight-with-digest"]);
+      },
+      revalidateSeconds: 60,
+      scheduleBackgroundRegeneration(_key, renderFn) {
+        scheduledRender = renderFn;
+      },
+    });
+
+    const response = await dispatchAppPage(options);
+    await response.text();
+    if (typeof scheduledRender !== "function") {
+      throw new Error("expected the stale entry to schedule regeneration");
+    }
+    // The regeneration fails, as one whose shell another error rejected does.
+    await expect(scheduledRender()).rejects.toMatchObject({ digest: metadataNotFoundDigest });
+    expect(isrSet).not.toHaveBeenCalled();
+  });
+
+  // As in Next.js, a regeneration streams metadata as the request that
+  // triggered it does, so generateMetadata()'s special error rejects its
+  // shell only for an html-limited bot.
+  it.each([
+    { serveStreamingMetadata: true, userAgent: "Mozilla/5.0" },
+    { serveStreamingMetadata: false, userAgent: "Mozilla/5.0 (compatible; Twitterbot/1.0)" },
+  ])(
+    "builds a regeneration that $userAgent triggers with serveStreamingMetadata $serveStreamingMetadata",
+    async ({ serveStreamingMetadata, userAgent }) => {
+      let scheduledRender: unknown = null;
+      const buildPageElement = vi.fn<DispatchOptions["buildPageElement"]>(async () =>
+        React.createElement("main", null, "page"),
+      );
+      const { options } = createDispatchOptions({
+        buildPageElement,
+        isProduction: true,
+        isrGet: vi.fn(async () =>
+          buildISRCacheEntry(buildCachedAppPageValue("<html>stale</html>"), true),
+        ),
+        loadSsrHandler: async () => ({
+          async handleSsr(_rscStream, _navigationContext, _fontData, captureOptions) {
+            if (captureOptions?.capturedRscDataRef && captureOptions.sideStream) {
+              captureOptions.capturedRscDataRef.value = new Response(
+                captureOptions.sideStream,
+              ).arrayBuffer();
+            }
+            return createStream(["<html>fresh</html>"]);
+          },
+        }),
+        request: new Request("https://example.test/posts/hello", {
+          headers: { "user-agent": userAgent },
+        }),
+        revalidateSeconds: 60,
+        scheduleBackgroundRegeneration(_key, renderFn) {
+          scheduledRender = renderFn;
+        },
+      });
+
+      const response = await dispatchAppPage(options);
+      await response.text();
+      if (typeof scheduledRender !== "function") {
+        throw new Error("expected stale HTML response to schedule regeneration");
+      }
+      buildPageElement.mockClear();
+      await scheduledRender();
+
+      expect(buildPageElement.mock.calls[0]?.[5]).toMatchObject({ serveStreamingMetadata });
+    },
+  );
 
   it("stores an intercepted RSC regeneration whose shell ended in a 404", async () => {
     const sourceRoute = createRoute({ params: [], pattern: "/feed", routeSegments: ["feed"] });

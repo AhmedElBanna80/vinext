@@ -1400,11 +1400,10 @@ async function renderAppPageLifecycleImpl(
     specialError: AppPageSpecialError,
   ): Response => {
     // A response the boundary replaced, such as a 500 from a failing
-    // not-found boundary, is not the special error's document. Next.js stores
-    // generateMetadata()'s special error with the status its triggering
-    // request's metadata streaming gives it, which a regeneration can't
-    // reproduce, so it isn't stored.
-    if (response.status !== specialError.statusCode || specialError.fromMetadata === true) {
+    // not-found boundary, is not the special error's document. As in Next.js,
+    // generateMetadata()'s special error, which rejects the shell only for a
+    // request that blocks on metadata, is stored like the page's.
+    if (response.status !== specialError.statusCode) {
       return applyIneligibleRouteCachePolicy(response, options);
     }
     const dynamicUsedDuringRender = consumeRenderDynamicUsage();
@@ -1565,8 +1564,7 @@ async function renderAppPageLifecycleImpl(
         // the request context is alive, before the special-error response
         // clears it, so that its dynamic API use, fetch tags and cacheLife all
         // decide the store. A render that turns dynamic isn't stored, and
-        // stops the wait. generateMetadata()'s special error isn't stored, but
-        // the page's components still run against the request context.
+        // stops the wait.
         await settleCapturedRscRenderForCacheMetadata(
           capturedRscDataRef.value,
           peekRenderDynamicUsage,
@@ -1615,29 +1613,10 @@ async function renderAppPageLifecycleImpl(
     await htmlRender.metadataReady;
   }
 
-  // The page renders once, inside the RSC stream. Mirror Next.js's
-  // `app-render.tsx:4293` catch shape: by the time the SSR shell promise has
-  // resolved, any redirect()/notFound() throw whose
-  // async work settles in microtasks during shell rendering has already fired
-  // through React's onError and been captured by the tracker. Convert that to
-  // a 307/404 before any bytes are flushed.
-  //
-  // Late rejections — ones that settle after macrotask boundaries (real
-  // I/O, setTimeout, etc.) — fall through to the streamed body, exactly
-  // as Next.js does. The digest survives in the Flight payload for the
-  // client router to consume.
-  const captured = rscErrorTracker.getCapturedSpecialError();
-  if (captured) {
-    const specialError = resolveAppPageSpecialError(captured);
-    if (specialError) {
-      void htmlStream.cancel().catch(() => {});
-      return applyIneligibleRouteCachePolicy(
-        await options.renderPageSpecialError(specialError),
-        options,
-      );
-    }
-  }
-
+  // A special error that a Suspense boundary, such as a loading.tsx, caught
+  // didn't reject the shell. As in Next.js, the document streams as a 200
+  // with the digest, which the client's boundary renders, in dev, dynamic and
+  // ISR renders alike, and an ISR render is stored with that status.
   // Eagerly read values that must be captured before the stream is consumed.
   let dynamicUsedDuringRender = consumeRenderDynamicUsage();
   dynamicUsedDuringHtmlRender = dynamicUsedDuringRender;
