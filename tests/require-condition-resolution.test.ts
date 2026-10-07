@@ -499,7 +499,10 @@ describe("vinext:require-condition-resolution", () => {
     });
   });
 
-  it("keeps the require target of a private server external copy that gets bundled", async () => {
+  it.each([
+    ["transitive-externals bundles", true],
+    ["a pre plugin resolves to the same file", false],
+  ])("server external private copy: %s (rewritten: %s)", async (_case, viaTransitive) => {
     await withConditionalPackage(async (root) => {
       const packageDir = path.join(root, "node_modules", "lib-cjs");
       const writeServerExt = async (dir: string) => {
@@ -536,10 +539,18 @@ describe("vinext:require-condition-resolution", () => {
             (id) => (isConditionalRequireScriptModuleId(id) ? true : undefined),
             () => ["server-ext"],
           ),
-          createTransitiveExternalsPlugin({
-            getRoot: () => root,
-            getExternalPackages: () => ["server-ext"],
-          }),
+          viaTransitive
+            ? createTransitiveExternalsPlugin({
+                getRoot: () => root,
+                getExternalPackages: () => ["server-ext"],
+              })
+            : {
+                name: "user-redirect",
+                enforce: "pre",
+                resolveId(source) {
+                  if (source === "server-ext") return path.join(privateDir, "index.mjs");
+                },
+              },
           {
             name: "record-target",
             transform(code, id) {
@@ -549,9 +560,9 @@ describe("vinext:require-condition-resolution", () => {
         ],
       });
       await builder.build(builder.environments.ssr);
-      expect(target).toContain(
-        `require(${JSON.stringify(`${path.join(privateDir, "index.js")}.vinext-require.js`)})`,
-      );
+      const privateRequire = `require(${JSON.stringify(`${path.join(privateDir, "index.js")}.vinext-require.js`)})`;
+      if (viaTransitive) expect(target).toContain(privateRequire);
+      else expect(target).toContain(`require("server-ext")`);
     });
   });
 

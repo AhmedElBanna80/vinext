@@ -11,6 +11,7 @@ import {
   staticStringValue,
   unwrapExpression,
 } from "./ast-utils.js";
+import { TRANSITIVE_EXTERNAL_META_KEY } from "./transitive-externals.js";
 import {
   collectDirectScopeBindings,
   collectLoopScopeBindings,
@@ -340,7 +341,9 @@ export function createRequireConditionResolutionPlugin(
           // list, including native addons, plus `serverExternalPackages`) stay
           // external too. The exception is an importer-private copy, which
           // vinext:transitive-externals bundles from this importer's `import`
-          // entry; that one still needs its `require` target.
+          // entry and marks in the resolution's `meta`; that one still needs
+          // its `require` target. A plugin resolving the same file unmarked
+          // still wins.
           //
           // A bundler external also wins when it matches the bare specifier,
           // the only id it tests once Vite externalizes the package, or the
@@ -354,6 +357,7 @@ export function createRequireConditionResolutionPlugin(
               packageName !== null && getServerExternalPackages().includes(packageName)
                 ? resolved !== null &&
                   !resolved.external &&
+                  resolved.meta?.[TRANSITIVE_EXTERNAL_META_KEY] === true &&
                   importPath !== undefined &&
                   canonicalizeFilePath(stripViteModuleQuery(resolved.id)) ===
                     canonicalizeFilePath(importPath)
