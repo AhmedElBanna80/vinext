@@ -133,6 +133,8 @@ describe("Nitro outputFileTracingIncludes", () => {
     ],
     "/api/*": ["./node_modules/api-only/**"],
     "/no-such-route": ["./node_modules/unmatched/**"],
+    // A root server entry, named like Next.js names it.
+    instrumentation: ["./node_modules/instrumentation-only/**"],
   },
   outputFileTracingExcludes: {
     "/": ["./node_modules/data-pkg/data/skip.txt"],
@@ -145,6 +147,9 @@ describe("Nitro outputFileTracingIncludes", () => {
 export function GET() { return new Response(readData()); }`,
           "app/api/foo/route.ts": `import readData from "data-pkg";
 export function GET() { return new Response(readData()); }`,
+          "instrumentation.ts": "export function register() {}",
+          "node_modules/instrumentation-only/package.json": pkg("instrumentation-only", "1.0.0"),
+          "node_modules/instrumentation-only/index.js": "module.exports = 1;",
           // Only selected by the "/api/*" key.
           "node_modules/api-only/package.json": pkg("api-only", "1.0.0"),
           "node_modules/api-only/lib/index.js": "module.exports = 1;",
@@ -198,6 +203,7 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
       expect(await exists(path.join(traced, "api-only", "lib", "index.js"))).toBe(true);
       expect(await exists(path.join(traced, "api-only", ".config", "settings.json"))).toBe(true);
       expect(await exists(path.join(traced, "unmatched"))).toBe(false);
+      expect(await exists(path.join(traced, "instrumentation-only", "index.js"))).toBe(true);
       // Excluded by a different key that matches the same route.
       expect(await exists(path.join(traced, "api-only", "lib", "skip.js"))).toBe(false);
       // A wildcard segment selecting a symlinked (pnpm-style) package.
@@ -406,6 +412,7 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
         appDir: path.join(root, "app"),
         pagesDir: path.join(root, "pages"),
         pageExtensions: ["tsx", "ts", "jsx", "js"],
+        rootEntries: ["instrumentation", "proxy"],
       });
       // Next.js hashes the parent path of metadata files below route groups.
       const groupSuffix = nextHash.djb2Hash("/(marketing)").toString(36).slice(0, 6);
@@ -434,6 +441,8 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
           "/pages/_app",
           "/pages/_document",
           "/pages/_error",
+          "instrumentation",
+          "proxy",
         ].sort(),
       );
     } finally {
@@ -680,6 +689,62 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
       expect(tracedPackages.pkg.versions["1.0.0"].files).toEqual([path.join(top, "data.txt")]);
       expect(tracedPackages.pkg.versions["2.0.0"].files).toEqual([path.join(nested, "index.js")]);
       expect(warnings).toEqual([]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("copies a nested version left with only included files to its nested path", async () => {
+    const { createNitroTraceIncludes } =
+      await import("../packages/vinext/src/build/nitro-trace-includes.js");
+    const root = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-nested-only-")),
+    );
+    try {
+      await writeFiles(root, {
+        "node_modules/pkg/package.json": pkg("pkg", "1.0.0"),
+        "node_modules/pkg/index.js": "",
+        "node_modules/other/node_modules/pkg/package.json": pkg("pkg", "2.0.0"),
+        "node_modules/other/node_modules/pkg/index.js": "",
+        "node_modules/other/node_modules/pkg/data.txt": "data",
+      });
+      const top = path.join(root, "node_modules/pkg");
+      const nested = path.join(root, "node_modules/other/node_modules/pkg");
+      const tracedPackages: TracedPackages = {
+        pkg: {
+          name: "pkg",
+          versions: {
+            "1.0.0": {
+              path: top,
+              files: [path.join(top, "index.js")],
+              pkgJSON: { name: "pkg", version: "1.0.0" },
+            },
+            "2.0.0": {
+              path: nested,
+              files: [path.join(nested, "index.js")],
+              pkgJSON: { name: "pkg", version: "2.0.0" },
+            },
+          },
+        },
+      };
+      const traceIncludes = createNitroTraceIncludes({
+        root,
+        routes: ["/app"],
+        includes: { "*": ["node_modules/other/node_modules/pkg/data.txt"] },
+        excludes: { "*": ["node_modules/other/node_modules/pkg/index.js"] },
+        warn: () => {},
+      })!;
+      traceIncludes.tracedPackages(tracedPackages);
+      // nf3 could not place it under `other` without traced files.
+      expect(Object.keys(tracedPackages.pkg.versions)).toEqual(["1.0.0"]);
+      const serverDir = path.join(root, ".output/server");
+      traceIncludes.write(serverDir);
+      expect(
+        await fs.readFile(
+          path.join(serverDir, "node_modules/other/node_modules/pkg/data.txt"),
+          "utf8",
+        ),
+      ).toBe("data");
     } finally {
       await fs.rm(root, { recursive: true, force: true }).catch(() => {});
     }

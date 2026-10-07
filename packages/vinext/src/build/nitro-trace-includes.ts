@@ -190,12 +190,15 @@ function hasReservedPagesFile(pagesDir: string, matcher: ValidFileMatcher): bool
  * `/api/hello` and `/*` forms work. The built-in entries Next.js emits
  * (`discoverRoutes`) are included too: `_app`, `_document` and `_error` when
  * there are pages, `_not-found` when there are app entries, and
- * `_global-error` when there are no pages.
+ * `_global-error` when there are no pages. Root server entries (`instrumentation`,
+ * `proxy` or `middleware`) keep their entry names.
  */
 export async function collectTraceRouteNames(options: {
   appDir: string | null;
   pagesDir: string | null;
   pageExtensions: readonly string[];
+  /** Root server entry names, such as `instrumentation` and `proxy`. */
+  rootEntries?: readonly string[];
 }): Promise<string[]> {
   const { appDir, pagesDir } = options;
   const matcher = createValidFileMatcher(options.pageExtensions);
@@ -238,6 +241,7 @@ export async function collectTraceRouteNames(options: {
     for (const name of appNames) names.add(name);
   }
 
+  for (const name of options.rootEntries ?? []) names.add(name);
   return [...names];
 }
 
@@ -499,6 +503,12 @@ export function createNitroTraceIncludes(
     applied = true;
     pendingCopies = new Map();
     const { included, isTracedFileExcluded } = selectFiles(options);
+    const tracedFiles = new Map<TracedPackageVersion, Set<string>>();
+    for (const pkg of Object.values(tracedPackages)) {
+      for (const version of Object.values(pkg.versions)) {
+        tracedFiles.set(version, new Set(version.files));
+      }
+    }
 
     const { packages, outsideNodeModules } = groupByPackage(included);
     if (outsideNodeModules > 0) {
@@ -553,6 +563,22 @@ export function createNitroTraceIncludes(
     // Like Next.js, excludes apply to the traced files plus the includes, so
     // a version whose traced files are all excluded keeps its included files.
     removeExcludedTracedFiles(tracedPackages, options.root, isTracedFileExcluded);
+    // nf3 links a version under its parent through the parents of its traced
+    // files. A nested version left with only included files has none, so it
+    // is copied to its nested path after Nitro writes instead.
+    for (const [name, pkg] of Object.entries(tracedPackages)) {
+      for (const [version, entry] of Object.entries(pkg.versions)) {
+        const traced = tracedFiles.get(entry);
+        if (!traced || entry.files.some((file) => traced.has(file))) continue;
+        const nested = packageOfFile(toSlash(path.join(entry.path, "package.json")))?.nested;
+        if (!nested) continue;
+        for (const file of entry.files) {
+          pendingCopies.set(path.join(nested, path.relative(entry.path, file)), file);
+        }
+        delete pkg.versions[version];
+      }
+      if (Object.keys(pkg.versions).length === 0) delete tracedPackages[name];
+    }
     if (otherCopies.length > 0) {
       warn(
         `[vinext] outputFileTracingIncludes matched files in ${otherCopies.join(", ")}, ` +

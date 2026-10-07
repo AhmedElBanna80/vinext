@@ -7986,6 +7986,13 @@ export const loadServerActionClient = ${
                     appDir: hasAppDir ? appDir : null,
                     pagesDir: hasPagesDir ? pagesDir : null,
                     pageExtensions: nextConfig.pageExtensions,
+                    // Next.js names root server entries after their file.
+                    rootEntries: [
+                      ...(instrumentationPath ? ["instrumentation"] : []),
+                      ...(middlewarePath
+                        ? [isProxyFile(middlewarePath) ? "proxy" : "middleware"]
+                        : []),
+                    ],
                   }),
                   includes: outputFileTracingIncludes,
                   excludes: outputFileTracingExcludes,

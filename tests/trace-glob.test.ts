@@ -225,6 +225,12 @@ describe("createContainsMatcher", () => {
     "/app/-x",
     "/",
     "/app/",
+    "b.a",
+    "ba.a",
+    "/app/b.a",
+    "/app/a.a",
+    "/0",
+    "/d",
   ];
   const keys = [
     "/",
@@ -334,6 +340,13 @@ describe("createContainsMatcher", () => {
     "/app/**?(a)",
     "/app/a**",
     "/app/{foo,@(bar|x)}",
+    // A literal extension after a negated group with a star joins the lookahead.
+    "!(*a).a",
+    "/app/!(*a).a",
+    "!(a).a",
+    // Escapes other than word characters drop the backslash.
+    "/\\.",
+    "/app\\.js",
   ];
 
   it.each(keys)("matches picomatch { dot, contains } for route key %s", (key) => {
@@ -384,6 +397,8 @@ describe("isTranslatedExactly", () => {
     "!foo",
     "a,b",
     "a+b",
+    "!(*a).a",
+    "/app\\.js",
   ])("accepts %s", (pattern) => {
     expect(isTranslatedExactly(pattern)).toBe(true);
   });
@@ -432,6 +447,12 @@ describe("isTranslatedExactly", () => {
     "/app/[ab",
     "{a,b",
     "a}",
+    // Escaped word characters keep their regex meaning in picomatch.
+    "/\\d",
+    "/app/\\c",
+    // A negated group with a star followed by a non-literal extension.
+    "!(*a).{js,ts}",
+    "!(*a).*",
   ])("rejects %s", (pattern) => {
     expect(isTranslatedExactly(pattern)).toBe(false);
   });
@@ -495,7 +516,7 @@ describe("isTranslatedExactly grammar", () => {
   // are generated from a fixed seed, so failures reproduce.
   // Space-separated, so tokens and values contain no spaces.
   const tokens = [
-    "a b ab / / * ** ? . - , ! @ + ./ \\* \\( \\] | ) ( } ] [ {",
+    "a b ab / / * ** ? . - , ! @ + ./ .a .js \\* \\( \\] \\d \\. \\, \\\\ | ) ( } ] [ {",
     "[ab] [^a] [a-c] [^-a] [!a] []a] {a,b} {,a} {a..c} {a} {a,*} {*.b,a} {a,?} {a.b,c} {a,b}+",
     "@(a|b) !(a) +(a) *(a|b) ?(a) (a|b) (a|) !(a|!(b)) !(*) @(a|*) (a|b)+ @(a)? *(a)? !(*a) a?b",
   ].flatMap((group) => group.split(" "));
@@ -503,6 +524,7 @@ describe("isTranslatedExactly grammar", () => {
     "",
     ..."/ a b ab ba aa abc a/b ab/ba /a /b /ab /c /a/ /a/b /a/b/c /b/a /aa/bb".split(" "),
     ..."/a-b /a.b /a,b /(a) /a*b /* /- /a|b /{a} /a] /a} /a+ /!a /@a".split(" "),
+    ..."/b.a /a.a /ba.a /b.js /a.js /0 /d /a\\b".split(" "),
   ];
   // mulberry32
   let seed = 1;

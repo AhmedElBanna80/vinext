@@ -139,6 +139,11 @@ function parseClass(segment: string, open: number): { source: string; end: numbe
   return null;
 }
 
+// The rest of a pattern that picomatch reads as an extension after a negative
+// extglob (`/^\.[^\\/.]+$/`), limited to literal text.
+const PLAIN_EXTENSION = /^\.[^\\/.*?+@![\](){}|,]+$/;
+const PICOMATCH_EXTENSION = /^\.[^\\/.]+$/;
+
 function parseExtglob(
   segment: string,
   start: number,
@@ -189,12 +194,21 @@ function parseSegment(
         // picomatch makes an extglob that starts the pattern (other than
         // `@()`, which it reads as a plain group) match at least one character.
         if (atPatternStart && index === 0 && kind !== "@") source += "(?=.)";
+        const rest = segment.slice(group.end + 1);
         if (kind !== "!") {
           source += `(?:${alternatives})${kind === "@" ? "" : kind}`;
-        } else if (endsPattern && /^\)*$/.test(segment.slice(group.end + 1))) {
+        } else if (endsPattern && /^\)*$/.test(rest)) {
           // picomatch only anchors the lookahead when nothing but closing
           // parentheses follows in the pattern.
           source += `(?:(?!(?:${alternatives})$))[^/]*?`;
+        } else if (
+          endsPattern &&
+          segment.slice(index, group.end).includes("*") &&
+          PLAIN_EXTENSION.test(rest)
+        ) {
+          // With a `*` inside, picomatch also checks the extension that ends
+          // the pattern in the lookahead (`!(*a).js`).
+          source += `(?:(?!(?:${alternatives})${escapeRegex(rest)})[^/]*?)`;
         } else {
           source += `(?:(?!(?:${alternatives}))[^/]*?)`;
         }
@@ -299,18 +313,21 @@ const GRAMMAR_CHARS = "\\*?+@![](){}|/";
  * use the grammar below, which `tests/trace-glob.test.ts` checks against
  * picomatch. Anything else fails safe in the caller.
  *
- * - literal characters (including an unmatched `]` or `}`), and backslash
- *   escapes other than `\/`;
+ * - literal characters (including an unmatched `]`), and backslash escapes of
+ *   punctuation other than `/` and `\` (picomatch keeps regex escapes such
+ *   as `\d`);
  * - `*` and `?`, and `**` as a whole path segment outside braces and groups;
- * - classes (`[ab]`, `[^a-c]`) without escapes, `/` or POSIX classes, not
- *   followed by `+`;
+ * - classes (`[ab]`, `[^a-c]`) without escapes, `/`, braces or POSIX classes,
+ *   not followed by `+`;
  * - `(...)` groups and `@()`, `?()`, `+()`, `*()` and `!()` extglobs, nested
  *   or not, whose alternatives use this grammar without `/`, braces, `+` or a
- *   leading `?`, optionally followed by one `?` or `+` quantifier;
- * - top-level brace lists and ranges (`{a,b}`, `{1..3}`) whose options use
- *   this grammar without `/`, groups, braces or `+`, are not `.` or `..`, and
- *   are not empty when the braces fill a whole path segment; not followed by
- *   `+`.
+ *   leading `?`, optionally followed by one `?` or `+` quantifier; a `!()`
+ *   with a `*` inside that ends the pattern before an extension needs a
+ *   literal extension (`!(*a).js`);
+ * - top-level brace lists (`{a,b}`) of non-empty options that use this
+ *   grammar without `/`, groups, braces, `*`, `?`, `+`, `@`, `!` or `..`, and
+ *   are not `.`; not followed by `+`;
+ * - no trailing `/` (other than the pattern `/`).
  */
 export function isTranslatedExactly(pattern: string): boolean {
   let index = 0;
@@ -351,6 +368,17 @@ export function isTranslatedExactly(pattern: string): boolean {
       index++;
       break;
     }
+    // picomatch checks an extension after `!(...*...)` in the lookahead; only
+    // a literal one is translated.
+    const rest = pattern.slice(index);
+    if (
+      pattern[start - 2] === "!" &&
+      pattern.slice(start, index).includes("*") &&
+      PICOMATCH_EXTENSION.test(rest) &&
+      !PLAIN_EXTENSION.test(rest)
+    ) {
+      return false;
+    }
     if ((pattern[index] === "?" || pattern[index] === "+") && pattern[index + 1] !== "(") index++;
     return true;
   };
@@ -390,7 +418,9 @@ export function isTranslatedExactly(pattern: string): boolean {
           index++;
         }
       } else if (char === "\\") {
-        if (next === undefined || next === "/") return false;
+        // picomatch keeps the backslash for regex escapes (`\d`), so only
+        // escaped punctuation is a literal.
+        if (next === undefined || next === "/" || next === "\\" || /\w/.test(next)) return false;
         index += 2;
       } else if (char === "(" || ((char === "*" || char === "+") && next === "(")) {
         if (context === "brace" || !parseGroup(index + (char === "(" ? 1 : 2))) return false;
