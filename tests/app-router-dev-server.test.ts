@@ -96,7 +96,7 @@ describe("App Router integration", () => {
   // Next.js 308s any raw path containing a backslash or a repeated slash to
   // the collapsed path (base-server.ts / resolve-routes.ts).
   it("redirects repeated slashes and backslashes like Next.js", async () => {
-    await expectRepeatedSlashRedirects(baseUrl);
+    await expectRepeatedSlashRedirects(baseUrl, { dev: true });
   });
 
   it("never turns a same-origin double-slash middleware redirect protocol-relative", async () => {

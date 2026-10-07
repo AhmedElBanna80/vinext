@@ -305,11 +305,14 @@ const REPEATED_SLASH_CASES: ReadonlyArray<readonly [string, string | 404]> = [
  * `fetch()` would normalize) and assert the server matches Next.js. Finishes
  * with a plain `GET /` to prove the server survived.
  */
-export async function expectRepeatedSlashRedirects(baseUrl: string): Promise<void> {
+export async function expectRepeatedSlashRedirects(
+  baseUrl: string,
+  options: { dev?: boolean } = {},
+): Promise<void> {
   const { hostname, port } = new URL(baseUrl);
-  const get = (requestPath: string) =>
+  const get = (requestPath: string, headers: Record<string, string> = {}) =>
     new Promise<NodeHttpResponse>((resolve, reject) => {
-      const req = http.request({ hostname, port, path: requestPath }, (res) => {
+      const req = http.request({ hostname, port, path: requestPath, headers }, (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
         res.on("end", () =>
@@ -323,6 +326,13 @@ export async function expectRepeatedSlashRedirects(baseUrl: string): Promise<voi
       req.on("error", reject);
       req.end();
     });
+
+  if (options.dev) {
+    // Next.js runs its dev cross-site check before the redirect.
+    const crossOrigin = await get("/about//", { Origin: "https://evil.example" });
+    expect(crossOrigin.status).toBe(403);
+    expect(crossOrigin.headers.location).toBeUndefined();
+  }
 
   for (const [requestPath, expected] of REPEATED_SLASH_CASES) {
     const res = await get(requestPath);

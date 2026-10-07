@@ -5603,16 +5603,7 @@ export const loadServerActionClient = ${
       configureServer(server: ViteDevServer) {
         const devBuildId = nextConfig?.buildId ?? process.env.__VINEXT_BUILD_ID ?? "development";
 
-        server.middlewares.use((req, res, next) => {
-          // Like Next.js, redirect any path containing a backslash or a
-          // repeated slash before anything else parses it (`new URL("//", base)`
-          // throws, and `//host/x` parses as a different origin).
-          const slashRedirect = getRepeatedSlashRedirectLocation(req.url ?? "/");
-          if (slashRedirect !== null) {
-            res.writeHead(308, { Location: slashRedirect, Refresh: `0;url=${slashRedirect}` });
-            res.end(slashRedirect);
-            return;
-          }
+        server.middlewares.use((req, _res, next) => {
           req.__vinextOriginalEncodedUrl ??= req.url;
           // Only the hybrid Pages handler below may attach the forwarded
           // middleware context. The App Router trusts req.headers for it, so a
@@ -6107,6 +6098,18 @@ export const loadServerActionClient = ${
             return;
           }
           next();
+        });
+
+        // Like Next.js, redirect any path containing a backslash or a repeated
+        // slash once the origin check has passed (router-server.ts runs
+        // blockCrossSiteDEV before resolveRoutes) and before anything below
+        // parses it: `new URL("//", base)` throws, and `//host/x` parses as a
+        // different origin.
+        server.middlewares.use((req, res, next) => {
+          const slashRedirect = getRepeatedSlashRedirectLocation(req.url ?? "/");
+          if (slashRedirect === null) return next();
+          res.writeHead(308, { Location: slashRedirect, Refresh: `0;url=${slashRedirect}` });
+          res.end(slashRedirect);
         });
 
         // Vite serves public files for every method. Intercept only mutations

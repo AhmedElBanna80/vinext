@@ -31,8 +31,10 @@ const REDIRECT_LOCATION_BASE = "http://vinext.invalid";
  *
  * Ported from Next.js's request entry (`base-server.ts` / `resolve-routes.ts`,
  * via `normalizeRepeatedSlashes` in `shared/lib/utils.ts`): backslashes in the
- * path become `/`, runs of slashes collapse to one, the query is kept, and the
- * result is parsed as a URL so dot segments resolve the same way. It runs
+ * path become `/`, runs of slashes collapse to one and the query is kept.
+ * `next start` then builds the Location with `url.format(parseUrl(...))` in
+ * `router-server.ts`, so the result is serialized through a WHATWG URL here
+ * too (`/a/%2e%2e//b` → `/b`, `?q="x"` → `?q=%22x%22`, as observed). It runs
  * before basePath handling, so `//` → `/`, `/docs//` → `/docs/` and
  * `//evil.com` → `/evil.com`. Percent-encoded `%2F`/`%5C` are not touched and
  * keep falling through to `isOpenRedirectShaped` (404), as in Next.js.
