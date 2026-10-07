@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createBuilder, createIdResolver } from "vite";
+import { createBuilder, createIdResolver, createServer, type Plugin } from "vite";
 import { describe, expect, it, vi } from "vite-plus/test";
 import {
   createRequireConditionResolutionPlugin,
@@ -140,7 +140,8 @@ describe("vinext:require-condition-resolution", () => {
     );
 
     expect(result).toBeNull();
-    expect(resolve).toHaveBeenCalledTimes(4);
+    // The bare "external" result is retried with the bundling resolvers.
+    expect(resolve).toHaveBeenCalledTimes(6);
   });
 
   it("leaves packages with the same import and require entry untouched", async () => {
@@ -291,82 +292,30 @@ describe("vinext:require-condition-resolution", () => {
   });
 
   // Server environments without `noExternal: true` (e.g. Nitro services)
-  // externalize node_modules packages by default; explicit externals still win.
-  it.each([
-    ["bundles the require target of a default-externalized package", {}, true],
-    [
-      "bundles past a bundler external that does not match",
-      { build: { rollupOptions: { external: [/^nitro(\/|$)/] } } },
-      true,
-    ],
-    [
-      "keeps a package listed in resolve.external external",
-      { resolve: { external: ["lib-cjs"] } },
-      false,
-    ],
-    [
-      "keeps packages external when resolve.external is true",
-      { resolve: { external: true as const } },
-      false,
-    ],
-    [
-      "keeps a string bundler external external",
-      { build: { rolldownOptions: { external: ["lib-cjs"] } } },
-      false,
-    ],
-    [
-      "keeps a RegExp bundler external external",
-      { build: { rollupOptions: { external: /^lib-/ } } },
-      false,
-    ],
-    [
-      "keeps a function bundler external external",
-      { build: { rolldownOptions: { external: (id: string) => id === "lib-cjs" } } },
-      false,
-    ],
-    [
-      "keeps every match of a global RegExp bundler external external",
-      { build: { rollupOptions: { external: /^lib-/g } } },
-      false,
-    ],
-    [
-      "leaves a require whose resolved target is a bundler external",
-      { build: { rollupOptions: { external: /node_modules/ } } },
-      false,
-    ],
-    [
-      "leaves a require whose resolved target a function bundler external matches",
-      {
-        build: {
-          rolldownOptions: {
-            external: (id: string, _importer: string | undefined, isResolved: boolean) =>
-              isResolved && id.includes("lib-cjs"),
-          },
-        },
+  // externalize node_modules packages by default. Run real builds so explicit
+  // externals and plugins are judged by Rolldown itself.
+  const userExternal = (match: (id: string, isResolved: boolean) => boolean) => ({
+    build: {
+      rolldownOptions: {
+        external: (id: string, _importer: string | undefined, isResolved: boolean) =>
+          match(id, isResolved),
       },
-      false,
-    ],
-    [
-      "leaves a require whose import target a function bundler external matches",
-      {
-        build: {
-          rolldownOptions: {
-            external: (id: string, _importer: string | undefined, isResolved: boolean) =>
-              isResolved && id.endsWith("/index.mjs"),
-          },
-        },
-      },
-      false,
-    ],
-    [
-      "keeps a bundler external external when everything else is bundled",
-      {
-        resolve: { noExternal: true as const },
-        build: { rolldownOptions: { external: ["lib-cjs"] } },
-      },
-      false,
-    ],
-  ])("%s", async (_name, environment, rewritten) => {
+    },
+  });
+  // Vite's own resolver runs before normal plugins, so only a pre plugin could
+  // intercept the bare import before this rewrite.
+  const redirectPlugin: Plugin = {
+    name: "redirect-lib-cjs",
+    enforce: "pre",
+    resolveId(source) {
+      if (source === "lib-cjs") return "\0lib-cjs-redirect";
+    },
+    load(id) {
+      if (id === "\0lib-cjs-redirect") return "export default 'redirect';";
+    },
+  };
+
+  async function withConditionalPackage<T>(run: (root: string) => Promise<T>): Promise<T> {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vinext-require-condition-")));
     try {
       const packageDir = path.join(root, "node_modules", "lib-cjs");
@@ -382,36 +331,154 @@ describe("vinext:require-condition-resolution", () => {
       );
       await writeFile(path.join(packageDir, "index.js"), "module.exports = 'cjs';\n");
       await writeFile(path.join(packageDir, "index.mjs"), "export default 'esm';\n");
+      await writeFile(
+        path.join(root, "page.js"),
+        `const Library = require("lib-cjs");\nconst Again = require("lib-cjs");\nexport { Library, Again };\n`,
+      );
+      return await run(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
 
+  function recordPage(onPage: (code: string) => void): Plugin {
+    return {
+      name: "record-page",
+      transform(code, id) {
+        if (id.endsWith("/page.js")) onPage(code);
+      },
+    };
+  }
+
+  function expectRewritten(root: string, code: string | undefined, rewritten: boolean) {
+    const virtualId = `${path.join(root, "node_modules", "lib-cjs", "index.js")}.vinext-require.js`;
+    if (rewritten) expect(code).toContain(`require(${JSON.stringify(virtualId)})`);
+    else expect(code).toContain(`require("lib-cjs")`);
+  }
+
+  it.each<[string, Record<string, unknown>, boolean, Plugin[]?]>([
+    ["bundles the require target of a default-externalized package", {}, true],
+    [
+      "bundles past a bundler external that does not match",
+      { build: { rollupOptions: { external: [/^nitro(\/|$)/] } } },
+      true,
+    ],
+    [
+      "keeps a package listed in resolve.external external",
+      { resolve: { external: ["lib-cjs"] } },
+      false,
+    ],
+    [
+      "keeps packages external when resolve.external is true",
+      { resolve: { external: true } },
+      false,
+    ],
+    [
+      "keeps a string bundler external external",
+      { build: { rolldownOptions: { external: ["lib-cjs"] } } },
+      false,
+    ],
+    [
+      "keeps a RegExp bundler external external",
+      { build: { rollupOptions: { external: /^lib-/ } } },
+      false,
+    ],
+    ["keeps a function bundler external external", userExternal((id) => id === "lib-cjs"), false],
+    [
+      "matches a sticky RegExp bundler external like Rolldown",
+      { build: { rollupOptions: { external: /cjs/y } } },
+      false,
+    ],
+    [
+      "matches a frozen global RegExp bundler external without mutating it",
+      { build: { rollupOptions: { external: Object.freeze(/^lib-/g) } } },
+      false,
+    ],
+    [
+      "leaves a require whose synthetic id is a bundler external",
+      { build: { rollupOptions: { external: /node_modules/ } } },
+      false,
+    ],
+    [
+      "leaves a require whose resolved synthetic id a function bundler external matches",
+      userExternal((id, isResolved) => isResolved && id.endsWith(".vinext-require.js")),
+      false,
+    ],
+    // The environment externalizes the bare id before Rolldown resolves it, so
+    // resolved-path externals never saw these targets without the rewrite.
+    [
+      "bundles past a function external on the import target",
+      userExternal((id, isResolved) => isResolved && id.endsWith("/index.mjs")),
+      true,
+    ],
+    [
+      "bundles past a function external on the require target",
+      userExternal((id, isResolved) => isResolved && id.endsWith("/lib-cjs/index.js")),
+      true,
+    ],
+    ["leaves a package that a plugin resolves elsewhere", {}, false, [redirectPlugin]],
+  ])("%s", async (_name, environment, rewritten, plugins = []) => {
+    await withConditionalPackage(async (root) => {
+      let page: string | undefined;
       const builder = await createBuilder({
         root,
         configFile: false,
         logLevel: "silent",
+        build: { ssr: "page.js", write: false },
         environments: { ssr: environment },
+        plugins: [
+          createRequireConditionResolutionPlugin(createIdResolver, () => undefined),
+          ...plugins,
+          recordPage((code) => (page = code)),
+        ],
       });
-      const plugin = createRequireConditionResolutionPlugin(createIdResolver, () => undefined);
-      const configResolved = plugin.configResolved;
-      if (typeof configResolved !== "function") throw new Error("missing configResolved hook");
-      await configResolved.call({} as never, builder.config);
-      const hook = plugin.transform;
-      const handler = typeof hook === "function" ? hook : hook?.handler;
+      await builder.build(builder.environments.ssr);
+      expectRewritten(root, page, rewritten);
+    });
+  });
 
-      const result = (await handler!.call(
-        { environment: builder.environments.ssr } as never,
-        `const Library = require("lib-cjs");\nconst Again = require("lib-cjs");\nexport { Library, Again };`,
-        path.join(root, "page.tsx"),
-      )) as { code: string } | null;
+  it("keeps rewriting in environments that already bundle every package", async () => {
+    await withConditionalPackage(async (root) => {
+      let page: string | undefined;
+      const builder = await createBuilder({
+        root,
+        configFile: false,
+        logLevel: "silent",
+        build: { ssr: "page.js", write: false },
+        environments: {
+          ssr: {
+            resolve: { noExternal: true },
+            build: { rolldownOptions: { external: /node_modules\/lib-cjs\/index\.mjs$/ } },
+          },
+        },
+        plugins: [
+          createRequireConditionResolutionPlugin(createIdResolver, () => undefined),
+          recordPage((code) => (page = code)),
+        ],
+      });
+      await builder.build(builder.environments.ssr);
+      expectRewritten(root, page, true);
+    });
+  });
 
-      if (rewritten) {
-        expect(result).not.toBeNull();
+  it("ignores build-only bundler externals in dev", async () => {
+    await withConditionalPackage(async (root) => {
+      const server = await createServer({
+        root,
+        configFile: false,
+        logLevel: "silent",
+        server: { middlewareMode: true, hmr: false, ws: false },
+        environments: { ssr: { build: { rolldownOptions: { external: ["lib-cjs"] } } } },
+        plugins: [createRequireConditionResolutionPlugin(createIdResolver, () => undefined)],
+      });
+      try {
+        const result = await server.environments.ssr.transformRequest("/page.js");
         expect(result?.code).toContain(
-          `require(${JSON.stringify(`${path.join(packageDir, "index.js")}.vinext-require.js`)})`,
+          `${path.join(root, "node_modules", "lib-cjs", "index.js")}.vinext-require.js`,
         );
-      } else {
-        expect(result).toBeNull();
+      } finally {
+        await server.close();
       }
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
+    });
   });
 });
