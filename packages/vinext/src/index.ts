@@ -2908,7 +2908,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           String(nextConfig.images?.unoptimized === true),
         );
         // images.loader / images.loaderFile modes the next/image shim validates
-        // against at render time (see resolveImageLoader in shims/image.tsx).
+        // against at render time (shims/image-external.tsx, shims/image.tsx).
         defines["process.env.__VINEXT_IMAGE_CUSTOM_LOADER"] = JSON.stringify(
           String(nextConfig.images?.loader === "custom"),
         );
@@ -3562,7 +3562,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   ...nextConfig.aliases,
                   ...nextShimMap,
                   "vinext/server/pages-client-assets": _pagesClientAssetsPath,
-                  // shims/image.tsx imports this slot for `images.loaderFile`.
+                  // shims/image-external.tsx imports this slot for `images.loaderFile`.
                   // Like Next.js (which aliases next/dist/shared/lib/image-loader
                   // to the file), point it at the user's file, resolved against
                   // the project root; otherwise keep vinext's `undefined` default.

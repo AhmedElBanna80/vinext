@@ -52,16 +52,7 @@ function LegacyImage(props: ImageProps): React.ReactElement {
     : onLoad;
 
   if (layout === "fill") {
-    return (
-      <Image
-        __vinextLegacyImage
-        alt={alt ?? ""}
-        fill
-        style={modernStyle}
-        onLoad={handleLoad}
-        {...rest}
-      />
-    );
+    return <Image alt={alt ?? ""} fill style={modernStyle} onLoad={handleLoad} {...rest} />;
   }
 
   if (layout === "responsive") {
@@ -75,15 +66,7 @@ function LegacyImage(props: ImageProps): React.ReactElement {
   const h = typeof height === "string" ? parseInt(height, 10) : height;
 
   return (
-    <Image
-      __vinextLegacyImage
-      alt={alt ?? ""}
-      width={w}
-      height={h}
-      style={modernStyle}
-      onLoad={handleLoad}
-      {...rest}
-    />
+    <Image alt={alt ?? ""} width={w} height={h} style={modernStyle} onLoad={handleLoad} {...rest} />
   );
 }
 

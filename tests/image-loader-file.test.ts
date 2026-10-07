@@ -1,7 +1,7 @@
 /**
  * `images.loaderFile` config wiring.
  *
- * shims/image.tsx imports `vinext/shims/image-loader-file`; the vinext plugin
+ * shims/image-external.tsx imports `vinext/shims/image-loader-file`; the vinext plugin
  * aliases that specifier to the configured loader file, mirroring how Next.js
  * aliases `next/dist/shared/lib/image-loader` to it. The rules come from the
  * `images.loaderFile` normalization in Next.js's server/config.ts. See
