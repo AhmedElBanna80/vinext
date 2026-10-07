@@ -694,59 +694,99 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
     }
   });
 
-  it("copies a nested version left with only included files to its nested path", async () => {
-    const { createNitroTraceIncludes } =
-      await import("../packages/vinext/src/build/nitro-trace-includes.js");
-    const root = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-nested-only-")),
-    );
-    try {
-      await writeFiles(root, {
-        "node_modules/pkg/package.json": pkg("pkg", "1.0.0"),
-        "node_modules/pkg/index.js": "",
-        "node_modules/other/node_modules/pkg/package.json": pkg("pkg", "2.0.0"),
-        "node_modules/other/node_modules/pkg/index.js": "",
-        "node_modules/other/node_modules/pkg/data.txt": "data",
-      });
-      const top = path.join(root, "node_modules/pkg");
-      const nested = path.join(root, "node_modules/other/node_modules/pkg");
-      const tracedPackages: TracedPackages = {
-        pkg: {
-          name: "pkg",
-          versions: {
-            "1.0.0": {
-              path: top,
-              files: [path.join(top, "index.js")],
-              pkgJSON: { name: "pkg", version: "1.0.0" },
-            },
-            "2.0.0": {
-              path: nested,
-              files: [path.join(nested, "index.js")],
-              pkgJSON: { name: "pkg", version: "2.0.0" },
+  it.each([
+    ["nested", "node_modules/other", "node_modules/other/node_modules/pkg"],
+    [
+      "pnpm",
+      "node_modules/.pnpm/other@1.0.0/node_modules/other",
+      "node_modules/.pnpm/pkg@2.0.0/node_modules/pkg",
+    ],
+  ])(
+    "keeps the placement of a %s version left with only included files",
+    async (_, otherDir, nestedDir) => {
+      const { createNitroTraceIncludes } =
+        await import("../packages/vinext/src/build/nitro-trace-includes.js");
+      const root = await fs.realpath(
+        await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-nested-only-")),
+      );
+      try {
+        await writeFiles(root, {
+          "node_modules/pkg/package.json": pkg("pkg", "1.0.0"),
+          "node_modules/pkg/index.js": "",
+          [`${otherDir}/package.json`]: pkg("other", "1.0.0"),
+          [`${otherDir}/index.js`]: "",
+          [`${nestedDir}/package.json`]: pkg("pkg", "2.0.0"),
+          [`${nestedDir}/index.js`]: "",
+          [`${nestedDir}/data.txt`]: "",
+        });
+        const top = path.join(root, "node_modules/pkg");
+        const other = path.join(root, otherDir);
+        const nested = path.join(root, nestedDir);
+        // nf3's trace: the server imports `pkg` 1.0.0 and `other`, which
+        // imports `pkg` 2.0.0.
+        const server = path.join(root, ".output/server/index.mjs");
+        const tracedFiles: Record<
+          string,
+          { parents: string[]; pkgName?: string; pkgVersion?: string }
+        > = {
+          [path.join(top, "index.js")]: { parents: [server], pkgName: "pkg", pkgVersion: "1.0.0" },
+          [path.join(other, "index.js")]: {
+            parents: [server],
+            pkgName: "other",
+            pkgVersion: "1.0.0",
+          },
+          [path.join(nested, "index.js")]: {
+            parents: [path.join(other, "index.js")],
+            pkgName: "pkg",
+            pkgVersion: "2.0.0",
+          },
+        };
+        const tracedPackages: TracedPackages = {
+          pkg: {
+            name: "pkg",
+            versions: {
+              "1.0.0": {
+                path: top,
+                files: [path.join(top, "index.js")],
+                pkgJSON: { name: "pkg", version: "1.0.0" },
+              },
+              "2.0.0": {
+                path: nested,
+                files: [path.join(nested, "index.js")],
+                pkgJSON: { name: "pkg", version: "2.0.0" },
+              },
             },
           },
-        },
-      };
-      const traceIncludes = createNitroTraceIncludes({
-        root,
-        routes: ["/app"],
-        includes: { "*": ["node_modules/other/node_modules/pkg/data.txt"] },
-        excludes: { "*": ["node_modules/other/node_modules/pkg/index.js"] },
-        warn: () => {},
-      })!;
-      traceIncludes.tracedPackages(tracedPackages);
-      // nf3 could not place it under `other` without traced files.
-      expect(Object.keys(tracedPackages.pkg.versions)).toEqual(["1.0.0"]);
-      const serverDir = path.join(root, ".output/server");
-      traceIncludes.write(serverDir);
-      expect(
-        await fs.readFile(
-          path.join(serverDir, "node_modules/other/node_modules/pkg/data.txt"),
-          "utf8",
-        ),
-      ).toBe("data");
-    } finally {
-      await fs.rm(root, { recursive: true, force: true }).catch(() => {});
-    }
-  });
+        };
+        const traceIncludes = createNitroTraceIncludes({
+          root,
+          routes: ["/app"],
+          includes: { "*": [`${nestedDir}/data.txt`] },
+          excludes: { "*": [`${nestedDir}/index.js`] },
+          warn: () => {},
+        })!;
+        traceIncludes.tracedFiles(tracedFiles);
+        traceIncludes.tracedPackages(tracedPackages);
+        // nf3 writes the version with its package.json and links it under the
+        // packages that import its files (`findPackageParents`); a version
+        // without parents would become the root `node_modules/pkg`.
+        const parentsOf = (version: string) => [
+          ...new Set(
+            tracedPackages.pkg.versions[version].files.flatMap((file) =>
+              (tracedFiles[file]?.parents ?? []).flatMap((parent) => {
+                const parentFile = tracedFiles[parent];
+                if (!parentFile || parentFile.pkgName === "pkg") return [];
+                return [`${parentFile.pkgName}@${parentFile.pkgVersion}`];
+              }),
+            ),
+          ),
+        ];
+        expect(tracedPackages.pkg.versions["2.0.0"].files).toEqual([path.join(nested, "data.txt")]);
+        expect(parentsOf("2.0.0")).toEqual(["other@1.0.0"]);
+        expect(parentsOf("1.0.0")).toEqual([]);
+      } finally {
+        await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+  );
 });

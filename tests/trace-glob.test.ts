@@ -399,6 +399,8 @@ describe("isTranslatedExactly", () => {
     "a+b",
     "!(*a).a",
     "/app\\.js",
+    // 256 brace combinations.
+    "{a,b}".repeat(8),
   ])("accepts %s", (pattern) => {
     expect(isTranslatedExactly(pattern)).toBe(true);
   });
@@ -453,6 +455,9 @@ describe("isTranslatedExactly", () => {
     // A negated group with a star followed by a non-literal extension.
     "!(*a).{js,ts}",
     "!(*a).*",
+    // Brace lists are expanded per combination, so their number is bounded.
+    "{a,b}".repeat(9),
+    "/{a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p}/{a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q}",
   ])("rejects %s", (pattern) => {
     expect(isTranslatedExactly(pattern)).toBe(false);
   });

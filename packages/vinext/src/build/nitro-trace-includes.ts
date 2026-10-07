@@ -29,7 +29,9 @@ import {
  * so the included files are copied after the build instead. Included files of
  * a nested package (`parent/node_modules/child`) that Nitro did not trace are
  * also copied after the build, to the same nested path, because Nitro writes
- * the packages it is given at the top level.
+ * the packages it is given at the top level. Excludes do not move a package
+ * version: its remaining files keep the trace parents nf3 places it by
+ * (`traceOpts.hooks.tracedFiles`).
  *
  * Next.js matches every route key against each server route and writes one
  * trace per route: the route's traced files plus the files of every matching
@@ -77,7 +79,12 @@ type PackageFiles = {
   files: Array<{ path: string; real: string }>;
 };
 
+/** nf3's traced files by real path, with the files that import each one. */
+export type TracedFiles = Record<string, { parents: string[] }>;
+
 export type NitroTraceIncludes = {
+  /** Nitro `traceOpts.hooks.tracedFiles` hook, which runs first. */
+  tracedFiles(tracedFiles: TracedFiles): void;
   /** Nitro `traceOpts.hooks.tracedPackages` hook. */
   tracedPackages(tracedPackages: TracedPackages): void;
   /**
@@ -498,15 +505,22 @@ export function createNitroTraceIncludes(
   let applied = false;
   /** Included files to copy after Nitro writes, by output path. */
   let pendingCopies = new Map<string, string>();
+  let tracedFiles: TracedFiles | null = null;
 
   const apply = (tracedPackages: TracedPackages): void => {
     applied = true;
     pendingCopies = new Map();
     const { included, isTracedFileExcluded } = selectFiles(options);
-    const tracedFiles = new Map<TracedPackageVersion, Set<string>>();
+    // nf3 places the versions of a package with several versions through the
+    // trace parents of their files, which it reads from `tracedFiles` after
+    // this hook.
+    const original = new Map<TracedPackageVersion, { files: Set<string>; parents: string[] }>();
     for (const pkg of Object.values(tracedPackages)) {
       for (const version of Object.values(pkg.versions)) {
-        tracedFiles.set(version, new Set(version.files));
+        const parents = new Set(
+          version.files.flatMap((file) => tracedFiles?.[file]?.parents ?? []),
+        );
+        original.set(version, { files: new Set(version.files), parents: [...parents] });
       }
     }
 
@@ -563,21 +577,25 @@ export function createNitroTraceIncludes(
     // Like Next.js, excludes apply to the traced files plus the includes, so
     // a version whose traced files are all excluded keeps its included files.
     removeExcludedTracedFiles(tracedPackages, options.root, isTracedFileExcluded);
-    // nf3 links a version under its parent through the parents of its traced
-    // files. A nested version left with only included files has none, so it
-    // is copied to its nested path after Nitro writes instead.
-    for (const [name, pkg] of Object.entries(tracedPackages)) {
-      for (const [version, entry] of Object.entries(pkg.versions)) {
-        const traced = tracedFiles.get(entry);
-        if (!traced || entry.files.some((file) => traced.has(file))) continue;
-        const nested = packageOfFile(toSlash(path.join(entry.path, "package.json")))?.nested;
-        if (!nested) continue;
-        for (const file of entry.files) {
-          pendingCopies.set(path.join(nested, path.relative(entry.path, file)), file);
+    // Excluded files take their trace parents with them, so a version could
+    // move: one left without parents becomes the root copy. Give its
+    // remaining files the parents of every file it had, so nf3 places it
+    // where it would without the excludes.
+    if (tracedFiles) {
+      for (const pkg of Object.values(tracedPackages)) {
+        for (const entry of Object.values(pkg.versions)) {
+          const before = original.get(entry);
+          if (
+            !before ||
+            entry.files.filter((file) => before.files.has(file)).length === before.files.size
+          ) {
+            continue;
+          }
+          for (const file of entry.files) {
+            tracedFiles[file] = { ...tracedFiles[file], parents: before.parents };
+          }
         }
-        delete pkg.versions[version];
       }
-      if (Object.keys(pkg.versions).length === 0) delete tracedPackages[name];
     }
     if (otherCopies.length > 0) {
       warn(
@@ -593,6 +611,9 @@ export function createNitroTraceIncludes(
   };
 
   return {
+    tracedFiles(files) {
+      tracedFiles = files;
+    },
     tracedPackages: apply,
     write(serverDir) {
       const outDir = path.join(serverDir, "node_modules");

@@ -41,7 +41,7 @@ import {
   matchAppRoute,
 } from "./routing/app-router.js";
 import type { NitroRouteRuleConfig } from "./build/nitro-route-rules.js";
-import type { TracedPackages } from "./build/nitro-trace-includes.js";
+import type { TracedFiles, TracedPackages } from "./build/nitro-trace-includes.js";
 import {
   buildViteResolveExtensions,
   normalizeViteResolveExtensions,
@@ -1609,6 +1609,7 @@ type NitroSetupContext = {
     traceDeps?: string[];
     traceOpts?: {
       hooks?: {
+        tracedFiles?: (tracedFiles: TracedFiles) => void | Promise<void>;
         tracedPackages?: (tracedPackages: TracedPackages) => void | Promise<void>;
       };
     };
@@ -8002,6 +8003,11 @@ export const loadServerActionClient = ${
           if (traceIncludes) {
             const traceOpts = (nitro.options.traceOpts ??= {});
             const hooks = (traceOpts.hooks ??= {});
+            const userTracedFiles = hooks.tracedFiles;
+            hooks.tracedFiles = async (tracedFiles) => {
+              traceIncludes.tracedFiles(tracedFiles);
+              await userTracedFiles?.(tracedFiles);
+            };
             const userTracedPackages = hooks.tracedPackages;
             hooks.tracedPackages = async (tracedPackages) => {
               traceIncludes.tracedPackages(tracedPackages);

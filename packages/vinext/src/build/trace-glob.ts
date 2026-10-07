@@ -306,6 +306,7 @@ function toRegExp(source: string, literal: string): RegExp {
 // Characters with a meaning in the grammar `isTranslatedExactly` accepts; any
 // other character is a literal.
 const GRAMMAR_CHARS = "\\*?+@![](){}|/";
+const MAX_BRACE_COMBINATIONS = 256;
 
 /**
  * Whether {@link createContainsMatcher} and {@link createPathMatcher} match a
@@ -326,7 +327,7 @@ const GRAMMAR_CHARS = "\\*?+@![](){}|/";
  *   literal extension (`!(*a).js`);
  * - top-level brace lists (`{a,b}`) of non-empty options that use this
  *   grammar without `/`, groups, braces, `*`, `?`, `+`, `@`, `!` or `..`, and
- *   are not `.`; not followed by `+`;
+ *   are not `.`; not followed by `+`; at most 256 combinations in all;
  * - no trailing `/` (other than the pattern `/`).
  */
 export function isTranslatedExactly(pattern: string): boolean {
@@ -383,9 +384,12 @@ export function isTranslatedExactly(pattern: string): boolean {
     return true;
   };
 
+  // Brace lists are expanded into one regex per combination, so the number of
+  // combinations is bounded.
+  let combinations = 1;
   const parseBraces = (): boolean => {
     index++;
-    for (;;) {
+    for (let options = 1; ; options++) {
       const start = index;
       if (!parseSequence("brace")) return false;
       // Expansion would join an option with its neighbours into new tokens
@@ -401,7 +405,8 @@ export function isTranslatedExactly(pattern: string): boolean {
       }
       if (pattern[index] !== "}") return false;
       index++;
-      return pattern[index] !== "+";
+      combinations *= options;
+      return combinations <= MAX_BRACE_COMBINATIONS && pattern[index] !== "+";
     }
   };
 
