@@ -7,6 +7,7 @@ import {
   createRequireConditionResolutionPlugin,
   isConditionalRequireScriptModuleId,
 } from "../packages/vinext/src/plugins/require-condition-resolution.js";
+import { createTransitiveExternalsPlugin } from "../packages/vinext/src/plugins/transitive-externals.js";
 
 // Ported from Next.js: test/e2e/app-dir/client-module-with-package-type/index.test.ts
 // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/client-module-with-package-type/index.test.ts
@@ -498,6 +499,96 @@ describe("vinext:require-condition-resolution", () => {
     });
   });
 
+  it("keeps the require target of a private server external copy that gets bundled", async () => {
+    await withConditionalPackage(async (root) => {
+      const packageDir = path.join(root, "node_modules", "lib-cjs");
+      const writeServerExt = async (dir: string) => {
+        await mkdir(dir, { recursive: true });
+        await writeFile(
+          path.join(dir, "package.json"),
+          JSON.stringify({
+            name: "server-ext",
+            version: "1.0.0",
+            type: "commonjs",
+            exports: { ".": { import: "./index.mjs", default: "./index.js" } },
+          }),
+        );
+        await writeFile(path.join(dir, "index.js"), "module.exports = 'cjs';\n");
+        await writeFile(path.join(dir, "index.mjs"), "export default 'esm';\n");
+      };
+      const privateDir = path.join(packageDir, "node_modules", "server-ext");
+      await writeServerExt(path.join(root, "node_modules", "server-ext"));
+      await writeServerExt(privateDir);
+      await writeFile(
+        path.join(packageDir, "index.js"),
+        `module.exports = require("server-ext");\n`,
+      );
+
+      let target: string | undefined;
+      const builder = await createBuilder({
+        root,
+        configFile: false,
+        logLevel: "silent",
+        build: { ssr: "page.js", write: false },
+        plugins: [
+          createRequireConditionResolutionPlugin(
+            createIdResolver,
+            (id) => (isConditionalRequireScriptModuleId(id) ? true : undefined),
+            () => ["server-ext"],
+          ),
+          createTransitiveExternalsPlugin({
+            getRoot: () => root,
+            getExternalPackages: () => ["server-ext"],
+          }),
+          {
+            name: "record-target",
+            transform(code, id) {
+              if (id.endsWith("/lib-cjs/index.js.vinext-require.js")) target = code;
+            },
+          },
+        ],
+      });
+      await builder.build(builder.environments.ssr);
+      expect(target).toContain(
+        `require(${JSON.stringify(`${path.join(privateDir, "index.js")}.vinext-require.js`)})`,
+      );
+    });
+  });
+
+  it("bundles a synthetic target's private dependencies rather than hoisted copies", async () => {
+    await withConditionalPackage(async (root) => {
+      const packageDir = path.join(root, "node_modules", "lib-cjs");
+      for (const [dir, value] of [
+        [path.join(packageDir, "node_modules", "plain-dep"), "private-copy"],
+        [path.join(root, "node_modules", "plain-dep"), "hoisted-copy"],
+      ]) {
+        await mkdir(dir, { recursive: true });
+        await writeFile(
+          path.join(dir, "package.json"),
+          JSON.stringify({ name: "plain-dep", version: "1.0.0", main: "index.js" }),
+        );
+        await writeFile(path.join(dir, "index.js"), `module.exports = ${JSON.stringify(value)};\n`);
+      }
+      await writeFile(
+        path.join(packageDir, "index.js"),
+        `module.exports = require("plain-dep");\n`,
+      );
+
+      const builder = await createBuilder({
+        root,
+        configFile: false,
+        logLevel: "silent",
+        build: { ssr: "page.js", write: false },
+        environments: { ssr: { resolve: { noExternal: true } } },
+        plugins: [createRequireConditionResolutionPlugin(createIdResolver, () => undefined)],
+      });
+      const output = await builder.build(builder.environments.ssr);
+      const code = JSON.stringify(output);
+      expect(code).toContain("private-copy");
+      expect(code).not.toContain("hoisted-copy");
+    });
+  });
+
   it("keeps rewriting in environments that already bundle every package", async () => {
     await withConditionalPackage(async (root) => {
       let page: string | undefined;
@@ -522,22 +613,25 @@ describe("vinext:require-condition-resolution", () => {
     });
   });
 
-  it("resolves nested requires from the directory of the synthetic target", async () => {
+  it("resolves nested requires from the file a synthetic target stands for", async () => {
     await withConditionalPackage(async (root) => {
       const packageDir = path.join(root, "node_modules", "lib-cjs");
       const privateDir = path.join(packageDir, "node_modules", "private-dep");
-      await mkdir(privateDir, { recursive: true });
-      await writeFile(
-        path.join(privateDir, "package.json"),
-        JSON.stringify({
-          name: "private-dep",
-          version: "1.0.0",
-          type: "commonjs",
-          exports: { ".": { import: "./index.mjs", default: "./index.js" } },
-        }),
-      );
-      await writeFile(path.join(privateDir, "index.js"), "module.exports = 'cjs';\n");
-      await writeFile(path.join(privateDir, "index.mjs"), "export default 'esm';\n");
+      // A hoisted copy that resolution from the project root would pick.
+      for (const dir of [privateDir, path.join(root, "node_modules", "private-dep")]) {
+        await mkdir(dir, { recursive: true });
+        await writeFile(
+          path.join(dir, "package.json"),
+          JSON.stringify({
+            name: "private-dep",
+            version: "1.0.0",
+            type: "commonjs",
+            exports: { ".": { import: "./index.mjs", default: "./index.js" } },
+          }),
+        );
+        await writeFile(path.join(dir, "index.js"), "module.exports = 'cjs';\n");
+        await writeFile(path.join(dir, "index.mjs"), "export default 'esm';\n");
+      }
       await writeFile(
         path.join(packageDir, "index.js"),
         `module.exports = require("private-dep");\n`,

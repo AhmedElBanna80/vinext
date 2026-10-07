@@ -23,7 +23,7 @@ import {
 } from "./ast-scope.js";
 import { magicStringTransformResult } from "./transform-result.js";
 import { packageNameFromSpecifier } from "../utils/package-name.js";
-import { stripViteModuleQuery } from "../utils/path.js";
+import { canonicalizeFilePath, stripViteModuleQuery } from "../utils/path.js";
 
 const LITERAL_REQUIRE_RE = /\brequire\s*\(/;
 const CONDITIONAL_REQUIRE_SCRIPT_ID_RE = /\.vinext-require\.(?:js|jsx|ts|tsx)$/i;
@@ -239,8 +239,13 @@ export function createRequireConditionResolutionPlugin(
         import: createResolver(config, { isRequire: false, noExternal: true }),
       };
     },
-    resolveId(source) {
+    resolveId(source, importer, options) {
       if (virtualTargets.has(source)) return source;
+      // Resolve a synthetic module's own imports from the file it stands for.
+      // Vite resolves bare ids from the project root when the importer is not
+      // a file on disk, which would pick a hoisted copy over a private one.
+      const target = importer ? virtualTargets.get(stripViteModuleQuery(importer)) : undefined;
+      if (target) return this.resolve(source, target.file, { ...options, skipSelf: true });
     },
     async load(id) {
       const target = virtualTargets.get(id);
@@ -279,6 +284,8 @@ export function createRequireConditionResolutionPlugin(
           return null;
         }
         const requires = collectLiteralRequires(code, id);
+        // Resolve from the file a synthetic module stands for (see resolveId).
+        const importer = virtualTargets.get(cleanId)?.file ?? id;
         if (requires.length === 0 || !defaultResolvers || !bundlingResolvers) return null;
         // `resolve.external: true` asks for every dependency to stay external,
         // so don't pull require targets into the bundle there.
@@ -297,24 +304,20 @@ export function createRequireConditionResolutionPlugin(
         // again so nested package require() calls retain their own conditions.
         for (const { argument, specifier } of requires) {
           let [requireResolution, importResolution] = await Promise.all([
-            defaultResolvers.require(this.environment, specifier, id),
-            defaultResolvers.import(this.environment, specifier, id),
+            defaultResolvers.require(this.environment, specifier, importer),
+            defaultResolvers.import(this.environment, specifier, importer),
           ]);
           // The environment externalizes this package (the resolver returned
           // the bare id), so the call is pre-resolved by bundling its
-          // `require` target instead. Packages that Next.js keeps external on
-          // the server (its default list, including native addons, plus
-          // `serverExternalPackages`) stay external, as they do in Next.js.
-          const packageName = packageNameFromSpecifier(specifier);
+          // `require` target instead.
           const bundlesExternal =
             !keepExternals &&
             requireResolution !== undefined &&
-            !isAbsoluteResolution(requireResolution) &&
-            !(packageName && getServerExternalPackages().includes(packageName));
+            !isAbsoluteResolution(requireResolution);
           if (bundlesExternal) {
             [requireResolution, importResolution] = await Promise.all([
-              bundlingResolvers.require(this.environment, specifier, id),
-              bundlingResolvers.import(this.environment, specifier, id),
+              bundlingResolvers.require(this.environment, specifier, importer),
+              bundlingResolvers.import(this.environment, specifier, importer),
             ]);
           }
           if (!isAbsoluteResolution(requireResolution)) continue;
@@ -332,17 +335,33 @@ export function createRequireConditionResolutionPlugin(
           // or externalizes it itself still wins. Vite drops that tag under
           // `legacy.inconsistentCjsInterop`, where its externalization cannot
           // be told apart from a plugin's, so the call is left alone there.
+          //
+          // Packages that Next.js keeps external on the server (its default
+          // list, including native addons, plus `serverExternalPackages`) stay
+          // external too. The exception is an importer-private copy, which
+          // vinext:transitive-externals bundles from this importer's `import`
+          // entry; that one still needs its `require` target.
+          //
           // A bundler external also wins when it matches the bare specifier,
           // the only id it tests once Vite externalizes the package, or the
           // synthetic id, which would become an import of a missing file.
           // (Vite's dev resolver returns the package entry, so only builds get
           // here.)
           if (bundlesExternal) {
-            const resolved = await this.resolve(specifier, id, { skipSelf: true });
+            const resolved = await this.resolve(specifier, importer, { skipSelf: true });
+            const packageName = packageNameFromSpecifier(specifier);
+            const takesOver =
+              packageName !== null && getServerExternalPackages().includes(packageName)
+                ? resolved !== null &&
+                  !resolved.external &&
+                  importPath !== undefined &&
+                  canonicalizeFilePath(stripViteModuleQuery(resolved.id)) ===
+                    canonicalizeFilePath(importPath)
+                : Boolean(resolved?.external) &&
+                  resolved?.id === specifier &&
+                  resolved.packageJsonPath !== undefined;
             if (
-              !resolved?.external ||
-              resolved.id !== specifier ||
-              resolved.packageJsonPath === undefined ||
+              !takesOver ||
               (bundlerExternal !== undefined &&
                 (isBundlerExternal(bundlerExternal, specifier, id) ||
                   isBundlerExternal(bundlerExternal, virtualId, id) ||
