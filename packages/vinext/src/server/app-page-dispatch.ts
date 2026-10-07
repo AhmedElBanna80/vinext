@@ -318,6 +318,7 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
       observeMetadataSearchParamsAccess?: boolean;
       observePageSearchParamsAccess?: boolean;
       serveStreamingMetadata?: boolean;
+      placeStreamedMetadataInHead?: boolean;
     },
   ) => Promise<AppPageElement>;
   clientReuseManifest?: ClientReuseManifestParseResult;
@@ -873,6 +874,18 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     isStaticEligible &&
     options.pprRuntime === undefined &&
     !isNeverStoredPath;
+  // Next.js renders a page it may store whole before serving it, so the
+  // page's streamed metadata is ready for <head>. A mounted-slot RSC request
+  // is never read from or written to the cache. Neither is an RSC request
+  // whose client-reuse manifest may enable skip transport, which is decided
+  // only once the page's elements are built.
+  const isMountedSlotsRscRequest = options.isRscRequest && Boolean(options.mountedSlotsHeader);
+  const maySkipTransport =
+    options.isRscRequest &&
+    options.clientReuseManifest?.kind === "parsed" &&
+    options.clientReuseManifest.manifest.entries.length > 0;
+  const mayBypassRscCache = isMountedSlotsRscRequest || maySkipTransport;
+  const placeStreamedMetadataInHead = isCacheCandidate && !mayBypassRscCache;
   if (shouldReadCache && isStaticEligible) {
     traceOperation = resolveAppPageTraceOperation({
       hasRequestSearchParams,
@@ -1000,8 +1013,10 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
                 observeMetadataSearchParamsAccess: revalidationDynamicConfig !== "force-static",
                 observePageSearchParamsAccess: revalidationDynamicConfig !== "force-static",
                 // As in Next.js, a regeneration streams metadata as the
-                // request that triggered it does.
+                // request that triggered it does, into the <head> of a
+                // document it renders whole.
                 serveStreamingMetadata: placeGeneratedMetadataInBody,
+                placeStreamedMetadataInHead: true,
               },
             );
             const baseRevalidatedOnError = options.createRscOnErrorHandler(
@@ -1225,6 +1240,23 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       setCurrentFetchCacheMode(options.resolveRouteFetchCacheMode?.(interceptRoute) ?? null);
       setCurrentFetchRevalidate(sourceRevalidateSeconds);
       setCurrentForceDynamicFetchDefault(sourceDynamicConfig === "force-dynamic");
+      // This renders the source route, so its own config, under the request's
+      // storage gates, decides whether the response may be stored.
+      const isSourceCacheCandidate =
+        options.bypassInterceptionContextCache !== true &&
+        shouldReadAppPageCache({
+          isDraftMode,
+          isForceDynamic: sourceDynamicConfig === "force-dynamic",
+          isProgressiveActionRender: options.isProgressiveActionRender === true,
+          isProduction: options.isProduction,
+          isRscRequest: options.isRscRequest,
+          revalidateSeconds: sourceRevalidateSeconds,
+          scriptNonce: options.scriptNonce,
+        }) &&
+        options.pprRuntime === undefined &&
+        options.resolveRouteStaticEligible(interceptRoute) &&
+        !isNeverStoredPath &&
+        !mayBypassRscCache;
       return options.buildPageElement(
         interceptRoute,
         interceptParams,
@@ -1236,6 +1268,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
           observeMetadataSearchParamsAccess: sourceDynamicConfig !== "force-static",
           observePageSearchParamsAccess: sourceDynamicConfig !== "force-static",
           serveStreamingMetadata: placeGeneratedMetadataInBody,
+          placeStreamedMetadataInHead: isSourceCacheCandidate,
         },
       );
     },
@@ -1320,6 +1353,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
             observeMetadataSearchParamsAccess: !isForceStatic,
             observePageSearchParamsAccess: !isForceStatic,
             serveStreamingMetadata: placeGeneratedMetadataInBody,
+            placeStreamedMetadataInHead,
           },
         );
       },
