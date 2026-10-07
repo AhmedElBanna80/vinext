@@ -48,13 +48,15 @@ const REDIRECT_LOCATION_BASE = "http://vinext.invalid";
  */
 export function getRepeatedSlashRedirectLocation(rawUrl: string): string | null {
   if (!rawUrl.startsWith("/")) return null;
-  const queryIndex = rawUrl.indexOf("?");
-  const pathname = queryIndex === -1 ? rawUrl : rawUrl.slice(0, queryIndex);
+  const urlParts = rawUrl.split("?");
+  const pathname = urlParts[0];
   if (!REPEATED_SLASH_OR_BACKSLASH_RE.test(pathname)) return null;
 
-  const query = queryIndex === -1 ? "" : rawUrl.slice(queryIndex + 1);
+  // Same as Next.js: the query is kept only when its first `?`-separated part
+  // is non-empty, so `//??next=1` redirects to `/`.
   const cleanUrl =
-    pathname.replaceAll("\\", "/").replace(/\/\/+/g, "/") + (query ? `?${query}` : "");
+    pathname.replaceAll("\\", "/").replace(/\/\/+/g, "/") +
+    (urlParts[1] ? `?${urlParts.slice(1).join("?")}` : "");
   const parsed = new URL(REDIRECT_LOCATION_BASE + cleanUrl);
   const location = parsed.pathname + parsed.search + parsed.hash;
   return isOpenRedirectShaped(location) ? null : location;
