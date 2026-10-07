@@ -1,7 +1,7 @@
 import MagicString from "magic-string";
 import { readFile } from "node:fs/promises";
 import path from "pathslash";
-import { createIdResolver, parseAst, type ESTree, type Plugin } from "vite";
+import { createIdResolver, parseAst, type ESTree, type Plugin, type ResolvedConfig } from "vite";
 import {
   collectBindingNames,
   forEachAstChild,
@@ -157,6 +157,26 @@ function collectLiteralRequires(code: string, id: string): LiteralRequire[] {
   return requires;
 }
 
+type BundlerExternal = NonNullable<ResolvedConfig["build"]["rolldownOptions"]>["external"];
+
+// Mirror the bundler's check of an import against `external`.
+function isBundlerExternal(
+  external: BundlerExternal,
+  id: string,
+  importer: string,
+  isResolved: boolean,
+): boolean {
+  if (typeof external === "function") return Boolean(external(id, importer, isResolved));
+  const patterns = Array.isArray(external) ? external : [external];
+  return patterns.some((pattern) => {
+    if (typeof pattern === "string") return pattern === id;
+    if (!(pattern instanceof RegExp)) return false;
+    // Global and sticky patterns keep state between test() calls.
+    pattern.lastIndex = 0;
+    return pattern.test(id);
+  });
+}
+
 /**
  * Resolve literal package `require()` calls while Vite still knows they are
  * CommonJS references. `vite-plugin-commonjs` subsequently hoists each call
@@ -198,9 +218,8 @@ export function createRequireConditionResolutionPlugin(
       // emits for it is later resolved with the `import` condition by the next
       // bundler or Node's ESM loader, so resolve to the real file here and
       // bundle the `require` target, as Next.js does for server dependencies.
-      // Packages listed in `resolve.external` still take precedence; the
-      // bundler-level `build.rolldownOptions.external` is not consulted, as in
-      // `noExternal: true` environments (Node, Workers) before this.
+      // Packages listed in `resolve.external` or matched by the bundler's
+      // `external` option still take precedence.
       bundlingResolvers = {
         require: createResolver(config, { isRequire: true, noExternal: true }),
         import: createResolver(config, { isRequire: false, noExternal: true }),
@@ -251,6 +270,7 @@ export function createRequireConditionResolutionPlugin(
         const resolvers =
           this.environment.config.resolve.external === true ? defaultResolvers : bundlingResolvers;
         if (requires.length === 0 || !resolvers) return null;
+        const bundlerExternal = this.environment.config.build.rolldownOptions?.external;
 
         const output = new MagicString(code);
         let changed = false;
@@ -276,6 +296,28 @@ export function createRequireConditionResolutionPlugin(
 
           const moduleType = syntheticModuleType(requirePath);
           const virtualId = `${requirePath}.vinext-require.${moduleType}`;
+          // Leave the call alone when the bundler would externalize it, either
+          // as written (the bare specifier, then the `import` target of the
+          // hoisted import) or as rewritten (the synthetic id, which would be
+          // emitted as an import of a file that does not exist, or the
+          // `require` target). Unrewritten, the external still applies.
+          const candidates: [string | undefined, boolean][] = [
+            [specifier, false],
+            [importPath, true],
+            [virtualId, false],
+            [virtualId, true],
+            [requirePath, true],
+          ];
+          if (
+            bundlerExternal !== undefined &&
+            candidates.some(
+              ([candidate, isResolved]) =>
+                candidate !== undefined &&
+                isBundlerExternal(bundlerExternal, candidate, id, isResolved),
+            )
+          ) {
+            continue;
+          }
           virtualTargets.set(virtualId, { file: requirePath, moduleType });
           output.overwrite(argument.start, argument.end, JSON.stringify(virtualId));
           changed = true;
