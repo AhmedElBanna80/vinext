@@ -9,6 +9,7 @@ import {
   createPathMatcher,
   globFiles,
   isTranslatedExactly,
+  matchesWholeName,
 } from "../packages/vinext/src/build/trace-glob.js";
 
 // Next.js expands outputFileTracingIncludes with its compiled node-glob and
@@ -345,44 +346,94 @@ describe("createContainsMatcher", () => {
 });
 
 describe("isTranslatedExactly", () => {
-  it("flags the shapes the picomatch translation does not cover", () => {
-    expect(isTranslatedExactly("/[[:alpha:]]pp")).toBe(false);
-    expect(isTranslatedExactly("@(a/b)")).toBe(false);
-    expect(isTranslatedExactly("@([)]/a)")).toBe(false);
-    expect(isTranslatedExactly("+(a|@(b/c))")).toBe(false);
-    expect(isTranslatedExactly("a[/]b")).toBe(false);
-    expect(isTranslatedExactly("!(/app)")).toBe(false);
-    expect(isTranslatedExactly("(a/b)")).toBe(false);
-    // picomatch passes these through as regex syntax.
-    expect(isTranslatedExactly("[ab]+")).toBe(false);
-    expect(isTranslatedExactly("a{b,c}+")).toBe(false);
-    expect(isTranslatedExactly("@(a+)")).toBe(false);
-    expect(isTranslatedExactly("(a|b+)")).toBe(false);
-    expect(isTranslatedExactly("(?a)")).toBe(false);
-    expect(isTranslatedExactly("@(?a)")).toBe(false);
-    expect(isTranslatedExactly("a)+")).toBe(false);
-    expect(isTranslatedExactly("x)?")).toBe(false);
-    expect(isTranslatedExactly("a(b|c")).toBe(false);
-    // Braces inside an extglob, globstars inside a segment, escaped `/`.
-    expect(isTranslatedExactly("/app/!({api,admin})")).toBe(false);
-    expect(isTranslatedExactly("/app/+({foo,bar})/x")).toBe(false);
-    expect(isTranslatedExactly("/root/**@(a|b)/file")).toBe(false);
-    expect(isTranslatedExactly("/root/**{a,b}/file")).toBe(false);
-    expect(isTranslatedExactly("/root/**@(a)**")).toBe(false);
-    expect(isTranslatedExactly("/app/a\\/b")).toBe(false);
-    expect(isTranslatedExactly("/**(a)")).toBe(true);
-    expect(isTranslatedExactly("/app/{foo,@(bar|x)}")).toBe(true);
-    expect(isTranslatedExactly("/app/a\\*b")).toBe(true);
-    expect(isTranslatedExactly("/app/@(foo|bar)?")).toBe(true);
-    expect(isTranslatedExactly("/app/(api)")).toBe(true);
-    expect(isTranslatedExactly("(a|b)+")).toBe(true);
-    expect(isTranslatedExactly("@(a|(b)+)")).toBe(true);
-    expect(isTranslatedExactly("@(+a)")).toBe(true);
-    expect(isTranslatedExactly("/app/[^-a]*")).toBe(true);
-    expect(isTranslatedExactly("/app/**/!(foo)")).toBe(true);
-    expect(isTranslatedExactly("/app/@(a|b)/c")).toBe(true);
-    expect(isTranslatedExactly("/app/[id]/x")).toBe(true);
-    expect(isTranslatedExactly("!foo")).toBe(true);
+  it.each([
+    "*",
+    "**",
+    "/*",
+    "/**",
+    "next-*",
+    "*-server",
+    "next-server",
+    "{next-server,x}",
+    "!foo",
+    "!next-server",
+    "?ext-server",
+    "/app",
+  ])("matches picomatch's whole-name test of next-server for key %s", (key) => {
+    expect(matchesWholeName(key, "next-server")).toBe(picomatch(key, {})("next-server"));
+  });
+
+  it.each([
+    "/",
+    "*",
+    "/api/*",
+    "/api/**",
+    "/app/**/!(foo)",
+    "/app/[id]/x",
+    "/api/login/[[...slug]]",
+    "/{api,docs}/*",
+    "node_modules/@swc/core-{darwin,linux}-*/*.node",
+    "./node_modules/pkg/**",
+    "/app/@(foo|bar)?",
+    "/app/(api)",
+    "(a|b)+",
+    "@(a|(b)+)",
+    "!(!(a))",
+    "/app/[^-a]*",
+    "/app/a\\*b",
+    "!foo",
+    "a,b",
+    "a+b",
+  ])("accepts %s", (pattern) => {
+    expect(isTranslatedExactly(pattern)).toBe(true);
+  });
+
+  it.each([
+    // POSIX classes, and `/` inside classes, groups or escapes.
+    "/[[:alpha:]]pp",
+    "a[/]b",
+    "@(a/b)",
+    "@([)]/a)",
+    "+(a|@(b/c))",
+    "!(/app)",
+    "(a/b)",
+    "/app/a\\/b",
+    // Regex syntax picomatch passes through.
+    "[ab]+",
+    "/api/[a\\]]+",
+    "a{b,c}+",
+    "@(a+)",
+    "@(+a)",
+    "(a|b+)",
+    "(?a)",
+    "@(?a)",
+    "a)+",
+    "x)?",
+    "a(b|c",
+    "/api/foo|/api/bar",
+    "a++",
+    // Globstars inside a segment, group or brace.
+    "/**(a)",
+    "!(**)",
+    "/root/**@(a|b)/file",
+    "/root/**{a,b}/file",
+    "/root/**@(a)**",
+    // Brace options that do not expand like picomatch.
+    "/app/!({api,admin})",
+    "/app/+({foo,bar})/x",
+    "/app/{foo,@(bar|x)}",
+    "/work/project/{a,!(b)}",
+    "/work/project/{,}/a",
+    "node_modules/pkg{,-other}/**",
+    "{a,*}",
+    "{1..3}",
+    // A trailing `/`, unterminated syntax and unmatched `}`.
+    "/app/",
+    "/app/[ab",
+    "{a,b",
+    "a}",
+  ])("rejects %s", (pattern) => {
+    expect(isTranslatedExactly(pattern)).toBe(false);
   });
 });
 
@@ -436,5 +487,67 @@ describe("createPathMatcher", () => {
     const matches = createPathMatcher(projectRoot, ["data/**"]);
     expect(matches(`${projectRoot}/data/a.txt`)).toBe(true);
     expect(matches("/work/app (copy)/i/data/a.txt")).toBe(false);
+  });
+});
+
+describe("isTranslatedExactly grammar", () => {
+  // Every pattern the allowlist accepts must match like picomatch. Patterns
+  // are generated from a fixed seed, so failures reproduce.
+  // Space-separated, so tokens and values contain no spaces.
+  const tokens = [
+    "a b ab / / * ** ? . - , ! @ + ./ \\* \\( \\] | ) ( } ] [ {",
+    "[ab] [^a] [a-c] [^-a] [!a] []a] {a,b} {,a} {a..c} {a} {a,*} {*.b,a} {a,?} {a.b,c} {a,b}+",
+    "@(a|b) !(a) +(a) *(a|b) ?(a) (a|b) (a|) !(a|!(b)) !(*) @(a|*) (a|b)+ @(a)? *(a)? !(*a) a?b",
+  ].flatMap((group) => group.split(" "));
+  const values = [
+    "",
+    ..."/ a b ab ba aa abc a/b ab/ba /a /b /ab /c /a/ /a/b /a/b/c /b/a /aa/bb".split(" "),
+    ..."/a-b /a.b /a,b /(a) /a*b /* /- /a|b /{a} /a] /a} /a+ /!a /@a".split(" "),
+  ];
+  // mulberry32
+  let seed = 1;
+  const random = (limit: number) => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let value = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value;
+    return ((value ^ (value >>> 14)) >>> 0) % limit;
+  };
+  const patterns = new Set<string>();
+  while (patterns.size < 5000) {
+    let pattern = random(2) === 0 ? "/" : "";
+    const count = 1 + random(7);
+    for (let index = 0; index < count; index++) pattern += tokens[random(tokens.length)];
+    patterns.add(pattern);
+  }
+  const exact = [...patterns].filter((pattern) => isTranslatedExactly(pattern));
+
+  it("accepts a meaningful share of the generated patterns", () => {
+    expect(exact.length).toBeGreaterThan(500);
+  });
+
+  it("matches picomatch for every accepted route key", () => {
+    const mismatches: string[] = [];
+    for (const pattern of exact) {
+      const expected = picomatch(pattern, { dot: true, contains: true });
+      const actual = createContainsMatcher(pattern);
+      for (const value of values) {
+        if (actual(value) !== expected(value)) mismatches.push(`${pattern} ${value}`);
+      }
+    }
+    expect(mismatches).toEqual([]);
+  });
+
+  it("matches picomatch for every accepted exclude", () => {
+    const base = "/r";
+    const mismatches: string[] = [];
+    for (const pattern of exact) {
+      const expected = picomatch(path.join(base, pattern), { dot: true, contains: true });
+      const actual = createPathMatcher(base, [pattern]);
+      for (const value of values) {
+        const file = `${base}${value}`;
+        if (actual(file) !== expected(file)) mismatches.push(`${pattern} ${file}`);
+      }
+    }
+    expect(mismatches).toEqual([]);
   });
 });

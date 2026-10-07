@@ -12,6 +12,7 @@ import {
   createPathMatcher,
   globFiles,
   isTranslatedExactly,
+  matchesWholeName,
 } from "./trace-glob.js";
 
 /**
@@ -40,7 +41,10 @@ import {
  * - an included file ships when some route includes it and none of that
  *   route's excludes match it;
  * - a file Nitro traced is dropped only when the excludes of every route match
- *   it, because the shared trace cannot be attributed to individual routes.
+ *   it, because the shared trace cannot be attributed to individual routes,
+ *   and so do the excludes of a key matching `next-server`, because the trace
+ *   also holds the server's own dependencies (Next.js's separate
+ *   `next-server` trace).
  *
  * Next.js's Turbopack build does not apply excludes to included files; this
  * follows the webpack build, which does. Edge runtime routes are matched like
@@ -165,9 +169,15 @@ function appEntryKey(file: string, matcher: ValidFileMatcher): string {
   return `/${matcher.stripExtension(file)}`.replace(/%5F/g, "_");
 }
 
+/**
+ * Whether `pages` has `_app`, `_document` or `_error`, which Next.js reads from
+ * `<name>.<ext>` or `<name>/index.<ext>` (`getPageFromPath`).
+ */
 function hasReservedPagesFile(pagesDir: string, matcher: ValidFileMatcher): boolean {
-  return ["_app", "_document", "_error"].some((name) =>
-    matcher.extensions.some((ext) => fs.existsSync(path.join(pagesDir, `${name}.${ext}`))),
+  return ["_app", "_document", "_error"].some(
+    (name) =>
+      findFileWithExtensions(path.join(pagesDir, name), matcher) ||
+      findFileWithExtensions(path.join(pagesDir, name, "index"), matcher),
   );
 }
 
@@ -344,10 +354,24 @@ function selectFiles(options: NitroTraceIncludesOptions): TraceSelection {
     }
   }
 
+  // Next.js keeps the server's own trace (`next-server.js.nft.json`) apart
+  // and applies only the excludes of keys matching `next-server` to it
+  // (`picomatch(key)('next-server')`). Nitro's trace also holds what the
+  // server and its runtime need, so the server is one more owner of each
+  // traced file.
+  const serverExcludes = exactExcludes([
+    ...new Set(
+      Object.keys(excludes)
+        .filter((key) => isTranslatedExactly(key) && matchesWholeName(key, "next-server"))
+        .flatMap((key) => excludes[key]),
+    ),
+  ]);
+  const serverMatchers = roots.map((base) => createPathMatcher(base, serverExcludes));
+  routeExcludes.push((file) => serverMatchers.some((matches) => matches(file)));
+
   return {
     included,
     isTracedFileExcluded: (file, linked) =>
-      routeExcludes.length > 0 &&
       routeExcludes.every(
         (isExcluded) => isExcluded(file) || (linked !== null && isExcluded(linked)),
       ),
@@ -475,7 +499,6 @@ export function createNitroTraceIncludes(
     applied = true;
     pendingCopies = new Map();
     const { included, isTracedFileExcluded } = selectFiles(options);
-    removeExcludedTracedFiles(tracedPackages, options.root, isTracedFileExcluded);
 
     const { packages, outsideNodeModules } = groupByPackage(included);
     if (outsideNodeModules > 0) {
@@ -527,6 +550,9 @@ export function createNitroTraceIncludes(
       }
       otherCopies.push(pkg.path);
     }
+    // Like Next.js, excludes apply to the traced files plus the includes, so
+    // a version whose traced files are all excluded keeps its included files.
+    removeExcludedTracedFiles(tracedPackages, options.root, isTracedFileExcluded);
     if (otherCopies.length > 0) {
       warn(
         `[vinext] outputFileTracingIncludes matched files in ${otherCopies.join(", ")}, ` +

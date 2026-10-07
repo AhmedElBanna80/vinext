@@ -289,59 +289,180 @@ function toRegExp(source: string, literal: string): RegExp {
   }
 }
 
+// Characters with a meaning in the grammar `isTranslatedExactly` accepts; any
+// other character is a literal.
+const GRAMMAR_CHARS = "\\*?+@![](){}|/";
+
 /**
  * Whether {@link createContainsMatcher} and {@link createPathMatcher} match a
- * pattern exactly like picomatch. Path segments are translated one at a time
- * and braces are expanded first, so these are not:
+ * pattern exactly like picomatch. This is an allowlist: the pattern may only
+ * use the grammar below, which `tests/trace-glob.test.ts` checks against
+ * picomatch. Anything else fails safe in the caller.
  *
- * - POSIX classes (`[[:alpha:]]`), and extglobs, groups or classes containing
- *   a `/` (`@(a/b)`, `a[/]b`), or an escaped `/` (`a\/b`).
- * - Braces inside an extglob or group (`!({a,b})`).
- * - A run of stars that picomatch reads as a globstar inside a segment: one
- *   before `@(` or `{` (`**@(a|b)`), or after `)` or `}` (`@(a)**`).
- * - The shapes where picomatch passes regex syntax through: a `+` after a
- *   class or brace (`[ab]+`) or inside a group (`@(a+)`), a `?` starting a
- *   group (`(?a)`), a `?` or `+` after an unmatched `)`, and an unterminated
- *   `(`.
+ * - literal characters (including an unmatched `]` or `}`), and backslash
+ *   escapes other than `\/`;
+ * - `*` and `?`, and `**` as a whole path segment outside braces and groups;
+ * - classes (`[ab]`, `[^a-c]`) without escapes, `/` or POSIX classes, not
+ *   followed by `+`;
+ * - `(...)` groups and `@()`, `?()`, `+()`, `*()` and `!()` extglobs, nested
+ *   or not, whose alternatives use this grammar without `/`, braces, `+` or a
+ *   leading `?`, optionally followed by one `?` or `+` quantifier;
+ * - top-level brace lists and ranges (`{a,b}`, `{1..3}`) whose options use
+ *   this grammar without `/`, groups, braces or `+`, are not `.` or `..`, and
+ *   are not empty when the braces fill a whole path segment; not followed by
+ *   `+`.
  */
 export function isTranslatedExactly(pattern: string): boolean {
-  if (/\[:[a-z]+:\]/.test(pattern)) return false;
-  if (/\*\*+(?:@\(|\{)|[)}]\*\*/.test(pattern)) return false;
-  let depth = 0;
-  for (let index = 0; index < pattern.length; index++) {
-    const char = pattern[index];
-    const next = pattern[index + 1];
-    if (char === "\\") {
-      if (next === "/") return false;
-      index++;
-    } else if (char === "{" && depth > 0) {
-      return false;
-    } else if (char === "[") {
-      const close = pattern.indexOf("]", index + 2);
-      if (close !== -1) {
-        if (pattern.slice(index, close).includes("/")) return false;
-        if (pattern[close + 1] === "+") return false;
-        index = close;
+  let index = 0;
+  const isBoundary = (at: number) => at < 0 || at >= pattern.length || pattern[at] === "/";
+
+  const parseClass = (): boolean => {
+    let at = index + 1;
+    if (pattern[at] === "^") at++;
+    for (let first = true; at < pattern.length; at++, first = false) {
+      const char = pattern[at];
+      if (
+        char === "\\" ||
+        char === "/" ||
+        char === "{" ||
+        char === "}" ||
+        (char === "[" && pattern[at + 1] === ":")
+      ) {
+        return false;
       }
-    } else if (char === "}" && next === "+") {
-      return false;
-    } else if ("@?+*!".includes(char) && next === "(") {
-      if (pattern[index + 2] === "?") return false;
-      depth++;
+      if (char === "]" && !first) {
+        index = at + 1;
+        return pattern[index] !== "+";
+      }
+    }
+    return false;
+  };
+
+  const parseGroup = (start: number): boolean => {
+    index = start;
+    for (;;) {
+      if (pattern[index] === "?") return false;
+      if (!parseSequence("group")) return false;
+      if (pattern[index] === "|") {
+        index++;
+        continue;
+      }
+      if (pattern[index] !== ")") return false;
       index++;
-    } else if (char === "(") {
-      if (next === "?") return false;
-      depth++;
-    } else if (char === ")") {
-      if (depth === 0 && (next === "?" || next === "+")) return false;
-      if (depth > 0) depth--;
-    } else if (char === "+" && depth > 0 && !"()".includes(pattern[index - 1])) {
-      return false;
-    } else if (char === "/" && depth > 0) {
-      return false;
+      break;
+    }
+    if ((pattern[index] === "?" || pattern[index] === "+") && pattern[index + 1] !== "(") index++;
+    return true;
+  };
+
+  const parseBraces = (): boolean => {
+    index++;
+    for (;;) {
+      const start = index;
+      if (!parseSequence("brace")) return false;
+      // Expansion would join an option with its neighbours into new tokens
+      // (`?{,a}(b)`, `@(a){?,b}`), and `path.join` would normalize a `.`
+      // option. picomatch also reads text around ranges (`{a..c}`) differently.
+      const option = pattern.slice(start, index);
+      if (option === "" || option === "." || option.includes("..") || /[*?+@!]/.test(option)) {
+        return false;
+      }
+      if (pattern[index] === ",") {
+        index++;
+        continue;
+      }
+      if (pattern[index] !== "}") return false;
+      index++;
+      return pattern[index] !== "+";
+    }
+  };
+
+  function parseSequence(context: "top" | "group" | "brace"): boolean {
+    while (index < pattern.length) {
+      const char = pattern[index];
+      const next = pattern[index + 1];
+      if (context === "group" && (char === "|" || char === ")")) return true;
+      if (context === "brace" && (char === "," || char === "}")) return true;
+      if (!GRAMMAR_CHARS.includes(char) || char === "?" || char === "@" || char === "!") {
+        if ("?@!".includes(char) && next === "(") {
+          if (context === "brace" || !parseGroup(index + 2)) return false;
+        } else {
+          index++;
+        }
+      } else if (char === "\\") {
+        if (next === undefined || next === "/") return false;
+        index += 2;
+      } else if (char === "(" || ((char === "*" || char === "+") && next === "(")) {
+        if (context === "brace" || !parseGroup(index + (char === "(" ? 1 : 2))) return false;
+      } else if (char === "*") {
+        let end = index;
+        while (pattern[end] === "*") end++;
+        // A run of stars only reads as a globstar where it fills a segment.
+        const isGlobstar = context === "top" && isBoundary(index - 1) && isBoundary(end);
+        if (end - index > 1 && !isGlobstar) return false;
+        index = end;
+      } else if (char === "+") {
+        // picomatch keeps `+` as a quantifier after a class, brace or group,
+        // and inside a group.
+        const previous = pattern[index - 1];
+        if (context !== "top" || (GRAMMAR_CHARS.includes(previous ?? "/") && previous !== "/")) {
+          return false;
+        }
+        index++;
+      } else if (char === "[") {
+        if (!parseClass()) return false;
+      } else if (char === "{") {
+        if (context !== "top" || !parseBraces()) return false;
+      } else if (char === "/") {
+        if (context !== "top") return false;
+        index++;
+      } else if (char === "]") {
+        index++;
+      } else {
+        // An unmatched `)`, `}` or `|`.
+        return false;
+      }
+    }
+    return context === "top";
+  }
+
+  // picomatch treats a trailing `/` specially.
+  if (pattern.length > 1 && pattern.endsWith("/")) return false;
+  return parseSequence("top");
+}
+
+/**
+ * Whether `picomatch(pattern)` (default options) matches all of `name`. Only
+ * for names without `/` or a leading `.`, such as `next-server`, where those
+ * options make no difference.
+ */
+export function matchesWholeName(pattern: string, name: string): boolean {
+  if (name === pattern) return true;
+  const { negated, expansions } = parseNegation(pattern);
+  const matches = expansions.some((expanded) =>
+    toRegExp(`^(?:${containsSource(expanded, true)})$`, expanded).test(name),
+  );
+  return matches !== negated;
+}
+
+/**
+ * Leading `!`s (not starting a `!()` extglob) negate a picomatch pattern, and
+ * picomatch drops leading `./` prefixes.
+ */
+function parseNegation(pattern: string): { negated: boolean; expansions: string[] } {
+  let negated = false;
+  let body = pattern;
+  for (;;) {
+    if (body.startsWith("./")) {
+      body = body.slice(2);
+    } else if (body.startsWith("!") && (body[1] !== "(" || body[2] === "?")) {
+      negated = !negated;
+      body = body.slice(1);
+    } else {
+      break;
     }
   }
-  return depth === 0;
+  return { negated, expansions: expandBraces(body) };
 }
 
 /**
@@ -349,23 +470,18 @@ export function isTranslatedExactly(pattern: string): boolean {
  * `picomatch(pattern, { dot: true, contains: true })`.
  */
 export function createContainsMatcher(pattern: string): (value: string) => boolean {
-  // Leading `!`s (not starting a `!()` extglob) negate the pattern; picomatch
-  // then only rejects values the pattern matches at their start.
-  let negated = false;
-  let body = pattern;
-  while (body.startsWith("!") && (body[1] !== "(" || body[2] === "?")) {
-    negated = !negated;
-    body = body.slice(1);
-  }
-  const expansions = expandBraces(body);
+  const { negated, expansions } = parseNegation(pattern);
   if (negated) {
+    // picomatch then only rejects values the pattern matches at their start.
     const sources = expansions.map((expanded) => containsSource(expanded, true));
     const regex = toRegExp(`^(?!(?:${sources.join("|")})).*$`, pattern);
-    return (value) => value === pattern || regex.test(value);
+    return (value) => value !== "" && (value === pattern || regex.test(value));
   }
   const regexes = expansions.map((expanded) => toRegExp(containsSource(expanded, true), expanded));
   // picomatch also matches a value equal to the pattern itself.
-  return (value) => value === pattern || regexes.some((regex) => regex.test(value));
+  // picomatch never matches an empty value.
+  return (value) =>
+    value !== "" && (value === pattern || regexes.some((regex) => regex.test(value)));
 }
 
 /**

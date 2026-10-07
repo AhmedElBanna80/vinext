@@ -135,7 +135,9 @@ describe("Nitro outputFileTracingIncludes", () => {
     "/no-such-route": ["./node_modules/unmatched/**"],
   },
   outputFileTracingExcludes: {
-    "/": ["./node_modules/data-pkg/data/skip.txt", "./node_modules/data-pkg/optional.js"],
+    "/": ["./node_modules/data-pkg/data/skip.txt"],
+    // Also matches next-server, so it applies to the server trace too.
+    "*": ["./node_modules/data-pkg/optional.js"],
     "/api/foo": ["./node_modules/api-only/lib/skip.js", "./node_modules/data-pkg/extra.js"],
   },
 };`,
@@ -439,6 +441,27 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
     }
   });
 
+  it("names the built-in routes when the only pages file is a reserved index page", async () => {
+    const { collectTraceRouteNames } =
+      await import("../packages/vinext/src/build/nitro-trace-includes.js");
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-reserved-"));
+    try {
+      const page = "export default function Page() { return null; }";
+      await writeFiles(root, { "app/page.tsx": page, "pages/_app/index.tsx": page });
+      const names = await collectTraceRouteNames({
+        appDir: path.join(root, "app"),
+        pagesDir: path.join(root, "pages"),
+        pageExtensions: ["tsx", "ts", "jsx", "js"],
+      });
+      // `getPageFromPath` reads `_app/index` as `_app`, so this build is hybrid.
+      expect(names.sort()).toEqual(
+        ["/app", "/app/_not-found", "/pages/_app", "/pages/_document", "/pages/_error"].sort(),
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
   it("names the built-in routes of app-only builds", async () => {
     const { collectTraceRouteNames } =
       await import("../packages/vinext/src/build/nitro-trace-includes.js");
@@ -558,7 +581,7 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
         root,
         routes: ["/app"],
         includes: {},
-        excludes: { "/": ["node_modules/@native/core-x/lib/**"] },
+        excludes: { "*": ["node_modules/@native/core-x/lib/**"] },
         warn: () => {},
       })!.tracedPackages(tracedPackages);
       expect(tracedPackages["@native/core-x"].versions["1.0.0"].files).toEqual([
@@ -567,6 +590,96 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
       expect(tracedPackages["@native/core-x"].versions["2.0.0"].files).toEqual([
         path.join(other, "lib/a.js"),
       ]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("keeps traced files the server trace does not exclude", async () => {
+    const { createNitroTraceIncludes } =
+      await import("../packages/vinext/src/build/nitro-trace-includes.js");
+    const root = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-server-")),
+    );
+    try {
+      const dir = path.join(root, "node_modules/traced");
+      const tracedPackages: TracedPackages = {
+        traced: {
+          name: "traced",
+          versions: {
+            "1.0.0": {
+              path: dir,
+              files: ["a.js", "b.js", "c.js"].map((file) => path.join(dir, file)),
+              pkgJSON: { name: "traced", version: "1.0.0" },
+            },
+          },
+        },
+      };
+      createNitroTraceIncludes({
+        root,
+        routes: ["/app"],
+        includes: {},
+        // Next.js applies only keys matching `next-server` to the server's
+        // own trace, which Nitro's trace also holds.
+        excludes: {
+          "/app": ["node_modules/traced/a.js", "node_modules/traced/c.js"],
+          "next-server": ["node_modules/traced/b.js", "node_modules/traced/c.js"],
+        },
+        warn: () => {},
+      })!.tracedPackages(tracedPackages);
+      expect(tracedPackages.traced.versions["1.0.0"].files).toEqual([
+        path.join(dir, "a.js"),
+        path.join(dir, "b.js"),
+      ]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("keeps the included files of a version whose traced files are all excluded", async () => {
+    const { createNitroTraceIncludes } =
+      await import("../packages/vinext/src/build/nitro-trace-includes.js");
+    const root = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-versions-")),
+    );
+    try {
+      await writeFiles(root, {
+        "node_modules/pkg/package.json": pkg("pkg", "1.0.0"),
+        "node_modules/pkg/index.js": "",
+        "node_modules/pkg/data.txt": "",
+        "node_modules/other/node_modules/pkg/package.json": pkg("pkg", "2.0.0"),
+        "node_modules/other/node_modules/pkg/index.js": "",
+      });
+      const top = path.join(root, "node_modules/pkg");
+      const nested = path.join(root, "node_modules/other/node_modules/pkg");
+      const tracedPackages: TracedPackages = {
+        pkg: {
+          name: "pkg",
+          versions: {
+            "1.0.0": {
+              path: top,
+              files: [path.join(top, "index.js")],
+              pkgJSON: { name: "pkg", version: "1.0.0" },
+            },
+            "2.0.0": {
+              path: nested,
+              files: [path.join(nested, "index.js")],
+              pkgJSON: { name: "pkg", version: "2.0.0" },
+            },
+          },
+        },
+      };
+      const warnings: string[] = [];
+      createNitroTraceIncludes({
+        root,
+        routes: ["/app"],
+        includes: { "*": ["node_modules/pkg/data.txt"] },
+        excludes: { "*": ["node_modules/pkg/index.js"] },
+        warn: (message) => warnings.push(message),
+      })!.tracedPackages(tracedPackages);
+      expect(tracedPackages.pkg.versions["1.0.0"].files).toEqual([path.join(top, "data.txt")]);
+      expect(tracedPackages.pkg.versions["2.0.0"].files).toEqual([path.join(nested, "index.js")]);
+      expect(warnings).toEqual([]);
     } finally {
       await fs.rm(root, { recursive: true, force: true }).catch(() => {});
     }
