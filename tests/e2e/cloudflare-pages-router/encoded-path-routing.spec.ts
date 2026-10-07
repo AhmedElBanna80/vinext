@@ -92,7 +92,7 @@ test("redirects repeated slashes and backslashes like Next.js on Workers", async
       location,
     });
   }
-  for (const path of ["/%2F", "/%5C", "/%2F/evil.com"]) {
+  for (const path of ["/%2F", "/%5C", "/%2F/evil.com", "/.//%2Fevil.com"]) {
     expect({ path, status: (await getRawPath(path)).status }).toEqual({ path, status: 404 });
   }
 });

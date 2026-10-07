@@ -41,8 +41,8 @@ import { registerPrerenderCloudflareLoader } from "../build/prerender-cloudflare
 import {
   canonicalizeRequestPathname,
   filterInternalHeaders,
-  getRepeatedSlashRedirectLocation,
   isOpenRedirectShaped,
+  sendRepeatedSlashRedirect,
 } from "./request-pipeline.js";
 import { notFoundResponse } from "./http-error-responses.js";
 import {
@@ -1258,18 +1258,6 @@ async function sendWebResponse(
       });
     });
   }
-}
-
-/**
- * Send Next.js's 308 for a raw request target containing a backslash or a
- * repeated slash. Returns true when the response was sent.
- */
-function sendRepeatedSlashRedirect(rawUrl: string, res: ServerResponse): boolean {
-  const location = getRepeatedSlashRedirectLocation(rawUrl);
-  if (location === null) return false;
-  res.writeHead(308, { Location: location, Refresh: `0;url=${location}` });
-  res.end(location);
-  return true;
 }
 
 function waitForNodeResponseCompletion(res: ServerResponse): Promise<void> {

@@ -10,7 +10,11 @@ import {
 import { isOpenRedirectShaped, repeatedSlashRedirectResponse } from "./open-redirect.js";
 import { createStaticFileSignal, type StaticFileSignalContext } from "./static-file-signal.js";
 
-export { getRepeatedSlashRedirectLocation, isOpenRedirectShaped } from "./open-redirect.js";
+export {
+  getRepeatedSlashRedirect,
+  isOpenRedirectShaped,
+  sendRepeatedSlashRedirect,
+} from "./open-redirect.js";
 export { createStaticFileSignal };
 
 const PATHNAME_CANONICALIZATION_BASE = new URL("http://vinext.invalid/");
@@ -65,7 +69,7 @@ export function canonicalizeRequestUrlPathname(url: string): string {
  *
  * Like Next.js, any raw path containing a literal backslash or a repeated
  * slash first gets a 308 to the collapsed path (`//evil.com` → `/evil.com`,
- * `//` → `/`); see `getRepeatedSlashRedirectLocation`. We check the RAW
+ * `//` → `/`); see `getRepeatedSlashRedirect`. We check the RAW
  * pathname before normalization so this fires before normalizePath collapses
  * `//`.
  *

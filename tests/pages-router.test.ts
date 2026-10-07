@@ -713,9 +713,9 @@ describe("Pages Router integration", () => {
   it("never turns a same-origin double-slash middleware redirect protocol-relative", async () => {
     const res = await fetch(`${baseUrl}/mw-redirect-double-slash`, { redirect: "manual" });
     expect(res.status).toBe(307);
-    const location = res.headers.get("location") ?? "";
-    expect(location.startsWith("//")).toBe(false);
-    expect(new URL(location, baseUrl).origin).toBe(new URL(baseUrl).origin);
+    // The trailingSlash: false rule strips the redirect target to the root;
+    // it is never relativized to a protocol-relative `//`.
+    expect(res.headers.get("location")).toBe("/");
   });
 
   it("renders the index page with correct HTML", async () => {
@@ -7373,9 +7373,9 @@ describe("Production server middleware (Pages Router)", () => {
   it("never turns a same-origin double-slash middleware redirect protocol-relative", async () => {
     const res = await fetch(`${prodUrl}/mw-redirect-double-slash`, { redirect: "manual" });
     expect(res.status).toBe(307);
-    const location = res.headers.get("location") ?? "";
-    expect(location.startsWith("//")).toBe(false);
-    expect(new URL(location, prodUrl).origin).toBe(new URL(prodUrl).origin);
+    // The trailingSlash: false rule strips the redirect target to the root;
+    // it is never relativized to a protocol-relative `//`.
+    expect(res.headers.get("location")).toBe("/");
   });
 
   it("redirects /old-page to /about via middleware", async () => {

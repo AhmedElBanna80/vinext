@@ -141,10 +141,10 @@ import { normalizePath } from "./server/normalize-path.js";
 import {
   canonicalizeRequestUrlPathname,
   filterInternalHeaders,
-  getRepeatedSlashRedirectLocation,
   INTERNAL_HEADERS,
   isOpenRedirectShaped,
   normalizeTrailingSlash,
+  sendRepeatedSlashRedirect,
   VINEXT_INTERNAL_HEADERS,
 } from "./server/request-pipeline.js";
 import {
@@ -6088,10 +6088,7 @@ export const loadServerActionClient = ${
         // parses it: `new URL("//", base)` throws, and `//host/x` parses as a
         // different origin.
         server.middlewares.use((req, res, next) => {
-          const slashRedirect = getRepeatedSlashRedirectLocation(req.url ?? "/");
-          if (slashRedirect === null) return next();
-          res.writeHead(308, { Location: slashRedirect, Refresh: `0;url=${slashRedirect}` });
-          res.end(slashRedirect);
+          if (!sendRepeatedSlashRedirect(req.url ?? "/", res)) next();
         });
 
         // Match Next.js dev behavior: allow the server to start, then reject

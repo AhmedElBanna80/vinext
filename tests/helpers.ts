@@ -298,6 +298,7 @@ const REPEATED_SLASH_CASES: ReadonlyArray<readonly [string, string | 404]> = [
   ["/%5C", 404],
   ["/%2F/evil.com", 404],
   ["/%5C%5Cevil.com", 404],
+  ["/.//%2Fevil.com", 404],
 ];
 
 /**
