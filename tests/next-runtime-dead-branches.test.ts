@@ -86,6 +86,22 @@ describe("blankDeadNextRuntimeRequireBranches", () => {
     expect(blankDeadNextRuntimeRequireBranches(noRequire, "/app/a.js", "nodejs")).toBeUndefined();
   });
 
+  it("keeps a dead branch that declares a hoisted var or function binding", () => {
+    // Blanking would delete the binding the live code still reads:
+    // `export default impl || "node"` must stay "node", not a ReferenceError.
+    const withVar = `if (process.env.NEXT_RUNTIME === "edge") { var impl = require("./edge"); }\nexport default impl || "node";\n`;
+    expect(blankDeadNextRuntimeRequireBranches(withVar, "/app/a.js", "nodejs")).toBeUndefined();
+    const withFunction = `if (process.env.NEXT_RUNTIME === "edge") { function load() { return require("./edge"); } }\nexport default typeof load;\n`;
+    expect(
+      blankDeadNextRuntimeRequireBranches(withFunction, "/app/a.js", "nodejs"),
+    ).toBeUndefined();
+    // A var scoped to a nested function does not escape the branch, so the
+    // branch is still blanked.
+    const nestedVar = `if (process.env.NEXT_RUNTIME === "edge") { (() => { var x = require("./edge"); })(); }\n`;
+    expect(blankDeadNextRuntimeRequireBranches(nestedVar, "/app/a.js", "nodejs")).not.toContain(
+      "./edge",
+    );
+  });
   it("reads the runtime from an environment define map", () => {
     expect(definedNextRuntime({ "process.env.NEXT_RUNTIME": '"nodejs"' })).toBe("nodejs");
     expect(definedNextRuntime({ "process.env.NEXT_RUNTIME": '""' })).toBe("");

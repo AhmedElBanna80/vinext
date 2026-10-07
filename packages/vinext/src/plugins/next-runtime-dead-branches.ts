@@ -78,6 +78,30 @@ function blank(chars: string[], node: ESTree.Node, kind: "statement" | "expressi
 }
 
 /**
+ * Whether `node` declares a binding that is hoisted out of it: a `var`, or a
+ * function declaration. Blanking such a branch would delete a binding live code
+ * may still read (`if (edge) { var impl = require(x) } export default impl`),
+ * so it is left to Rolldown. Nested functions scope their own `var`s.
+ */
+function declaresHoistedBinding(node: ESTree.Node): boolean {
+  if (node.type === "FunctionDeclaration") return true;
+  if (node.type === "VariableDeclaration" && node.kind === "var") return true;
+  if (
+    node.type === "FunctionExpression" ||
+    node.type === "ArrowFunctionExpression" ||
+    node.type === "ClassDeclaration" ||
+    node.type === "ClassExpression"
+  ) {
+    return false;
+  }
+  let found = false;
+  forEachAstChild(node, (child) => {
+    if (!found && declaresHoistedBinding(child)) found = true;
+  });
+  return found;
+}
+
+/**
  * Remove the bodies of `if` / `?:` branches that are dead under the
  * environment's `process.env.NEXT_RUNTIME` define, when they contain a
  * `require()` call.
@@ -113,7 +137,11 @@ export function blankDeadNextRuntimeRequireBranches(
     if (node.type === "IfStatement" || node.type === "ConditionalExpression") {
       const value = evaluateNextRuntimeTest(node.test, runtime);
       const deadBranch = value === false ? node.consequent : value === true ? node.alternate : null;
-      if (deadBranch && REQUIRE_CALL_PRESCAN.test(code.slice(deadBranch.start, deadBranch.end))) {
+      if (
+        deadBranch &&
+        REQUIRE_CALL_PRESCAN.test(code.slice(deadBranch.start, deadBranch.end)) &&
+        !declaresHoistedBinding(deadBranch)
+      ) {
         dead.push({
           node: deadBranch,
           kind: node.type === "IfStatement" ? "statement" : "expression",
