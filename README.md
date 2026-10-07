@@ -792,7 +792,7 @@ their `env` binding lookups) are instantiated lazily on the first request.
 
 Registration is wired into **every router and runtime** — App Router and Pages Router, on Cloudflare Workers as well as the Node.js server (`vinext start`) and dev. It self-guards (instantiated once per isolate) and is resilient: if an adapter can't initialize on a given runtime (e.g. a KV binding doesn't exist on the Node server), vinext logs a warning and falls back to the default handler instead of failing requests.
 
-To write your own adapter, point a slot at any module by path and default-export a factory that receives `{ env, options }` at runtime and returns a data-cache `CacheHandler` (or a CDN adapter):
+To write your own adapter, point a slot at any module by path. Its default export receives one `{ env, options }` argument at runtime and produces a data-cache `CacheHandler` (or a CDN adapter):
 
 ```ts
 vinext({
@@ -804,6 +804,41 @@ vinext({
   },
 });
 ```
+
+The default export can be a factory or a class:
+
+```ts
+// my-adapter.js: a factory
+export default ({ env, options }) => ({
+  async get(key) {
+    /* … */
+  },
+  async set(key, data) {
+    /* … */
+  },
+  async revalidateTag(tags) {
+    /* … */
+  },
+});
+
+// my-adapter.js: or a class
+export default class MyAdapter {
+  constructor({ env, options }) {
+    /* … */
+  }
+  async get(key) {
+    /* … */
+  }
+  async set(key, data) {
+    /* … */
+  }
+  async revalidateTag(tags) {
+    /* … */
+  }
+}
+```
+
+vinext invokes a constructor with `new`. That covers classes (including transpiled, bound, or Proxy-wrapped ones) and any `function`; a `function` factory that returns an object gives the same result either way. Arrow functions are called. The result must be the adapter itself, not a Promise. A data adapter implements `get`, `set`, and `revalidateTag`; a CDN adapter also implements `buildResponseHeaders`. If the export isn't a function or the result is missing a method, vinext logs a warning naming the slot and what's wrong, then keeps the default handler.
 
 ## What's NOT supported (and won't be)
 

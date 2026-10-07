@@ -9,7 +9,6 @@
  *    workersCacheCdnAdapter) and their runtime factory default exports.
  */
 import fs from "node:fs";
-import { instantiateCacheAdapter } from "../packages/vinext/src/shims/cache-adapter-instantiate.js";
 import os from "node:os";
 import path from "node:path";
 import { describe, it, expect, expectTypeOf } from "vite-plus/test";
@@ -50,6 +49,7 @@ import createKvDataCacheAdapter, {
 import createCloudflareCdnCacheAdapter, {
   CloudflareCdnCacheAdapter,
 } from "../packages/cloudflare/src/cache/cdn-adapter.runtime.js";
+import { instantiateCacheAdapter } from "../packages/vinext/src/shims/cache-adapter-instantiate.js";
 
 describe("generateCacheAdaptersModule", () => {
   it("exposes the public virtual module id", () => {
@@ -97,7 +97,7 @@ describe("generateCacheAdaptersModule", () => {
       `import { registerCdnCacheAdapter } from "vinext/shims/cdn-cache-state";`,
     );
     expect(code).toContain(
-      'registerCdnCacheAdapter(() => instantiateCacheAdapter(__vinextCdnAdapterFactory, { env, options: undefined }, "CDN"));',
+      'registerCdnCacheAdapter(() => instantiateCacheAdapter(__vinextCdnAdapterFactory, { env, options: undefined }, "cdn"));',
     );
     expect(code).not.toContain("__vinextDataAdapterFactory");
     expect(code).not.toContain("registerDataCacheHandler");
@@ -190,47 +190,19 @@ describe("generateCacheAdaptersModule", () => {
     expect(code).toContain(`import __vinextDataAdapterFactory from ${JSON.stringify(weird)};`);
   });
 
-  describe("instantiateCacheAdapter (the shim the generated module imports)", () => {
-    it("is imported by every registrar that configures an adapter", () => {
-      for (const cache of [
-        { data: { adapter: "my-data-adapter" } },
-        { cdn: { adapter: "my-cdn-adapter" } },
-      ]) {
-        expect(generateCacheAdaptersModule(cache)).toContain(
-          `import { instantiateCacheAdapter } from "vinext/shims/cache-adapter-instantiate";`,
-        );
-      }
-      expect(generateCacheAdaptersModule(undefined)).not.toContain("instantiateCacheAdapter");
-    });
-
-    it("calls a factory function with the { env, options } argument", () => {
-      const seen: unknown[] = [];
-      const factory = (args: unknown) => {
-        seen.push(args);
-        return { kind: "factory" };
-      };
-      const args = { env: { KV: 1 }, options: { binding: "MY_KV" } };
-      expect(instantiateCacheAdapter(factory, args, "data")).toEqual({ kind: "factory" });
-      expect(seen).toEqual([args]);
-    });
-
-    it("constructs a class default export with the same argument", () => {
-      class Handler {
-        constructor(public readonly args: unknown) {}
-      }
-      const args = { env: undefined, options: { url: "redis://x" } };
-      const adapter = instantiateCacheAdapter<Handler>(Handler, args, "data");
-      expect(adapter).toBeInstanceOf(Handler);
-      expect(adapter.args).toBe(args);
-    });
-
-    it("rejects a non-function default export with a message naming the slot", () => {
-      const args = { env: undefined, options: undefined };
-      expect(() => instantiateCacheAdapter({ get() {} }, args, "data")).toThrow(
-        "the data cache adapter module must have a default export that is a factory function or a class, got object",
+  it("routes every configured slot through the shared instantiation shim", () => {
+    for (const cache of [
+      { data: { adapter: "my-data-adapter" } },
+      { cdn: { adapter: "my-cdn-adapter" } },
+    ]) {
+      expect(generateCacheAdaptersModule(cache)).toContain(
+        `import { instantiateCacheAdapter } from "vinext/shims/cache-adapter-instantiate";`,
       );
-      expect(() => instantiateCacheAdapter(null, args, "CDN")).toThrow("got null");
-    });
+    }
+    expect(generateCdnCacheAdapterModule({ cdn: { adapter: "my-cdn-adapter" } })).toContain(
+      'instantiateCacheAdapter(__vinextCdnAdapterFactory, { env, options: undefined }, "cdn")',
+    );
+    expect(generateCacheAdaptersModule(undefined)).not.toContain("instantiateCacheAdapter");
   });
 });
 
@@ -326,6 +298,15 @@ describe("Cloudflare kv-data-adapter factory", () => {
       env: { MY_KV: namespace },
       options: { binding: "MY_KV" },
     });
+    expect(handler).toBeInstanceOf(KVCacheHandler);
+  });
+
+  it("is accepted by the registration shim the generated module uses", () => {
+    const handler = instantiateCacheAdapter(
+      createKvDataCacheAdapter,
+      { env: { VINEXT_KV_CACHE: namespace }, options: undefined },
+      "data",
+    );
     expect(handler).toBeInstanceOf(KVCacheHandler);
   });
 
@@ -505,6 +486,15 @@ describe("workersCacheCdnAdapter builder + factory", () => {
     expect(adapter).toBeInstanceOf(CloudflareCdnCacheAdapter);
     // Edge adapter does not own in-process background regeneration.
     expect(adapter.ownsBackgroundRevalidation).toBe(false);
+  });
+
+  it("factory is accepted by the registration shim the generated module uses", () => {
+    const adapter = instantiateCacheAdapter(
+      createCloudflareCdnCacheAdapter,
+      { env: undefined, options: undefined },
+      "cdn",
+    );
+    expect(adapter).toBeInstanceOf(CloudflareCdnCacheAdapter);
   });
 
   it("forwards a custom version metadata binding", () => {

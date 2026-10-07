@@ -90,8 +90,11 @@ export type CacheAdapterBuildOutput = {
 export type CacheAdapterDescriptor<O extends Record<string, unknown> = Record<string, unknown>> = {
   /**
    * Module specifier (or absolute path, e.g. from `require.resolve(...)`) whose
-   * default export is a cache adapter factory `({ env, options }) => adapter`,
-   * or a class constructed with that same `{ env, options }` argument.
+   * default export creates the adapter from one `{ env, options }` argument:
+   * either a factory `({ env, options }) => adapter` or a class
+   * `new Adapter({ env, options })`. A constructor (any class, or a `function`
+   * declaration) is invoked with `new`; an arrow function is called. The result
+   * must be the adapter object itself, not a Promise.
    */
   adapter: string;
   /** JSON-serializable options forwarded to the factory at runtime. */
@@ -336,7 +339,7 @@ export function generateCacheAdaptersModule(cache?: VinextCacheConfig): string {
       `    registerCdnCacheAdapter(() => instantiateCacheAdapter(__vinextCdnAdapterFactory, { env, options: ${inlineOptions(
         cdn.adapter,
         cdn.options,
-      )} }, "CDN"));`,
+      )} }, "cdn"));`,
       "  } catch (error) {",
       '    console.warn("[vinext] failed to initialize the configured CDN cache adapter; ' +
         'using the default adapter.\\n" + __vinextFormatAdapterError(error));',
