@@ -469,6 +469,35 @@ describe("vinext:require-condition-resolution", () => {
     });
   });
 
+  it("keeps server external packages such as native addons external", async () => {
+    await withConditionalPackage(async (root) => {
+      const packageDir = path.join(root, "node_modules", "lib-cjs");
+      await writeFile(path.join(packageDir, "binding.node"), "not a JavaScript module");
+      await writeFile(
+        path.join(packageDir, "index.js"),
+        `module.exports = require("./binding.node");\n`,
+      );
+
+      let page: string | undefined;
+      const builder = await createBuilder({
+        root,
+        configFile: false,
+        logLevel: "silent",
+        build: { ssr: "page.js", write: false },
+        plugins: [
+          createRequireConditionResolutionPlugin(
+            createIdResolver,
+            () => undefined,
+            () => ["lib-cjs"],
+          ),
+          recordPage((code) => (page = code)),
+        ],
+      });
+      await builder.build(builder.environments.ssr);
+      expectRewritten(root, page, false);
+    });
+  });
+
   it("keeps rewriting in environments that already bundle every package", async () => {
     await withConditionalPackage(async (root) => {
       let page: string | undefined;

@@ -22,6 +22,7 @@ import {
   type AstScope,
 } from "./ast-scope.js";
 import { magicStringTransformResult } from "./transform-result.js";
+import { packageNameFromSpecifier } from "../utils/package-name.js";
 import { stripViteModuleQuery } from "../utils/path.js";
 
 const LITERAL_REQUIRE_RE = /\brequire\s*\(/;
@@ -195,6 +196,7 @@ type CommonJsTransformFilter = (id: string) => boolean | undefined;
 export function createRequireConditionResolutionPlugin(
   createResolver: IdResolverFactory = createIdResolver,
   commonjsTransformFilter?: CommonJsTransformFilter,
+  getServerExternalPackages: () => readonly string[] = () => [],
 ): Plugin {
   // Vite reuses this plugin instance across its RSC, SSR, and client
   // environments, so the synthetic identity has to resolve in each graph.
@@ -300,11 +302,15 @@ export function createRequireConditionResolutionPlugin(
           ]);
           // The environment externalizes this package (the resolver returned
           // the bare id), so the call is pre-resolved by bundling its
-          // `require` target instead.
+          // `require` target instead. Packages that Next.js keeps external on
+          // the server (its default list, including native addons, plus
+          // `serverExternalPackages`) stay external, as they do in Next.js.
+          const packageName = packageNameFromSpecifier(specifier);
           const bundlesExternal =
             !keepExternals &&
             requireResolution !== undefined &&
-            !isAbsoluteResolution(requireResolution);
+            !isAbsoluteResolution(requireResolution) &&
+            !(packageName && getServerExternalPackages().includes(packageName));
           if (bundlesExternal) {
             [requireResolution, importResolution] = await Promise.all([
               bundlingResolvers.require(this.environment, specifier, id),
