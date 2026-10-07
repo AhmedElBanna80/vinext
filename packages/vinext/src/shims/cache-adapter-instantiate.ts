@@ -7,24 +7,22 @@
  * Contract: the default export must be a function, and it receives one
  * `{ env, options }` argument.
  *
- * - A class is invoked with `new`. A class is a constructor whose own
- *   `prototype` is non-writable (every `class` declaration, and Babel's
- *   compiled classes), carries members besides `constructor` (methods that
- *   down-levelled classes and constructor functions put on the prototype), or
- *   inherits from another prototype than the root object (down-levelled
- *   subclasses, whose methods all live on the base class).
- *   Proxy-wrapped classes qualify through the Proxy's default traps.
+ * - A `class` (class syntax, as Vite and every current toolchain emit it) is
+ *   invoked with `new`. It is recognised by the source text that
+ *   `Function.prototype.toString` must return for class syntax, which starts
+ *   with `class`, on a function that has [[Construct]].
  * - Any other function is called as a factory, with plain-call semantics
  *   (`this`, `new.target` and bound receivers are what a call gives them).
- *   That includes bound functions, which expose no `prototype`: export the
- *   class itself rather than a bound copy. It also includes an ES5-compiled
- *   class whose methods are all instance fields: its prototype holds only
- *   `constructor`, exactly like a `function` factory's, so nothing short of
- *   invoking it tells them apart. Such a module exports
- *   `(args) => new Adapter(args)` instead.
+ *   Existing factories therefore behave exactly as before, whatever their
+ *   `prototype` looks like (frozen, decorated, or inherited).
+ * - A constructor that is not class syntax (an ES5-compiled class, or a
+ *   bound or Proxy-wrapped class, whose source text is not observable) is
+ *   structurally indistinguishable from a factory without invoking it, so the
+ *   module states it explicitly by exporting a factory that constructs it:
+ *   `export default (args) => new Adapter(args)`.
  *
- * Both checks read language-level facts without invoking the export, so no
- * source sniffing, no error-message matching and no second invocation.
+ * Classification never invokes the export, matches no error messages and
+ * never retries, so the export runs exactly once.
  *
  * The produced value must be an adapter object (not a Promise) with the slot's
  * required members; anything else throws an error naming what is wrong.
@@ -69,20 +67,17 @@ export function isConstructor(value: unknown): boolean {
   }
 }
 
-/** Whether a constructible export is a class rather than a `function` factory. */
+const CLASS_SOURCE = /^class\b/;
+
+/**
+ * Whether an export is class syntax and must be invoked with `new`. The
+ * [[Construct]] check excludes methods named `class`, whose source text
+ * also starts with that word.
+ */
 export function isClassExport(value: unknown): boolean {
   if (!isConstructor(value)) return false;
   try {
-    const descriptor = Object.getOwnPropertyDescriptor(value, "prototype");
-    if (!descriptor) return false;
-    if (descriptor.writable === false) return true;
-    const prototype: unknown = descriptor.value;
-    if (prototype === null || typeof prototype !== "object") return false;
-    if (Reflect.ownKeys(prototype).some((key) => key !== "constructor")) return true;
-    // A plain function's prototype inherits straight from the root object
-    // (`Object.prototype` of its realm). Anything deeper is a subclass.
-    const parent: unknown = Object.getPrototypeOf(prototype);
-    return parent !== null && Object.getPrototypeOf(parent) !== null;
+    return CLASS_SOURCE.test(Function.prototype.toString.call(value));
   } catch {
     return false;
   }

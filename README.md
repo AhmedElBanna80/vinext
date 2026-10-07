@@ -838,7 +838,7 @@ export default class MyAdapter {
 }
 ```
 
-vinext invokes a class with `new`: a `class` declaration (including a Proxy-wrapped one), or a transpiled class with its methods on its `prototype` chain. Any other function, including a `function` factory or a bound function, is called normally. Export the class itself rather than a bound copy. A class compiled to an ES5 `function` whose adapter methods are all instance fields looks exactly like a factory, so export a factory for it instead: `export default (args) => new MyAdapter(args)`. The result must be the adapter itself, not a Promise. A data adapter implements `get`, `set`, and `revalidateTag`; a CDN adapter also implements `buildResponseHeaders` and sets `ownsBackgroundRevalidation` to a boolean. If the export isn't a function or the result is missing a member, vinext logs a warning naming the slot and what's wrong, then keeps the default handler.
+vinext invokes class syntax with `new` and calls any other function, so existing factories keep plain-call semantics. A constructor that isn't class syntax (an ES5-compiled, bound, or Proxy-wrapped class) can't be told apart from a factory, so export a factory that constructs it: `export default (args) => new MyAdapter(args)`. The result must be the adapter itself, not a Promise. A data adapter implements `get`, `set`, and `revalidateTag`; a CDN adapter also implements `buildResponseHeaders` and sets `ownsBackgroundRevalidation` to a boolean. If the export isn't a function or the result is missing a member, vinext logs a warning naming the slot and what's wrong, then keeps the default handler.
 
 ## What's NOT supported (and won't be)
 

@@ -35,6 +35,12 @@ class DataAdapter {
   async revalidateTag() {}
 }
 
+// TypeScript `target: ES5` output for a class with prototype methods.
+function Es5Base(this: { received: unknown }, input: unknown) {
+  this.received = input;
+}
+Object.assign(Es5Base.prototype, dataMethods());
+
 describe("isConstructor", () => {
   it("classifies functions by [[Construct]] without invoking them or reading their properties", () => {
     let calls = 0;
@@ -66,34 +72,47 @@ describe("isConstructor", () => {
 });
 
 describe("isClassExport", () => {
-  it("recognises classes by a non-writable or populated prototype", () => {
+  it("recognises class syntax only", () => {
     class FieldsOnly {
       value = 1;
     }
+    class Sub extends DataAdapter {}
     function Es5Class() {}
     Es5Class.prototype.get = function () {};
     function factory() {
       return {};
     }
     function* generator() {}
-    function Es5Sub() {}
-    Es5Sub.prototype = Object.create(Es5Class.prototype, {
-      constructor: { value: Es5Sub, writable: true, configurable: true },
-    });
-    function nullPrototype() {
-      return {};
-    }
-    nullPrototype.prototype = Object.create(null);
+    const methods = { class(this: void) {} };
     expect(isClassExport(DataAdapter)).toBe(true);
-    expect(isClassExport(Es5Sub)).toBe(true);
-    expect(isClassExport(nullPrototype)).toBe(false);
     expect(isClassExport(FieldsOnly)).toBe(true);
-    expect(isClassExport(Es5Class)).toBe(true);
-    expect(isClassExport(new Proxy(DataAdapter, {}))).toBe(true);
+    expect(isClassExport(Sub)).toBe(true);
+    expect(isClassExport(class {})).toBe(true);
+    expect(isClassExport(Es5Class)).toBe(false);
+    expect(isClassExport(new Proxy(DataAdapter, {}))).toBe(false);
+    expect(isClassExport(DataAdapter.bind(null))).toBe(false);
     expect(isClassExport(factory)).toBe(false);
     expect(isClassExport(factory.bind(null))).toBe(false);
     expect(isClassExport(() => ({}))).toBe(false);
     expect(isClassExport(generator)).toBe(false);
+    expect(isClassExport(methods.class)).toBe(false);
+  });
+
+  it("leaves factories with unusual prototypes classified as factories", () => {
+    const frozen = Object.freeze(function frozenFactory() {
+      return {};
+    });
+    function decorated() {
+      return {};
+    }
+    decorated.prototype.meta = "adapter";
+    function inherited() {
+      return {};
+    }
+    inherited.prototype = Object.create(Es5Base.prototype);
+    expect(isClassExport(frozen)).toBe(false);
+    expect(isClassExport(decorated)).toBe(false);
+    expect(isClassExport(inherited)).toBe(false);
   });
 });
 
@@ -162,20 +181,49 @@ describe("instantiateCacheAdapter", () => {
     expect(instantiateCacheAdapter(FieldAdapter, args, "data")).toBeInstanceOf(FieldAdapter);
   });
 
-  it("constructs Proxy-wrapped classes, even when the Proxy's get trap throws", () => {
-    let constructs = 0;
-    const proxied = new Proxy(DataAdapter, {
-      construct(target, argumentsList, newTarget) {
-        constructs++;
-        return Reflect.construct(target, argumentsList, newTarget);
-      },
+  it("calls factories with unusual prototypes instead of constructing them", () => {
+    const adapter = dataMethods();
+    const frozen = Object.freeze(function frozenFactory() {
+      if (new.target) throw new Error("factory was constructed");
+      return adapter;
     });
-    const viaProxy = instantiateCacheAdapter<DataAdapter>(proxied, args, "data");
-    expect(viaProxy).toBeInstanceOf(DataAdapter);
-    expect(viaProxy.received).toBe(args);
-    expect(constructs).toBe(1);
+    expect(instantiateCacheAdapter(frozen, args, "data")).toBe(adapter);
 
-    const hostile = new Proxy(DataAdapter, {
+    function decorated() {
+      if (new.target) throw new Error("factory was constructed");
+      return adapter;
+    }
+    decorated.prototype.meta = "adapter";
+    expect(instantiateCacheAdapter(decorated, args, "data")).toBe(adapter);
+  });
+
+  it("calls constructors that are not class syntax, surfacing the runtime's error", () => {
+    function Es5Adapter(this: Record<string, unknown>, input: unknown) {
+      Object.assign(this, { received: input });
+    }
+    Object.assign(Es5Adapter.prototype, dataMethods());
+    expect(() => instantiateCacheAdapter(Es5Adapter, args, "data")).toThrow(TypeError);
+    expect(() => instantiateCacheAdapter(DataAdapter.bind(null), args, "data")).toThrow(TypeError);
+    expect(() => instantiateCacheAdapter(new Proxy(DataAdapter, {}), args, "data")).toThrow(
+      TypeError,
+    );
+  });
+
+  it("constructs them through the documented `(args) => new Adapter(args)` export", () => {
+    // TypeScript `target: ES5` class with prototype methods, and a subclass of it.
+    function Es5Sub(this: { received: unknown }, input: unknown) {
+      Es5Base.call(this, input);
+    }
+    Object.setPrototypeOf(Es5Sub, Es5Base);
+    Es5Sub.prototype = Object.create(Es5Base.prototype, {
+      constructor: { value: Es5Sub, writable: true, configurable: true },
+    });
+    // An ES5 class whose methods are all instance fields.
+    function FieldsAdapter(this: Record<string, unknown>, input: unknown) {
+      Object.assign(this, dataMethods(), { received: input });
+    }
+    const Bound = DataAdapter.bind(null);
+    const Proxied = new Proxy(DataAdapter, {
       get() {
         throw new Error("prototype read");
       },
@@ -183,64 +231,23 @@ describe("instantiateCacheAdapter", () => {
         return new target(...(argumentsList as [unknown]));
       },
     });
-    expect(instantiateCacheAdapter(hostile, args, "data")).toBeInstanceOf(DataAdapter);
-  });
 
-  it("constructs down-levelled classes", () => {
-    // TypeScript `target: ES5` shape: methods on a writable prototype.
-    function Es5Adapter(this: { received: unknown }, input: unknown) {
-      this.received = input;
+    for (const [Adapter, instanceOf] of [
+      [Es5Base, Es5Base],
+      [Es5Sub, Es5Base],
+      [FieldsAdapter, FieldsAdapter],
+      [Bound, DataAdapter],
+      [Proxied, DataAdapter],
+    ] as const) {
+      const Construct = Adapter as unknown as new (input: unknown) => { received: unknown };
+      const adapter = instantiateCacheAdapter<{ received: unknown }>(
+        (input: unknown) => new Construct(input),
+        args,
+        "data",
+      );
+      expect(adapter).toBeInstanceOf(instanceOf);
+      expect(adapter.received).toBe(args);
     }
-    Object.assign(Es5Adapter.prototype, dataMethods());
-    const es5 = instantiateCacheAdapter<{ received: unknown }>(Es5Adapter, args, "data");
-    expect(es5).toBeInstanceOf(Es5Adapter);
-    expect(es5.received).toBe(args);
-
-    // Babel shape: `_classCallCheck` throws on a plain call, and `_createClass`
-    // makes `prototype` non-writable (here with no prototype methods at all).
-    function BabelAdapter(this: unknown, input: unknown) {
-      if (!(this instanceof BabelAdapter)) {
-        throw new TypeError("Cannot call a class as a function");
-      }
-      Object.assign(this, dataMethods(), { received: input });
-    }
-    Object.defineProperty(BabelAdapter, "prototype", { writable: false });
-    expect(instantiateCacheAdapter(BabelAdapter, args, "data")).toBeInstanceOf(BabelAdapter);
-
-    // TypeScript `target: ES5` subclass (`__extends`): its own prototype holds
-    // only `constructor`, and every adapter method is inherited from the base.
-    function Es5Sub(this: { received: unknown }, input: unknown) {
-      Es5Adapter.call(this, input);
-    }
-    Object.setPrototypeOf(Es5Sub, Es5Adapter);
-    Es5Sub.prototype = Object.create(Es5Adapter.prototype, {
-      constructor: { value: Es5Sub, writable: true, configurable: true },
-    });
-    const sub = instantiateCacheAdapter<{ received: unknown }>(Es5Sub, args, "data");
-    expect(sub).toBeInstanceOf(Es5Sub);
-    expect(sub).toBeInstanceOf(Es5Adapter);
-    expect(sub.received).toBe(args);
-  });
-
-  it("treats an ES5 class with only instance-field methods as a factory, as documented", () => {
-    // TypeScript `target: ES5` output for `class A { get = ...; set = ...; ... }`:
-    // the prototype holds only `constructor`, like any `function` factory's.
-    function FieldsAdapter(this: Record<string, unknown>, input: unknown) {
-      Object.assign(this, dataMethods(), { received: input });
-    }
-    expect(isClassExport(FieldsAdapter)).toBe(false);
-    expect(() => instantiateCacheAdapter(FieldsAdapter, args, "data")).toThrow(TypeError);
-
-    // The documented form for such a module: a factory that constructs it.
-    const factory = (input: unknown) =>
-      new (FieldsAdapter as unknown as new (input: unknown) => { received: unknown })(input);
-    const adapter = instantiateCacheAdapter<{ received: unknown }>(factory, args, "data");
-    expect(adapter).toBeInstanceOf(FieldsAdapter);
-    expect(adapter.received).toBe(args);
-  });
-
-  it("calls a bound class like any bound function, surfacing the runtime's error", () => {
-    expect(() => instantiateCacheAdapter(DataAdapter.bind(null), args, "data")).toThrow(TypeError);
   });
 
   it("propagates an error thrown by the adapter unchanged", () => {
