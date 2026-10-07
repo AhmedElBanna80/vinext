@@ -30,6 +30,7 @@ import { StaticFileCache, contentTypeForPath, etagFromFilenameHash } from "./sta
 import {
   isImageOptimizationPath,
   IMAGE_CONTENT_SECURITY_POLICY,
+  IMAGE_RESPONSE_CACHE_STATE,
   parseImageParams,
   isSafeImageContentType,
   DEFAULT_DEVICE_SIZES,
@@ -74,6 +75,7 @@ import type { ExecutionContextLike } from "vinext/shims/request-context";
 import { collectInlineCssManifest } from "../build/inline-css.js";
 import { readPrerenderSecret } from "../build/server-manifest.js";
 import {
+  NEXTJS_CACHE_HEADER,
   VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
   VINEXT_PRERENDER_RENDER_ERROR_HEADER,
   VINEXT_PRERENDER_SECRET_HEADER,
@@ -418,6 +420,13 @@ function nodeHeadersToWebHeaders(headersRecord: IncomingMessage["headers"]): Hea
 
 const NO_BODY_RESPONSE_STATUSES = new Set([204, 205, 304]);
 
+// The Node server passes `/_next/image` sources through unoptimized and keeps
+// no image cache, so every image it sends is a fresh response. Sent only with
+// the image bytes: a 304 carries no `x-nextjs-cache`, as in Next.js.
+const IMAGE_REPRESENTATION_HEADERS: Record<string, string> = {
+  [NEXTJS_CACHE_HEADER]: IMAGE_RESPONSE_CACHE_STATE,
+};
+
 // Constant header-name sets for `omitHeadersCaseInsensitive`. Hoisted to module
 // scope so the Set allocation happens once at module load instead of per response.
 // All entries must be lowercase.
@@ -628,6 +637,10 @@ function sendCompressed(
  *
  * Without a cache, falls back to async filesystem probing (still non-blocking,
  * unlike the old sync existsSync/statSync approach).
+ *
+ * `extraHeaders` go on every response for the file. `representationHeaders` go
+ * only on responses that carry the file's bytes (200 and 206), never on a 304,
+ * 412, 416 or 405.
  */
 async function tryServeStatic(
   req: IncomingMessage,
@@ -638,6 +651,7 @@ async function tryServeStatic(
   cache?: StaticFileCache,
   extraHeaders?: Record<string, string | string[]>,
   statusCode?: number,
+  representationHeaders?: Record<string, string>,
 ): Promise<boolean> {
   if (pathname === "/") return false;
   const responseStatus = statusCode ?? 200;
@@ -765,6 +779,7 @@ async function tryServeStatic(
       const rangeHeaders = {
         ...entry.original.headers,
         ...extraHeaders,
+        ...representationHeaders,
         "Accept-Ranges": "bytes",
         "Content-Length": String(length),
         "Content-Range": `bytes ${range.start}-${range.end}/${entry.original.size}`,
@@ -788,6 +803,7 @@ async function tryServeStatic(
     const responseHeaders = {
       ...variant.headers,
       ...extraHeaders,
+      ...representationHeaders,
       "Accept-Ranges": "bytes",
     };
     res.writeHead(
@@ -921,6 +937,7 @@ async function tryServeStatic(
     const length = range.end - range.start + 1;
     const rangeHeaders = {
       ...baseHeaders,
+      ...representationHeaders,
       "Content-Length": String(length),
       "Content-Range": `bytes ${range.start}-${range.end}/${resolved.size}`,
     };
@@ -941,7 +958,10 @@ async function tryServeStatic(
     // ahead of time, so Node.js uses chunked transfer encoding.
     res.writeHead(
       responseStatus,
-      mergeVaryHeader({ ...baseHeaders, "Content-Encoding": encoding }, "Accept-Encoding"),
+      mergeVaryHeader(
+        { ...baseHeaders, ...representationHeaders, "Content-Encoding": encoding },
+        "Accept-Encoding",
+      ),
     );
     if (omitBody || req.method === "HEAD") {
       res.end();
@@ -961,6 +981,7 @@ async function tryServeStatic(
 
   const identityHeaders = {
     ...baseHeaders,
+    ...representationHeaders,
     "Content-Length": String(resolved.size),
   };
   res.writeHead(
@@ -1816,6 +1837,8 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
           false,
           staticCache,
           imageSecurityHeaders,
+          undefined,
+          IMAGE_REPRESENTATION_HEADERS,
         )
       ) {
         return;
@@ -2403,6 +2426,8 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
                 false,
                 staticCache,
                 imageSecurityHeaders,
+                undefined,
+                IMAGE_REPRESENTATION_HEADERS,
               )
             ) {
               return true;
