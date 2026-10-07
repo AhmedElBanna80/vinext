@@ -38,7 +38,7 @@ function isProcessEnvNextRuntime(node: ESTree.Node): boolean {
  * the value the environment defines. Anything else is `null` (unknown). The
  * test itself is never removed, so its side effects do not matter here.
  */
-export function evaluateNextRuntimeTest(node: ESTree.Node, runtime: string): boolean | null {
+function evaluateNextRuntimeTest(node: ESTree.Node, runtime: string): boolean | null {
   if (node.type === "UnaryExpression" && node.operator === "!") {
     const value = evaluateNextRuntimeTest(node.argument, runtime);
     return value === null ? null : !value;
