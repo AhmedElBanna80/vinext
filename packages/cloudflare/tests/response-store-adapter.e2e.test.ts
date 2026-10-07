@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 
-import { Miniflare, type MiniflareOptions } from "miniflare";
+import {
+  fetch as miniflareFetch,
+  Miniflare,
+  Response as MiniflareResponse,
+  type MiniflareOptions,
+  type Request as MiniflareRequest,
+} from "miniflare";
 import { afterEach, beforeEach, describe, test } from "vitest";
 
 const root = path.resolve(import.meta.dirname, "../../..");
@@ -20,6 +26,7 @@ const responseStoreShards = 4;
 
 let miniflare: Miniflare;
 let workerVersionId: string;
+let upstreamRequests = 0;
 
 async function modules(directory: string, entry: string) {
   const files = (await readdir(directory, { recursive: true })).filter((file) =>
@@ -55,7 +62,7 @@ async function metadataEntries(): Promise<unknown[][]> {
   return Promise.all(
     Array.from({ length: responseStoreShards }, async (_, index) => {
       const metadata = namespace.getByName(
-        `${workerVersionId}:r2-v1:metadata-shard:${index}-of-${responseStoreShards}`,
+        `${workerVersionId}:r2-v2:metadata-shard:${index}-of-${responseStoreShards}`,
       );
       const inspect = Reflect.get(metadata, "inspect");
       assert.equal(typeof inspect, "function");
@@ -66,6 +73,7 @@ async function metadataEntries(): Promise<unknown[][]> {
 
 type StoredResponseEntry = {
   activeRevision?: unknown;
+  cacheTags?: unknown;
   freshUntil?: unknown;
   objectKey?: unknown;
   responseHeaders?: unknown;
@@ -105,20 +113,28 @@ async function bodiesStored(entries: StoredResponseEntry[]): Promise<boolean> {
 
 // Writes run in waitUntil after the response returns, so poll for them, then
 // fail unless exactly `count` entries were published and each body is readable.
-async function waitForResponseEntries(pathname: string, count: number): Promise<void> {
-  let entries = await responseEntries(pathname);
+async function waitForStoredEntries(
+  load: () => Promise<StoredResponseEntry[]>,
+  count: number,
+): Promise<void> {
+  let entries = await load();
   let stored = entries.length >= count && (await bodiesStored(entries));
   for (let attempt = 0; attempt < 50 && !stored; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 50));
-    entries = await responseEntries(pathname);
+    entries = await load();
     stored = entries.length >= count && (await bodiesStored(entries));
   }
   assert.equal(entries.length, count, JSON.stringify(entries));
   assert.ok(stored, `R2 bodies not stored for ${JSON.stringify(entries)}`);
 }
 
+async function waitForResponseEntries(pathname: string, count: number): Promise<void> {
+  await waitForStoredEntries(() => responseEntries(pathname), count);
+}
+
 beforeEach(async () => {
   workerVersionId = crypto.randomUUID();
+  upstreamRequests = 0;
   const compatibility = {
     compatibilityDate: "2026-04-08",
     compatibilityFlags: ["nodejs_compat", "experimental"],
@@ -137,6 +153,12 @@ beforeEach(async () => {
         },
         modules: await modules(appOutput, "index.js"),
         name: "app",
+        // Answers the demo's https://upstream.test fetches and counts them.
+        outboundService: (outbound: MiniflareRequest) => {
+          if (new URL(outbound.url).hostname !== "upstream.test") return miniflareFetch(outbound);
+          upstreamRequests += 1;
+          return new MiniflareResponse(`upstream:${upstreamRequests}`);
+        },
         serviceBindings: {
           ASSETS: async () => new Response(null, { status: 404 }),
           RESPONSE_STORE: { entrypoint: "ResponseStoreService", name: "cache" },
@@ -1015,6 +1037,51 @@ describe("Cloudflare Workers Response Store adapter", () => {
     assert.match(fresh, /^replayed:/);
   });
 
+  test("serves stale unstable_cache siblings while it refreshes them", async () => {
+    const pathname = "/unstable-cache-siblings";
+    const read = async () => {
+      // A replay that regenerates one sibling must not regenerate the other in
+      // the foreground, or each replays the page for the other without end.
+      const body = await Promise.race([
+        cacheStatus(pathname).then((result) => result.body),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`${pathname} did not respond within 4s`)), 4_000),
+        ),
+      ]);
+      return [htmlValue(body, "sibling-first"), htmlValue(body, "sibling-second")];
+    };
+    const first = await read();
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    // Like Next.js, unstable_cache without `expire` never hard-expires: past
+    // `revalidate` it serves the stale value and refreshes it in the background.
+    assert.deepEqual(await read(), first);
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const fresh = await read();
+    assert.notEqual(fresh[0], first[0]);
+    assert.notEqual(fresh[1], first[1]);
+    assert.match(fresh[0], /^first:/);
+    assert.match(fresh[1], /^second:/);
+  }, 15_000);
+
+  test("refreshes a stale cached fetch once", async () => {
+    const pathname = "/fetch-cache-swr";
+    const read = async () => htmlValue((await cacheStatus(pathname)).body, "fetch-cache-value");
+    assert.equal(await read(), "upstream:1");
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    // The stale read schedules the Store's page replay, which fetches upstream once.
+    // The fetch shim must not refresh the same entry a second time.
+    assert.equal(await read(), "upstream:1");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(await read(), "upstream:2");
+    assert.equal(upstreamRequests, 2);
+  });
+
   test("keeps the active response when background regeneration becomes non-cacheable", async () => {
     const pathname = `/api/revalidation-policy?key=${crypto.randomUUID()}`;
     const prepared = await request(pathname, { method: "POST" });
@@ -1038,8 +1105,75 @@ describe("Cloudflare Workers Response Store adapter", () => {
     const bucket = await miniflare.getR2Bucket("CACHE_BODIES", "cache");
     const objects = await bucket.list();
     assert.equal(objects.objects.length, 1);
-    assert.match(objects.objects[0].key, /\/r2-v1\/shards-4\/[0-9a-f]{64}\/active$/);
+    assert.match(objects.objects[0].key, /\/r2-v2\/shards-4\/[0-9a-f]{64}\/active$/);
   });
+
+  test("recomputes expired use-cache values that only a page replay could regenerate", async () => {
+    const pathname = "/use-cache-unreplayable";
+    const read = async () => {
+      // Regenerating one value replays the page, which reads the other. A read that
+      // waited for that replay would replay the page for each value in turn, without end.
+      const body = await Promise.race([
+        cacheStatus(pathname).then((result) => result.body),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`${pathname} did not respond within 4s`)), 4_000),
+        ),
+      ]);
+      return [htmlValue(body, "unreplayable-first"), htmlValue(body, "unreplayable-second")];
+    };
+    const first = await read();
+
+    // Both values must be stored for a page replay, not a cache function call.
+    const replayEntries = async () =>
+      ((await metadataEntries()).flat() as StoredResponseEntry[]).filter(
+        (entry) =>
+          entry.revalidator?.id === "vinext:data" && JSON.stringify(entry).includes(pathname),
+      );
+    for (let attempt = 0; attempt < 50 && (await replayEntries()).length < 2; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal((await replayEntries()).length, 2);
+
+    await new Promise((resolve) => setTimeout(resolve, 2_100));
+
+    // Past `expire` the values are a miss, as in Next.js, and the render recomputes them.
+    const recomputed = await read();
+    assert.notEqual(recomputed[0], first[0]);
+    assert.notEqual(recomputed[1], first[1]);
+    assert.match(recomputed[0], /^first:unreplayable:/);
+    assert.match(recomputed[1], /^second:unreplayable:/);
+  }, 15_000);
+
+  test("revalidating a tag replays the page on the value's next read", async () => {
+    const pathname = "/use-cache-unreplayable-tagged";
+    const value = async () => htmlValue((await cacheStatus(pathname)).body, "unreplayable-tagged");
+    const before = await value();
+    await waitForStoredEntries(
+      async () =>
+        ((await metadataEntries()).flat() as StoredResponseEntry[]).filter(
+          (entry) =>
+            entry.revalidator?.id === "vinext:data" && JSON.stringify(entry).includes(pathname),
+        ),
+      1,
+    );
+
+    // Like Next.js, revalidating the tag only marks the value stale: its next read still
+    // serves it, and the Store replays the page in the background to regenerate it.
+    const revalidate = await request("/api/revalidate-tag", {
+      body: JSON.stringify({ tag: "unreplayable-tagged" }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    assert.equal(revalidate.status, 200, await revalidate.text());
+    assert.equal(await value(), before);
+    let regenerated = before;
+    for (let attempt = 0; attempt < 40 && regenerated === before; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      regenerated = await value();
+    }
+    assert.notEqual(regenerated, before);
+    assert.match(regenerated, /^unreplayable-tagged:/);
+  }, 15_000);
 
   test("never serves a hard-expired use-cache value", async () => {
     const first = htmlValue((await cacheStatus("/use-cache-expired")).body, "expired-cache-value");
@@ -1072,14 +1206,21 @@ describe("Cloudflare Workers Response Store adapter", () => {
   test("revalidates tags and purges paths through the unified store", async () => {
     const firstTagged = await cacheStatus("/cached/tagged");
     const firstId = htmlValue(firstTagged.body, "rendered-at");
+    await waitForResponseEntries("/cached/tagged", 1);
     const revalidate = await request("/api/revalidate-tag", {
       body: JSON.stringify({ tag: "post:tagged" }),
       headers: { "content-type": "application/json" },
       method: "POST",
     });
     assert.equal(revalidate.status, 200, await revalidate.text());
-    const refreshed = await cacheStatus("/cached/tagged");
-    assert.notEqual(htmlValue(refreshed.body, "rendered-at"), firstId);
+    // Like Next.js, the next read serves the stale page and regenerates it in the background.
+    assert.equal(htmlValue((await cacheStatus("/cached/tagged")).body, "rendered-at"), firstId);
+    let refreshedId = firstId;
+    for (let attempt = 0; attempt < 40 && refreshedId === firstId; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      refreshedId = htmlValue((await cacheStatus("/cached/tagged")).body, "rendered-at");
+    }
+    assert.notEqual(refreshedId, firstId);
 
     const firstPurged = await cacheStatus("/cached/purged");
     const purge = await request("/api/revalidate-path", {
