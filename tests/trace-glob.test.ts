@@ -213,6 +213,15 @@ describe("createContainsMatcher", () => {
     "{a,b",
     "a.js",
     "/app/a.js",
+    "/app/foo",
+    "/app/bar",
+    "/app/foobar",
+    "/app/x/foo",
+    "/app/(api)",
+    "ba",
+    "-a",
+    "/-",
+    "/app/-x",
   ];
   const keys = [
     "/",
@@ -275,6 +284,46 @@ describe("createContainsMatcher", () => {
     "**(a)",
     "/app/**(a)",
     "/pages/*(_)app",
+    // A `?` or `+` after a group quantifies it.
+    "/app/@(foo|bar)?",
+    "@(a)+",
+    "!(a)?",
+    "!(a)+",
+    "x@(a)?y",
+    "*(a)?",
+    "?(a)?",
+    "@(a)??",
+    "@(a)?(b)",
+    "(!(a))?",
+    // Bare parentheses are groups.
+    "/app/(api)",
+    "(a|b)+",
+    "(a)?",
+    "(a)++",
+    "(a)(b)",
+    "!(a)(b)",
+    "@(a|(b))",
+    "@(a|(b)+)",
+    "@(+a)",
+    "((a))",
+    "(*)",
+    "a(b",
+    "a)b",
+    "(a",
+    // Negated classes keep `-` literal.
+    "/app/[^-a]*",
+    "/app/[^a-]*",
+    "[^-]",
+    "/[^a-c]pp",
+    // An interior globstar can match the end of the value.
+    "/app/**/!(foo)",
+    "/app/**/*(a)",
+    "/app/**/@(a|)",
+    "/app/**/foo",
+    "/a*/**/foo",
+    "**/!(foo)",
+    "/**/!(foo)",
+    "/app/**/x/**",
   ];
 
   it.each(keys)("matches picomatch { dot, contains } for route key %s", (key) => {
@@ -294,6 +343,24 @@ describe("isTranslatedExactly", () => {
     expect(isTranslatedExactly("+(a|@(b/c))")).toBe(false);
     expect(isTranslatedExactly("a[/]b")).toBe(false);
     expect(isTranslatedExactly("!(/app)")).toBe(false);
+    expect(isTranslatedExactly("(a/b)")).toBe(false);
+    // picomatch passes these through as regex syntax.
+    expect(isTranslatedExactly("[ab]+")).toBe(false);
+    expect(isTranslatedExactly("a{b,c}+")).toBe(false);
+    expect(isTranslatedExactly("@(a+)")).toBe(false);
+    expect(isTranslatedExactly("(a|b+)")).toBe(false);
+    expect(isTranslatedExactly("(?a)")).toBe(false);
+    expect(isTranslatedExactly("@(?a)")).toBe(false);
+    expect(isTranslatedExactly("a)+")).toBe(false);
+    expect(isTranslatedExactly("x)?")).toBe(false);
+    expect(isTranslatedExactly("a(b|c")).toBe(false);
+    expect(isTranslatedExactly("/app/@(foo|bar)?")).toBe(true);
+    expect(isTranslatedExactly("/app/(api)")).toBe(true);
+    expect(isTranslatedExactly("(a|b)+")).toBe(true);
+    expect(isTranslatedExactly("@(a|(b)+)")).toBe(true);
+    expect(isTranslatedExactly("@(+a)")).toBe(true);
+    expect(isTranslatedExactly("/app/[^-a]*")).toBe(true);
+    expect(isTranslatedExactly("/app/**/!(foo)")).toBe(true);
     expect(isTranslatedExactly("/app/@(a|b)/c")).toBe(true);
     expect(isTranslatedExactly("/app/[id]/x")).toBe(true);
     expect(isTranslatedExactly("!foo")).toBe(true);
@@ -329,6 +396,11 @@ describe("createPathMatcher", () => {
     "pkg/**(a)",
     "node_modules/pkg/**(a)",
     "node_modules/pkg/a**(b)",
+    "node_modules/pkg/(index).js",
+    "node_modules/pkg/@(index|x)?.js",
+    "node_modules/pkg/**/!(index.js)",
+    "node_modules/**/!(swc.node)",
+    "node_modules/pkg[^-a]*/**",
   ];
 
   it.each(excludes)("matches picomatch on path.join(dir, glob) for %s", (exclude) => {

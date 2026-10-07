@@ -393,6 +393,9 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
         "app/@modal/photo/page.tsx": page,
         "app/@modal/default.tsx": page,
         "app/_private/page.tsx": page,
+        // Next.js reads `%5F` as `_`.
+        "app/%5Fsites/page.tsx": page,
+        "app/%5Fsites/icon.png": "",
         "pages/legacy.tsx": page,
         "pages/docs/index.tsx": page,
         "pages/api/x.ts": "export default function handler() {}",
@@ -420,6 +423,8 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
           "/app/blog/[slug]/icon.png",
           `/app/twitter-image-${groupSuffix}`,
           "/app/photo",
+          "/app/_sites",
+          "/app/_sites/icon.png",
           "/app/_not-found",
           "/pages/legacy",
           "/pages/docs",
@@ -453,6 +458,24 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
       expect(names.sort()).toEqual(
         ["/app", "/app/robots.txt", "/app/_not-found", "/app/_global-error"].sort(),
       );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("names the not-found route of an app with only a root not-found page", async () => {
+    const { collectTraceRouteNames } =
+      await import("../packages/vinext/src/build/nitro-trace-includes.js");
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-not-found-"));
+    try {
+      const page = "export default function Page() { return null; }";
+      await writeFiles(root, { "app/layout.tsx": page, "app/not-found.tsx": page });
+      const names = await collectTraceRouteNames({
+        appDir: path.join(root, "app"),
+        pagesDir: null,
+        pageExtensions: ["tsx", "ts", "jsx", "js"],
+      });
+      expect(names.sort()).toEqual(["/app/_not-found", "/app/_global-error"].sort());
     } finally {
       await fs.rm(root, { recursive: true, force: true }).catch(() => {});
     }

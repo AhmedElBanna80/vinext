@@ -1,6 +1,10 @@
 import fs from "node:fs";
 import path, { toSlash } from "pathslash";
-import { createValidFileMatcher, type ValidFileMatcher } from "../routing/file-matcher.js";
+import {
+  createValidFileMatcher,
+  findFileWithExtensions,
+  type ValidFileMatcher,
+} from "../routing/file-matcher.js";
 import type { MetadataFileRoute } from "../server/metadata-routes.js";
 import { hasExportedName } from "./report.js";
 import {
@@ -141,7 +145,7 @@ function metadataRouteName(
   matcher: ValidFileMatcher,
   metadataRouteSuffix: (parentSegments: string[], metaType: string) => string,
 ): string {
-  let page = `/${matcher.stripExtension(toSlash(path.relative(appDir, route.filePath)))}`;
+  let page = appEntryKey(toSlash(path.relative(appDir, route.filePath)), matcher);
   let suffix = "";
   if (page === "/robots") page += ".txt";
   else if (page === "/manifest") page += ".webmanifest";
@@ -151,6 +155,14 @@ function metadataRouteName(
   if (generatesMultipleFiles(route)) entry += "/[__metadata_id__]";
   else if (entry.endsWith("/sitemap")) entry += ".xml";
   return normalizeAppPath(`app${entry}/route`);
+}
+
+/**
+ * Next.js's App Router page key for a file relative to `appDir`
+ * (`createPagesMapping`), which turns `%5F` into `_`.
+ */
+function appEntryKey(file: string, matcher: ValidFileMatcher): string {
+  return `/${matcher.stripExtension(file)}`.replace(/%5F/g, "_");
 }
 
 function hasReservedPagesFile(pagesDir: string, matcher: ValidFileMatcher): boolean {
@@ -203,12 +215,15 @@ export async function collectTraceRouteNames(options: {
     // Every page and route file is an entry, including pages that only fill
     // a parallel route slot (`app/@modal/photo/page` is `/app/photo`).
     for (const file of collectAppEntryFiles(appDir, matcher)) {
-      appNames.add(normalizeAppPath(`app/${matcher.stripExtension(file)}`));
+      appNames.add(normalizeAppPath(`app${appEntryKey(file, matcher)}`));
     }
     for (const route of scanMetadataFiles(appDir)) {
       appNames.add(metadataRouteName(route, appDir, matcher, metadataRouteSuffix));
     }
-    if (appNames.size > 0) appNames.add("/app/_not-found");
+    // A root `not-found` file is an app entry too; it builds as `_not-found`.
+    if (appNames.size > 0 || findFileWithExtensions(path.join(appDir, "not-found"), matcher)) {
+      appNames.add("/app/_not-found");
+    }
     if (!hasPages) appNames.add("/app/_global-error");
     for (const name of appNames) names.add(name);
   }

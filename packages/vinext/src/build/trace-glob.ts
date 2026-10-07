@@ -116,7 +116,8 @@ function parseClass(segment: string, open: number): { source: string; end: numbe
   for (let first = true; index < segment.length; index++, first = false) {
     const char = segment[index];
     if (char === "]" && !first) {
-      const source = negate ? `[^/${body}]` : `[${body}]`;
+      // picomatch adds the `/` after the body, so it never ends a range.
+      const source = negate ? `[^${body}/]` : `[${body}]`;
       if (!negate && !PICOMATCH_CLASS_REGEX_CHARS.test(raw)) {
         return { source: `(?:${escapeRegex(`[${raw}]`)}|${source})`, end: index };
       }
@@ -129,7 +130,9 @@ function parseClass(segment: string, open: number): { source: string; end: numbe
       body += /[\]\\^-]/.test(escaped) ? `\\${escaped}` : escapeRegex(escaped);
       continue;
     }
-    body += char === "[" || char === "^" || char === "\\" || char === "]" ? `\\${char}` : char;
+    // picomatch escapes a `-` that closes the class (`[^a-]` is `[^a\-/]`).
+    const isLiteral = char === "[" || char === "^" || char === "\\" || char === "]";
+    body += isLiteral || (char === "-" && segment[index + 1] === "]") ? `\\${char}` : char;
   }
   return null;
 }
@@ -174,15 +177,18 @@ function parseSegment(
       index += 2;
       continue;
     }
-    if ("@?+*!".includes(char) && segment[index + 1] === "(") {
-      const group = parseExtglob(segment, index + 2, endsPattern);
+    const isExtglob = "@?+*!".includes(char) && segment[index + 1] === "(";
+    if (isExtglob || char === "(") {
+      // A bare `(...)` is a regex group, like `@(...)`.
+      const kind = isExtglob ? char : "@";
+      const group = parseExtglob(segment, index + (isExtglob ? 2 : 1), endsPattern);
       if (group) {
         const alternatives = group.alternatives.join("|");
         // picomatch makes an extglob that starts the pattern (other than
         // `@()`, which it reads as a plain group) match at least one character.
-        if (atPatternStart && index === 0 && char !== "@") source += "(?=.)";
-        if (char !== "!") {
-          source += `(?:${alternatives})${char === "@" ? "" : char}`;
+        if (atPatternStart && index === 0 && kind !== "@") source += "(?=.)";
+        if (kind !== "!") {
+          source += `(?:${alternatives})${kind === "@" ? "" : kind}`;
         } else if (endsPattern && /^\)*$/.test(segment.slice(group.end + 1))) {
           // picomatch only anchors the lookahead when nothing but closing
           // parentheses follows in the pattern.
@@ -191,6 +197,12 @@ function parseSegment(
           source += `(?:(?!(?:${alternatives}))[^/]*?)`;
         }
         index = group.end + 1;
+        // A `?` or `+` right after the group quantifies it, unless it starts
+        // another extglob.
+        if ((segment[index] === "?" || segment[index] === "+") && segment[index + 1] !== "(") {
+          source += segment[index];
+          index++;
+        }
         continue;
       }
     }
@@ -236,22 +248,29 @@ function containsSource(pattern: string, rooted: boolean): string {
     .split("/")
     .filter((segment, index, all) => !(segment === "**" && all[index - 1] === "**"));
   let source = "";
+  // Whether the next segment starts after a `/` this function adds.
+  let separate = false;
   segments.forEach((segment, index) => {
     if (segment === "**") {
+      separate = false;
       if (segments.length === 1) source += ".*";
       // `**/x`: x at the start of the value or after any `/`.
       else if (index === 0) source += "(?:^|/)";
       // picomatch does not let a globstar right after a leading `/`, or after
       // a wildcard (`*/**`), match zero directories.
-      else if (index === 1 && rooted && segments[0] === "") source += "/.*";
-      else if (index === segments.length - 1) {
+      else if (index === 1 && rooted && segments[0] === "") {
+        source += "/.*";
+        separate = true;
+      } else if (index === segments.length - 1) {
         source += endsWithStar(segments[index - 1]) ? "/.*" : "(?:/.*|$)";
       }
-      // `a/**/b`: the following `/` is added with `b`.
-      else source += "(?:/.*)?";
+      // `a/**/b`: b after `a/.../`, after `a/`, or (when b can match nothing)
+      // at the end of the value.
+      else source += "(?:/.*/|/|$)";
       return;
     }
-    if (index > 0 && !(index === 1 && segments[0] === "**")) source += "/";
+    if (separate) source += "/";
+    separate = true;
     const endsPattern = index === segments.length - 1;
     source += parseSegment(segment, 0, endsPattern, false, rooted && index === 0).source;
   });
@@ -270,34 +289,46 @@ function toRegExp(source: string, literal: string): RegExp {
 /**
  * Whether {@link createContainsMatcher} and {@link createPathMatcher} match a
  * pattern exactly like picomatch. Path segments are translated one at a time,
- * so POSIX classes (`[[:alpha:]]`), and extglobs or classes containing a `/`
- * (`@(a/b)`, `a[/]b`), are not.
+ * so POSIX classes (`[[:alpha:]]`), and extglobs, groups or classes containing
+ * a `/` (`@(a/b)`, `a[/]b`), are not. Neither are the shapes where picomatch
+ * passes regex syntax through: a `+` after a class or brace (`[ab]+`) or
+ * inside a group (`@(a+)`), a `?` starting a group (`(?a)`), a `?` or `+`
+ * after an unmatched `)`, and an unterminated `(`.
  */
 export function isTranslatedExactly(pattern: string): boolean {
   if (/\[:[a-z]+:\]/.test(pattern)) return false;
-  let extglobDepth = 0;
+  let depth = 0;
   for (let index = 0; index < pattern.length; index++) {
     const char = pattern[index];
+    const next = pattern[index + 1];
     if (char === "\\") {
       index++;
     } else if (char === "[") {
       const close = pattern.indexOf("]", index + 2);
       if (close !== -1) {
         if (pattern.slice(index, close).includes("/")) return false;
+        if (pattern[close + 1] === "+") return false;
         index = close;
       }
-    } else if ("@?+*!".includes(char) && pattern[index + 1] === "(") {
-      extglobDepth++;
+    } else if (char === "}" && next === "+") {
+      return false;
+    } else if ("@?+*!".includes(char) && next === "(") {
+      if (pattern[index + 2] === "?") return false;
+      depth++;
       index++;
-    } else if (char === "(" && extglobDepth > 0) {
-      extglobDepth++;
-    } else if (char === ")" && extglobDepth > 0) {
-      extglobDepth--;
-    } else if (char === "/" && extglobDepth > 0) {
+    } else if (char === "(") {
+      if (next === "?") return false;
+      depth++;
+    } else if (char === ")") {
+      if (depth === 0 && (next === "?" || next === "+")) return false;
+      if (depth > 0) depth--;
+    } else if (char === "+" && depth > 0 && !"()".includes(pattern[index - 1])) {
+      return false;
+    } else if (char === "/" && depth > 0) {
       return false;
     }
   }
-  return true;
+  return depth === 0;
 }
 
 /**
