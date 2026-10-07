@@ -838,7 +838,7 @@ export default class MyAdapter {
 }
 ```
 
-vinext invokes a constructor with `new`. That covers classes (including transpiled, bound, or Proxy-wrapped ones) and any `function`; a `function` factory that returns an object gives the same result either way. Arrow functions are called. The result must be the adapter itself, not a Promise. A data adapter implements `get`, `set`, and `revalidateTag`; a CDN adapter also implements `buildResponseHeaders`. If the export isn't a function or the result is missing a method, vinext logs a warning naming the slot and what's wrong, then keeps the default handler.
+vinext invokes a class with `new`: a `class` declaration (including a Proxy-wrapped one), or a transpiled class with its methods on `prototype`. Any other function, including a `function` factory or a bound function, is called normally; to use a class, export the class itself rather than a bound copy. The result must be the adapter itself, not a Promise. A data adapter implements `get`, `set`, and `revalidateTag`; a CDN adapter also implements `buildResponseHeaders` and sets `ownsBackgroundRevalidation` to a boolean. If the export isn't a function or the result is missing a member, vinext logs a warning naming the slot and what's wrong, then keeps the default handler.
 
 ## What's NOT supported (and won't be)
 

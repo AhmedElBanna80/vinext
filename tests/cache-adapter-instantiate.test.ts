@@ -7,6 +7,7 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import {
   instantiateCacheAdapter,
+  isClassExport,
   isConstructor,
 } from "../packages/vinext/src/shims/cache-adapter-instantiate.js";
 
@@ -35,7 +36,7 @@ class DataAdapter {
 }
 
 describe("isConstructor", () => {
-  it("classifies functions by [[Construct]] without invoking them", () => {
+  it("classifies functions by [[Construct]] without invoking them or reading their properties", () => {
     let calls = 0;
     function plain() {
       calls++;
@@ -45,16 +46,44 @@ describe("isConstructor", () => {
         calls++;
       }
     }
+    const hostile = new Proxy(Native, {
+      get() {
+        throw new Error("prototype read");
+      },
+    });
     expect(isConstructor(plain)).toBe(true);
     expect(isConstructor(Native)).toBe(true);
     expect(isConstructor(Native.bind(null))).toBe(true);
     expect(isConstructor(new Proxy(Native, {}))).toBe(true);
+    expect(isConstructor(hostile)).toBe(true);
     expect(isConstructor(() => {})).toBe(false);
     expect(isConstructor(async () => {})).toBe(false);
     expect(isConstructor(async function () {})).toBe(false);
     expect(isConstructor({ create(this: void) {} }.create)).toBe(false);
     expect(isConstructor({})).toBe(false);
     expect(calls).toBe(0);
+  });
+});
+
+describe("isClassExport", () => {
+  it("recognises classes by a non-writable or populated prototype", () => {
+    class FieldsOnly {
+      value = 1;
+    }
+    function Es5Class() {}
+    Es5Class.prototype.get = function () {};
+    function factory() {
+      return {};
+    }
+    function* generator() {}
+    expect(isClassExport(DataAdapter)).toBe(true);
+    expect(isClassExport(FieldsOnly)).toBe(true);
+    expect(isClassExport(Es5Class)).toBe(true);
+    expect(isClassExport(new Proxy(DataAdapter, {}))).toBe(true);
+    expect(isClassExport(factory)).toBe(false);
+    expect(isClassExport(factory.bind(null))).toBe(false);
+    expect(isClassExport(() => ({}))).toBe(false);
+    expect(isClassExport(generator)).toBe(false);
   });
 });
 
@@ -81,15 +110,28 @@ describe("instantiateCacheAdapter", () => {
     expect(instantiateCacheAdapter(mod.create, args, "data")).toBe(adapter);
   });
 
-  it("returns the object a `function` factory returns, exactly as calling it would", () => {
+  it("calls a `function` factory with plain-call semantics", () => {
     const seen: unknown[] = [];
     const adapter = dataMethods();
-    function createAdapter(input: unknown) {
-      seen.push(input);
+    function createAdapter(this: unknown, input: unknown) {
+      seen.push({ input, receiver: this, newTarget: new.target });
       return adapter;
     }
     expect(instantiateCacheAdapter(createAdapter, args, "data")).toBe(adapter);
-    expect(seen).toEqual([args]);
+    expect(seen).toEqual([{ input: args, receiver: undefined, newTarget: undefined }]);
+  });
+
+  it("keeps the receiver of a bound `function` factory", () => {
+    const owner = {
+      adapter: dataMethods(),
+      create(this: { adapter: ReturnType<typeof dataMethods> }) {
+        return this.adapter;
+      },
+    };
+    function factory(this: typeof owner) {
+      return this.create();
+    }
+    expect(instantiateCacheAdapter(factory.bind(owner), args, "data")).toBe(owner.adapter);
   });
 
   it("constructs a native class with { env, options }", () => {
@@ -110,11 +152,7 @@ describe("instantiateCacheAdapter", () => {
     expect(instantiateCacheAdapter(FieldAdapter, args, "data")).toBeInstanceOf(FieldAdapter);
   });
 
-  it("constructs bound and Proxy-wrapped classes", () => {
-    const bound = instantiateCacheAdapter<DataAdapter>(DataAdapter.bind(null), args, "data");
-    expect(bound).toBeInstanceOf(DataAdapter);
-    expect(bound.received).toBe(args);
-
+  it("constructs Proxy-wrapped classes, even when the Proxy's get trap throws", () => {
     let constructs = 0;
     const proxied = new Proxy(DataAdapter, {
       construct(target, argumentsList, newTarget) {
@@ -126,10 +164,20 @@ describe("instantiateCacheAdapter", () => {
     expect(viaProxy).toBeInstanceOf(DataAdapter);
     expect(viaProxy.received).toBe(args);
     expect(constructs).toBe(1);
+
+    const hostile = new Proxy(DataAdapter, {
+      get() {
+        throw new Error("prototype read");
+      },
+      construct(target, argumentsList) {
+        return new target(...(argumentsList as [unknown]));
+      },
+    });
+    expect(instantiateCacheAdapter(hostile, args, "data")).toBeInstanceOf(DataAdapter);
   });
 
-  it("constructs down-levelled ES5 classes, including ones that guard against a plain call", () => {
-    // TypeScript `target: ES5` shape: methods on the prototype.
+  it("constructs down-levelled classes", () => {
+    // TypeScript `target: ES5` shape: methods on a writable prototype.
     function Es5Adapter(this: { received: unknown }, input: unknown) {
       this.received = input;
     }
@@ -138,21 +186,20 @@ describe("instantiateCacheAdapter", () => {
     expect(es5).toBeInstanceOf(Es5Adapter);
     expect(es5.received).toBe(args);
 
-    // Babel shape: `_classCallCheck` throws when invoked without `new`.
+    // Babel shape: `_classCallCheck` throws on a plain call, and `_createClass`
+    // makes `prototype` non-writable (here with no prototype methods at all).
     function BabelAdapter(this: unknown, input: unknown) {
       if (!(this instanceof BabelAdapter)) {
         throw new TypeError("Cannot call a class as a function");
       }
-      (this as { received: unknown }).received = input;
+      Object.assign(this, dataMethods(), { received: input });
     }
-    Object.assign(BabelAdapter.prototype, dataMethods());
+    Object.defineProperty(BabelAdapter, "prototype", { writable: false });
     expect(instantiateCacheAdapter(BabelAdapter, args, "data")).toBeInstanceOf(BabelAdapter);
+  });
 
-    // Constructor functions that assign methods in the body.
-    function BodyAdapter(this: Record<string, unknown>) {
-      Object.assign(this, dataMethods());
-    }
-    expect(instantiateCacheAdapter(BodyAdapter, args, "data")).toBeInstanceOf(BodyAdapter);
+  it("calls a bound class like any bound function, surfacing the runtime's error", () => {
+    expect(() => instantiateCacheAdapter(DataAdapter.bind(null), args, "data")).toThrow(TypeError);
   });
 
   it("propagates an error thrown by the adapter unchanged", () => {
@@ -208,36 +255,50 @@ describe("instantiateCacheAdapter", () => {
 
   it("rejects results that are not an adapter object", () => {
     expect(() => instantiateCacheAdapter(() => undefined, args, "data")).toThrow(
-      "cache.data adapter: the default export must produce an adapter object, got undefined. A data cache adapter implements get, set, revalidateTag.",
+      "cache.data adapter: the default export must produce an adapter object, got undefined. A data cache adapter implements get, set and revalidateTag.",
+    );
+    // A `function` factory that forgets to return.
+    function forgetsToReturn() {}
+    expect(() => instantiateCacheAdapter(forgetsToReturn, args, "data")).toThrow(
+      /must produce an adapter object, got undefined\./,
     );
     expect(() => instantiateCacheAdapter(() => DataAdapter, args, "data")).toThrow(
-      /must produce an adapter object, got a function/,
+      /must produce an adapter object, got a function\./,
     );
   });
 
-  it("names the methods a data adapter is missing", () => {
+  it("names the members a data adapter is missing", () => {
     expect(() =>
       instantiateCacheAdapter(() => ({ async get() {}, set: "nope" }), args, "data"),
     ).toThrow(
-      "cache.data adapter: the adapter produced by the default export is missing set, revalidateTag. A data cache adapter implements get, set, revalidateTag.",
-    );
-    // A `function` factory that forgets to return yields its empty `this` under `new`.
-    function forgetsToReturn() {}
-    expect(() => instantiateCacheAdapter(forgetsToReturn, args, "data")).toThrow(
-      /is missing get, set, revalidateTag\./,
+      "cache.data adapter: the adapter produced by the default export is missing method set, method revalidateTag. A data cache adapter implements get, set and revalidateTag.",
     );
   });
 
-  it("requires buildResponseHeaders on a CDN adapter", () => {
+  it("requires buildResponseHeaders and a boolean ownsBackgroundRevalidation on a CDN adapter", () => {
     expect(() => instantiateCacheAdapter(DataAdapter, args, "cdn")).toThrow(
-      "cache.cdn adapter: the adapter produced by the default export is missing buildResponseHeaders. A CDN cache adapter implements get, set, revalidateTag, buildResponseHeaders.",
+      "cache.cdn adapter: the adapter produced by the default export is missing method buildResponseHeaders, boolean ownsBackgroundRevalidation. A CDN cache adapter implements get, set, revalidateTag and buildResponseHeaders, and sets ownsBackgroundRevalidation to a boolean.",
     );
-    class CdnAdapter extends DataAdapter {
-      readonly ownsBackgroundRevalidation = false;
+
+    class WithoutOwnership extends DataAdapter {
       buildResponseHeaders() {
         return {};
       }
     }
+    expect(() => instantiateCacheAdapter(WithoutOwnership, args, "cdn")).toThrow(
+      /is missing boolean ownsBackgroundRevalidation\./,
+    );
+
+    class CdnAdapter extends WithoutOwnership {
+      readonly ownsBackgroundRevalidation = false;
+    }
     expect(instantiateCacheAdapter(CdnAdapter, args, "cdn")).toBeInstanceOf(CdnAdapter);
+
+    class GetterOwnership extends WithoutOwnership {
+      get ownsBackgroundRevalidation() {
+        return true;
+      }
+    }
+    expect(instantiateCacheAdapter(GetterOwnership, args, "cdn")).toBeInstanceOf(GetterOwnership);
   });
 });

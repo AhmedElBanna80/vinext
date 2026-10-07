@@ -92,9 +92,10 @@ export type CacheAdapterDescriptor<O extends Record<string, unknown> = Record<st
    * Module specifier (or absolute path, e.g. from `require.resolve(...)`) whose
    * default export creates the adapter from one `{ env, options }` argument:
    * either a factory `({ env, options }) => adapter` or a class
-   * `new Adapter({ env, options })`. A constructor (any class, or a `function`
-   * declaration) is invoked with `new`; an arrow function is called. The result
-   * must be the adapter object itself, not a Promise.
+   * `new Adapter({ env, options })`. A class (a `class` declaration, or a
+   * transpiled class with methods on its `prototype`) is invoked with `new`;
+   * any other function, including a bound one, is called. The result must be
+   * the adapter object itself, not a Promise.
    */
   adapter: string;
   /** JSON-serializable options forwarded to the factory at runtime. */

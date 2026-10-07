@@ -7,40 +7,75 @@
  * Contract: the default export must be a function, and it receives one
  * `{ env, options }` argument.
  *
- * - If it is a constructor (a class, including down-levelled, bound or
- *   Proxy-wrapped classes, or a `function` declaration), it is invoked with
- *   `new`. A `function` factory that returns an object behaves identically
- *   under `new`, because a constructor that returns an object yields that
- *   object.
- * - Otherwise (arrow functions, object methods), it is called.
+ * - A class is invoked with `new`. A class is a constructor whose own
+ *   `prototype` is non-writable (every `class` declaration, and Babel's
+ *   compiled classes) or carries members besides `constructor` (methods that
+ *   down-levelled classes and constructor functions put on the prototype).
+ *   Proxy-wrapped classes qualify through the Proxy's default traps.
+ * - Any other function is called as a factory, with plain-call semantics
+ *   (`this`, `new.target` and bound receivers are what a call gives them).
+ *   That includes bound functions, which expose no `prototype`: export the
+ *   class itself rather than a bound copy.
  *
- * Whether a function is a constructor is a language-level fact, read without
- * invoking it, so no source sniffing, no error-message matching and no second
- * invocation is involved.
+ * Both checks read language-level facts without invoking the export, so no
+ * source sniffing, no error-message matching and no second invocation.
  *
  * The produced value must be an adapter object (not a Promise) with the slot's
- * required methods; anything else throws an error naming what is wrong.
+ * required members; anything else throws an error naming what is wrong.
  */
 export type CacheAdapterFactoryArgs = { env: unknown; options: unknown };
 
 export type CacheAdapterSlot = "data" | "cdn";
 
-const REQUIRED_METHODS: Record<CacheAdapterSlot, readonly string[]> = {
-  data: ["get", "set", "revalidateTag"],
-  cdn: ["get", "set", "revalidateTag", "buildResponseHeaders"],
+type AdapterRequirements = {
+  methods: readonly string[];
+  booleans: readonly string[];
+  description: string;
+};
+
+const REQUIREMENTS: Record<CacheAdapterSlot, AdapterRequirements> = {
+  data: {
+    methods: ["get", "set", "revalidateTag"],
+    booleans: [],
+    description: "A data cache adapter implements get, set and revalidateTag.",
+  },
+  cdn: {
+    methods: ["get", "set", "revalidateTag", "buildResponseHeaders"],
+    booleans: ["ownsBackgroundRevalidation"],
+    description:
+      "A CDN cache adapter implements get, set, revalidateTag and buildResponseHeaders, and sets ownsBackgroundRevalidation to a boolean.",
+  },
 };
 
 /**
- * Whether `value` has a [[Construct]] internal method. `Reflect.construct`
- * only reads `prototype` from its `newTarget` and throws a TypeError before
- * doing so when `newTarget` is not a constructor; the target function itself
- * is a no-op, so the configured export is never run here.
+ * Whether `value` has a [[Construct]] internal method. A Proxy is
+ * constructible exactly when its target is; its no-op `construct` trap
+ * answers without running the export or reading any of its properties.
  */
 export function isConstructor(value: unknown): boolean {
   if (typeof value !== "function") return false;
   try {
-    Reflect.construct(function () {}, [], value);
+    const probe = new Proxy(value as new () => object, { construct: () => ({}) });
+    new probe();
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a constructible export is a class rather than a `function` factory. */
+export function isClassExport(value: unknown): boolean {
+  if (!isConstructor(value)) return false;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, "prototype");
+    if (!descriptor) return false;
+    if (descriptor.writable === false) return true;
+    const prototype: unknown = descriptor.value;
+    return (
+      prototype !== null &&
+      typeof prototype === "object" &&
+      Reflect.ownKeys(prototype).some((key) => key !== "constructor")
+    );
   } catch {
     return false;
   }
@@ -59,8 +94,7 @@ export function instantiateCacheAdapter<T>(
   slot: CacheAdapterSlot,
 ): T {
   const label = `cache.${slot} adapter`;
-  const kind = slot === "cdn" ? "CDN" : "data";
-  const required = REQUIRED_METHODS[slot];
+  const requirements = REQUIREMENTS[slot];
 
   if (typeof exported !== "function") {
     const hint =
@@ -76,7 +110,7 @@ export function instantiateCacheAdapter<T>(
     );
   }
 
-  const adapter: unknown = isConstructor(exported)
+  const adapter: unknown = isClassExport(exported)
     ? new (exported as new (args: CacheAdapterFactoryArgs) => unknown)(args)
     : (exported as (args: CacheAdapterFactoryArgs) => unknown)(args);
 
@@ -96,18 +130,24 @@ export function instantiateCacheAdapter<T>(
     throw new TypeError(
       `${label}: the default export must produce an adapter object, got ${describeValue(
         adapter,
-      )}. A ${kind} cache adapter implements ${required.join(", ")}.`,
+      )}. ${requirements.description}`,
     );
   }
 
-  const missing = required.filter(
-    (method) => typeof (adapter as Record<string, unknown>)[method] !== "function",
-  );
-  if (missing.length > 0) {
+  const record = adapter as Record<string, unknown>;
+  const problems = [
+    ...requirements.methods
+      .filter((method) => typeof record[method] !== "function")
+      .map((method) => `method ${method}`),
+    ...requirements.booleans
+      .filter((property) => typeof record[property] !== "boolean")
+      .map((property) => `boolean ${property}`),
+  ];
+  if (problems.length > 0) {
     throw new TypeError(
-      `${label}: the adapter produced by the default export is missing ${missing.join(
+      `${label}: the adapter produced by the default export is missing ${problems.join(
         ", ",
-      )}. A ${kind} cache adapter implements ${required.join(", ")}.`,
+      )}. ${requirements.description}`,
     );
   }
 
