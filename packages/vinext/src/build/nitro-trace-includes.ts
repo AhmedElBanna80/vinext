@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path, { toSlash } from "pathslash";
-import { createValidFileMatcher } from "../routing/file-matcher.js";
+import { createValidFileMatcher, type ValidFileMatcher } from "../routing/file-matcher.js";
 import type { MetadataFileRoute } from "../server/metadata-routes.js";
 import { hasExportedName } from "./report.js";
 import { createContainsMatcher, createPathMatcher, globFiles } from "./trace-glob.js";
@@ -109,27 +109,49 @@ function normalizePagePath(page: string, isDynamic: boolean): string {
   return page === "/" ? "/index" : page;
 }
 
-/**
- * Next.js names a metadata route that exports `generateSitemaps` or
- * `generateImageMetadata` `<path>/[__metadata_id__]`, without the sitemap's
- * `.xml`, and other metadata routes by their served path.
- */
-function metadataRouteName(route: MetadataFileRoute): string {
-  if (!route.isDynamic) return route.servedUrl;
+function generatesMultipleFiles(route: MetadataFileRoute): boolean {
+  if (!route.isDynamic) return false;
   let code: string;
   try {
     code = fs.readFileSync(route.filePath, "utf8");
   } catch {
-    return route.servedUrl;
+    return false;
   }
-  if (
-    !hasExportedName(code, "generateSitemaps") &&
-    !hasExportedName(code, "generateImageMetadata")
-  ) {
-    return route.servedUrl;
-  }
-  const base = route.type === "sitemap" ? route.servedUrl.replace(/\.xml$/, "") : route.servedUrl;
-  return `${base}/[__metadata_id__]`;
+  return (
+    hasExportedName(code, "generateSitemaps") || hasExportedName(code, "generateImageMetadata")
+  );
+}
+
+/**
+ * The entry name Next.js gives a metadata file (`createPagesMapping`):
+ * `normalizeMetadataRoute` adds `.txt` / `.webmanifest` to root robots and
+ * manifest files and a hash suffix under route groups and parallel routes,
+ * then `normalizeMetadataPageToRoute` adds `.xml` to sitemaps, or
+ * `[__metadata_id__]` when the file exports `generateSitemaps` or
+ * `generateImageMetadata`. Dynamic segments keep their names.
+ */
+function metadataRouteName(
+  route: MetadataFileRoute,
+  appDir: string,
+  matcher: ValidFileMatcher,
+  metadataRouteSuffix: (parentSegments: string[], metaType: string) => string,
+): string {
+  let page = `/${matcher.stripExtension(toSlash(path.relative(appDir, route.filePath)))}`;
+  let suffix = "";
+  if (page === "/robots") page += ".txt";
+  else if (page === "/manifest") page += ".webmanifest";
+  else suffix = metadataRouteSuffix(page.split("/").slice(1, -1), route.type);
+  const { dir, name, ext } = path.parse(page);
+  let entry = path.join(dir, `${name}${suffix ? `-${suffix}` : ""}${ext}`);
+  if (generatesMultipleFiles(route)) entry += "/[__metadata_id__]";
+  else if (entry.endsWith("/sitemap")) entry += ".xml";
+  return normalizeAppPath(`app${entry}/route`);
+}
+
+function hasReservedPagesFile(pagesDir: string, matcher: ValidFileMatcher): boolean {
+  return ["_app", "_document", "_error"].some((name) =>
+    matcher.extensions.some((ext) => fs.existsSync(path.join(pagesDir, `${name}.${ext}`))),
+  );
 }
 
 /**
@@ -138,8 +160,10 @@ function metadataRouteName(route: MetadataFileRoute): string {
  * App Router entries (`app/(group)/api/hello/route` is `/app/api/hello`) and
  * `normalizePagePath` for Pages Router entries (`/pages/index`,
  * `/pages/api/hello`). Keys match anywhere in the name, so the documented
- * `/api/hello` and `/*` forms work. The built-in entries Next.js always emits
- * are included too.
+ * `/api/hello` and `/*` forms work. The built-in entries Next.js emits
+ * (`discoverRoutes`) are included too: `_app`, `_document` and `_error` when
+ * there are pages, `_not-found` when there are app entries, and
+ * `_global-error` when there are no pages.
  */
 export async function collectTraceRouteNames(options: {
   appDir: string | null;
@@ -150,27 +174,7 @@ export async function collectTraceRouteNames(options: {
   const matcher = createValidFileMatcher(options.pageExtensions);
   const names = new Set<string>();
 
-  if (appDir) {
-    const [{ appRouter }, { scanMetadataFiles }] = await Promise.all([
-      import("../routing/app-router.js"),
-      import("../server/metadata-routes.js"),
-    ]);
-    for (const route of await appRouter(appDir, options.pageExtensions, matcher)) {
-      const file = route.pagePath ?? route.routePath;
-      if (!file) continue;
-      const entry = matcher.stripExtension(toSlash(path.relative(appDir, file)));
-      names.add(normalizeAppPath(`app/${entry}`));
-    }
-    // Metadata routes are `app/<served path>/route` entries, or
-    // `app/<path>/[__metadata_id__]/route` when they generate several files
-    // (Next.js `normalizeMetadataPageToRoute`).
-    for (const route of scanMetadataFiles(appDir)) {
-      names.add(`/app${metadataRouteName(route)}`);
-    }
-    names.add("/app/_not-found");
-    names.add("/app/_global-error");
-  }
-
+  let hasPages = false;
   if (pagesDir) {
     const { apiRouter, pagesRouter } = await import("../routing/pages-router.js");
     const [pages, apis] = await Promise.all([
@@ -182,7 +186,30 @@ export async function collectTraceRouteNames(options: {
       const page = `/${relative}`.replace(/\/index$/, "") || "/";
       names.add(`/pages${normalizePagePath(page, route.isDynamic)}`);
     }
-    for (const name of ["_app", "_document", "_error"]) names.add(`/pages/${name}`);
+    hasPages = names.size > 0 || hasReservedPagesFile(pagesDir, matcher);
+    if (hasPages) {
+      for (const name of ["_app", "_document", "_error"]) names.add(`/pages/${name}`);
+    }
+  }
+
+  if (appDir) {
+    const [{ appRouter }, { metadataRouteSuffix, scanMetadataFiles }] = await Promise.all([
+      import("../routing/app-router.js"),
+      import("../server/metadata-routes.js"),
+    ]);
+    const appNames = new Set<string>();
+    for (const route of await appRouter(appDir, options.pageExtensions, matcher)) {
+      const file = route.pagePath ?? route.routePath;
+      if (!file) continue;
+      const entry = matcher.stripExtension(toSlash(path.relative(appDir, file)));
+      appNames.add(normalizeAppPath(`app/${entry}`));
+    }
+    for (const route of scanMetadataFiles(appDir)) {
+      appNames.add(metadataRouteName(route, appDir, matcher, metadataRouteSuffix));
+    }
+    if (appNames.size > 0) appNames.add("/app/_not-found");
+    if (!hasPages) appNames.add("/app/_global-error");
+    for (const name of appNames) names.add(name);
   }
 
   return [...names];
@@ -252,9 +279,26 @@ function selectFiles(options: NitroTraceIncludesOptions): TraceSelection {
 
   return {
     included,
-    isTracedFileExcluded: (file) =>
-      routeExcludes.length > 0 && routeExcludes.every((isExcluded) => isExcluded(file)),
+    isTracedFileExcluded: (file) => {
+      if (routeExcludes.length === 0) return false;
+      const linked = pnpmLinkedPath(file, root);
+      return routeExcludes.every(
+        (isExcluded) => isExcluded(file) || (linked !== null && isExcluded(linked)),
+      );
+    },
   };
+}
+
+/**
+ * Nitro lists a pnpm package's files by their real path in the `.pnpm` store,
+ * but the package ships as `node_modules/<name>`, the path apps write excludes
+ * against. Map a store path to that path so those excludes apply too.
+ */
+function pnpmLinkedPath(file: string, root: string): string | null {
+  const match = /\/node_modules\/\.pnpm\/[^/]+\/node_modules\/((?:@[^/]+\/)?[^/]+)\/(.+)$/.exec(
+    file,
+  );
+  return match ? path.join(path.resolve(root), "node_modules", match[1], match[2]) : null;
 }
 
 function splitPackageName(segments: readonly string[]): string[] {

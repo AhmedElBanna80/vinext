@@ -1,62 +1,57 @@
 import fs from "node:fs";
 import path from "pathslash";
+import { compileGlob, type GlobSegment } from "./glob-match.js";
 
 /**
  * Glob matching for `outputFileTracingIncludes` / `outputFileTracingExcludes`,
  * following the options Next.js uses in `collect-build-traces.ts`:
  *
  * - Include globs are expanded with node-glob 7 (Next.js's compiled `glob`),
- *   `glob(pattern, { cwd: dir, nodir: true, dot: true })` ({@link globFiles}):
- *   wildcards and `**` match dot entries, directories are never results, and a
- *   symlinked directory is read like any other directory, except that `**`
- *   does not recurse below a symlinked directory it reached itself (the link's
- *   direct children still match the rest of the pattern).
+ *   `glob(pattern, { cwd: dir, nodir: true, dot: true })` ({@link globFiles}).
+ *   Patterns compile through the minimatch port in `glob-match.ts`, and the
+ *   walk follows node-glob: wildcards and `**` match dot entries, directories
+ *   are never results, and a symlinked directory is read like any other
+ *   directory, except that `**` does not recurse below a symlinked directory
+ *   it reached itself (the link's direct children still match the rest of the
+ *   pattern).
  * - Route keys and exclude globs are matched with picomatch 4,
  *   `picomatch(pattern, { dot: true, contains: true })`
  *   ({@link createContainsMatcher}, {@link createPathMatcher}): the pattern
- *   may match anywhere in the route name or absolute file path.
+ *   may match anywhere in the route name or absolute file path. This
+ *   translates picomatch's output for the syntax below rather than porting
+ *   its parser.
  *
- * Supported syntax: `*`, `**`, `?`, `[...]` classes, `{a,b}` and `{1..3}`
- * braces, the `@()`, `?()`, `+()`, `*()` and `!()` extglobs, and backslash
- * escapes. Parentheses outside an extglob are literal, as in node-glob, so
- * app route group directories such as `(group)` can be named directly.
+ * Supported picomatch syntax: `*`, `**`, `?`, `[...]` classes, `{a,b}` lists
+ * and `{a..b}` ranges, the `@()`, `?()`, `+()`, `*()` and `!()` extglobs
+ * within one path segment, and backslash escapes.
  */
 
 const REGEX_SPECIAL_CHARS = /[\\^$.*+?()[\]{}|]/g;
-// Upper bound on the strings a single `{a..b}` range expands to.
-const MAX_BRACE_RANGE = 10_000;
 
 function escapeRegex(value: string): string {
   return value.replace(REGEX_SPECIAL_CHARS, "\\$&");
 }
 
-function expandRange(body: string): string[] | null {
-  const numeric = /^(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?$/.exec(body);
-  const alpha = numeric ? null : /^([a-zA-Z])\.\.([a-zA-Z])(?:\.\.(-?\d+))?$/.exec(body);
-  const match = numeric ?? alpha;
-  if (!match) return null;
-  const start = numeric ? Number(match[1]) : match[1].charCodeAt(0);
-  const end = numeric ? Number(match[2]) : match[2].charCodeAt(0);
-  const step = Math.abs(Number(match[3] ?? 1)) || 1;
-  if (Math.abs(end - start) / step > MAX_BRACE_RANGE) return null;
-  // `{01..10}` keeps the zero padding of its widest bound.
-  const width =
-    numeric && /^-?0\d/.test(match[1] + "|" + match[2])
-      ? Math.max(match[1].length, match[2].length)
-      : 0;
-  const values: string[] = [];
-  for (
-    let value = start;
-    start <= end ? value <= end : value >= end;
-    value += start <= end ? step : -step
-  ) {
-    values.push(numeric ? String(value).padStart(width, "0") : String.fromCharCode(value));
+/**
+ * picomatch compiles `{a..b}` to the class of its sorted bounds (`[a-b]`), or
+ * to the literal bounds when that class is not a valid regex (`{01..03}`).
+ */
+function picomatchRange(body: string): string | null {
+  if (!body.includes("..") || /[{},]/.test(body)) return null;
+  const bounds = body.split("..");
+  if (bounds.includes("")) return null;
+  bounds.sort();
+  const range = `[${bounds.join("-")}]`;
+  try {
+    new RegExp(range);
+    return range;
+  } catch {
+    return bounds.join("..").replace(/[\\*?[\]{}()!@+|^$]/g, "\\$&");
   }
-  return values;
 }
 
-/** Expand `{a,b}` and `{1..3}` braces, as node-glob does before matching. */
-export function expandBraces(pattern: string): string[] {
+/** Expand picomatch `{a,b}` lists, and compile `{a..b}` ranges to a class. */
+function expandBraces(pattern: string): string[] {
   for (let open = 0; open < pattern.length; open++) {
     if (pattern[open] === "\\") {
       open++;
@@ -90,7 +85,8 @@ export function expandBraces(pattern: string): string[] {
         start = end + 1;
       }
     } else {
-      options = expandRange(body);
+      const range = picomatchRange(body);
+      if (range !== null) options = [range];
     }
     if (!options) {
       // A brace without a list or range (`{a}`) stays literal.
@@ -103,27 +99,15 @@ export function expandBraces(pattern: string): string[] {
   return [pattern];
 }
 
-/**
- * The two engines Next.js uses differ in a few details: node-glob (include
- * expansion) reads `[!a]` as a negated class, while picomatch (route keys and
- * excludes) reads `!` literally there and also accepts the bracket text itself
- * (`[id]` matches `i`, `d` or `[id]`) unless the class contains a range or
- * other regex character.
- */
-type Engine = "glob" | "picomatch";
-
-type ParsedSegment = { source: string; magic: boolean; end: number };
-
+// picomatch accepts the bracket text itself (`[id]` matches `i`, `d` or
+// `[id]`) unless the class contains a range or other regex character, and
+// reads `!` literally (only `^` negates).
 const PICOMATCH_CLASS_REGEX_CHARS = /[-*+?.^${}(|)[\]]/;
 
-function parseClass(
-  segment: string,
-  open: number,
-  engine: Engine,
-): { source: string; end: number } | null {
+function parseClass(segment: string, open: number): { source: string; end: number } | null {
   let index = open + 1;
   let negate = false;
-  if (segment[index] === "^" || (engine === "glob" && segment[index] === "!")) {
+  if (segment[index] === "^") {
     negate = true;
     index++;
   }
@@ -133,7 +117,7 @@ function parseClass(
     const char = segment[index];
     if (char === "]" && !first) {
       const source = negate ? `[^/${body}]` : `[${body}]`;
-      if (engine === "picomatch" && !negate && !PICOMATCH_CLASS_REGEX_CHARS.test(raw)) {
+      if (!negate && !PICOMATCH_CLASS_REGEX_CHARS.test(raw)) {
         return { source: `(?:${escapeRegex(`[${raw}]`)}|${source})`, end: index };
       }
       return { source, end: index };
@@ -150,22 +134,15 @@ function parseClass(
   return null;
 }
 
-type SegmentContext = {
-  engine: Engine;
-  /** The segment is the last of a picomatch pattern. */
-  endsPattern: boolean;
-};
-
 function parseExtglob(
   segment: string,
   start: number,
-  context: SegmentContext,
-  after: string,
+  endsPattern: boolean,
 ): { alternatives: string[]; end: number } | null {
   const alternatives: string[] = [];
   let index = start;
   for (;;) {
-    const part = parseSegment(segment, index, context, true, after);
+    const part = parseSegment(segment, index, endsPattern, true);
     alternatives.push(part.source);
     index = part.end;
     if (index >= segment.length) return null;
@@ -175,19 +152,19 @@ function parseExtglob(
 }
 
 /**
- * Parse one path segment (or, inside an extglob, one alternative) into regex
- * source. `after` is the source that follows the enclosing extglob up to the
- * end of the segment, which a negated extglob must also fail to match with.
+ * Translate one path segment (or, inside an extglob, one alternative) of a
+ * picomatch pattern into regex source. `endsPattern` is true for the last
+ * segment of the pattern, and `atPatternStart` for a segment the pattern
+ * starts with.
  */
 function parseSegment(
   segment: string,
   start: number,
-  context: SegmentContext,
+  endsPattern: boolean,
   inExtglob = false,
-  after = "",
-): ParsedSegment {
+  atPatternStart = false,
+): { source: string; end: number } {
   let source = "";
-  let magic = false;
   let index = start;
   while (index < segment.length) {
     const char = segment[index];
@@ -198,47 +175,41 @@ function parseSegment(
       continue;
     }
     if ("@?+*!".includes(char) && segment[index + 1] === "(") {
-      const probe = parseExtglob(segment, index + 2, context, after);
-      if (probe) {
-        const rest = parseSegment(segment, probe.end + 1, context, inExtglob, after);
-        const group = parseExtglob(segment, index + 2, context, rest.source + after) ?? probe;
+      const group = parseExtglob(segment, index + 2, endsPattern);
+      if (group) {
         const alternatives = group.alternatives.join("|");
+        // picomatch makes an extglob that starts the pattern (other than
+        // `@()`, which it reads as a plain group) match at least one character.
+        if (atPatternStart && index === 0 && char !== "@") source += "(?=.)";
         if (char !== "!") {
           source += `(?:${alternatives})${char === "@" ? "" : char}`;
-        } else if (context.engine === "glob") {
-          // minimatch: no alternative may match together with the rest of the
-          // segment, so `!(a)*` rejects `ab` as well as `a`.
-          source += `(?:(?!(?:${alternatives})${rest.source}${after}$)[^/]*?)`;
-        } else {
+        } else if (endsPattern && /^\)*$/.test(segment.slice(group.end + 1))) {
           // picomatch only anchors the lookahead when nothing but closing
           // parentheses follows in the pattern.
-          source +=
-            context.endsPattern && /^\)*$/.test(segment.slice(probe.end + 1))
-              ? `(?:(?!(?:${alternatives})$))[^/]*?`
-              : `(?:(?!(?:${alternatives}))[^/]*?)`;
+          source += `(?:(?!(?:${alternatives})$))[^/]*?`;
+        } else {
+          source += `(?:(?!(?:${alternatives}))[^/]*?)`;
         }
-        return { source: source + rest.source, magic: true, end: rest.end };
+        index = group.end + 1;
+        continue;
       }
     }
     if (char === "*") {
       // A segment-leading wildcard matches at least one character.
       source += index === 0 ? "(?=.)[^/]*" : "[^/]*";
       while (segment[index + 1] === "*") index++;
-      magic = true;
       index++;
       continue;
     }
     if (char === "?") {
       source += "[^/]";
-      magic = true;
       index++;
       continue;
     }
     if (char === "[") {
-      const charClass = parseClass(segment, index, context.engine);
+      const charClass = parseClass(segment, index);
       if (charClass) {
         source += charClass.source;
-        magic = true;
         index = charClass.end + 1;
         continue;
       }
@@ -246,11 +217,12 @@ function parseSegment(
     source += escapeRegex(char);
     index++;
   }
-  return { source, magic, end: index };
+  return { source, end: index };
 }
 
-function unescapeGlob(segment: string): string {
-  return segment.replace(/\\(.)/g, "$1");
+/** Whether a segment's last token is a wildcard (`*`, `a*`, `@(a)*`). */
+function endsWithStar(segment: string | undefined): boolean {
+  return segment !== undefined && /(?:^|[^\\])(?:\\\\)*\*$/.test(segment);
 }
 
 /**
@@ -268,17 +240,19 @@ function containsSource(pattern: string, rooted: boolean): string {
       if (segments.length === 1) source += ".*";
       // `**/x`: x at the start of the value or after any `/`.
       else if (index === 0) source += "(?:^|/)";
-      // picomatch does not let a globstar right after a leading `/` match
-      // zero directories.
+      // picomatch does not let a globstar right after a leading `/`, or after
+      // a wildcard (`*/**`), match zero directories.
       else if (index === 1 && rooted && segments[0] === "") source += "/.*";
-      else if (index === segments.length - 1) source += "(?:/.*|$)";
+      else if (index === segments.length - 1) {
+        source += endsWithStar(segments[index - 1]) ? "/.*" : "(?:/.*|$)";
+      }
       // `a/**/b`: the following `/` is added with `b`.
       else source += "(?:/.*)?";
       return;
     }
     if (index > 0 && !(index === 1 && segments[0] === "**")) source += "/";
-    const context = { engine: "picomatch", endsPattern: index === segments.length - 1 } as const;
-    source += parseSegment(segment, 0, context).source;
+    const endsPattern = index === segments.length - 1;
+    source += parseSegment(segment, 0, endsPattern, false, rooted && index === 0).source;
   });
   return source;
 }
@@ -328,11 +302,6 @@ export function createPathMatcher(
   return (file) => joined.includes(file) || regexes.some((regex) => regex.test(file));
 }
 
-type GlobPart =
-  | { kind: "literal"; value: string }
-  | { kind: "pattern"; regex: RegExp }
-  | { kind: "globstar" };
-
 function readdirNames(dir: string): string[] | null {
   try {
     return fs.readdirSync(dir);
@@ -365,15 +334,9 @@ function isFile(file: string): boolean {
  */
 export function globFiles(cwd: string, pattern: string): string[] {
   const results = new Set<string>();
-  for (const expanded of expandBraces(pattern)) {
+  for (const parts of compileGlob(pattern)) {
     // A trailing slash only matches directories, which `nodir` drops.
-    if (expanded.endsWith("/")) continue;
-    const parts: GlobPart[] = expanded.split("/").map((segment) => {
-      if (segment === "**") return { kind: "globstar" };
-      const parsed = parseSegment(segment, 0, { engine: "glob", endsPattern: false });
-      if (!parsed.magic) return { kind: "literal", value: unescapeGlob(segment) };
-      return { kind: "pattern", regex: toRegExp(`^${parsed.source}$`, segment) };
-    });
+    if (parts.length > 1 && isEmptyLiteral(parts[parts.length - 1])) continue;
 
     let literalCount = 0;
     while (literalCount < parts.length && parts[literalCount].kind === "literal") literalCount++;
@@ -384,7 +347,7 @@ export function globFiles(cwd: string, pattern: string): string[] {
     // Resolves absolute patterns (including drive letters) against cwd.
     const base = path.resolve(
       cwd,
-      literalPrefix === "" && expanded.startsWith("/") ? "/" : literalPrefix || ".",
+      literalPrefix === "" && isEmptyLiteral(parts[0]) ? "/" : literalPrefix || ".",
     );
 
     const visited = new Set<string>();
@@ -426,4 +389,8 @@ export function globFiles(cwd: string, pattern: string): string[] {
     walk(base, literalCount, false);
   }
   return [...results];
+}
+
+function isEmptyLiteral(part: GlobSegment | undefined): boolean {
+  return part?.kind === "literal" && part.value === "";
 }

@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -35,6 +36,10 @@ async function exists(file: string): Promise<boolean> {
 }
 
 const PNPM_NATIVE = "node_modules/.pnpm/@native+core-x@1.0.0/node_modules/@native/core-x";
+
+const nextHash = createRequire(import.meta.url)("next/dist/shared/lib/hash") as {
+  djb2Hash(value: string): number;
+};
 
 const pkg = (name: string, version: string) => JSON.stringify({ name, version, main: "index.js" });
 
@@ -382,6 +387,8 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
           "export function generateImageMetadata() { return [{ id: 'small' }]; }\n" +
           "export default function Icon() { return null; }",
         "app/products/opengraph-image.tsx": "export default function Image() { return null; }",
+        "app/blog/[slug]/icon.png": "",
+        "app/(marketing)/twitter-image.tsx": "export default function Image() { return null; }",
         "pages/legacy.tsx": page,
         "pages/docs/index.tsx": page,
         "pages/api/x.ts": "export default function handler() {}",
@@ -391,8 +398,11 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
         pagesDir: path.join(root, "pages"),
         pageExtensions: ["tsx", "ts", "jsx", "js"],
       });
+      // Next.js hashes the parent path of metadata files below route groups.
+      const groupSuffix = nextHash.djb2Hash("/(marketing)").toString(36).slice(0, 6);
       // `next build --webpack` entry names (`.next/server/**/*.js.nft.json`)
-      // after normalizeAppPath / normalizePagePath.
+      // after normalizeAppPath / normalizePagePath. `_global-error` is only
+      // built without pages.
       expect(names.sort()).toEqual(
         [
           "/app",
@@ -403,8 +413,9 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
           "/app/products/sitemap/[__metadata_id__]",
           "/app/products/icon/[__metadata_id__]",
           "/app/products/opengraph-image",
+          "/app/blog/[slug]/icon.png",
+          `/app/twitter-image-${groupSuffix}`,
           "/app/_not-found",
-          "/app/_global-error",
           "/pages/legacy",
           "/pages/docs",
           "/pages/api/x",
@@ -413,6 +424,71 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
           "/pages/_error",
         ].sort(),
       );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("names the built-in routes of app-only builds", async () => {
+    const { collectTraceRouteNames } =
+      await import("../packages/vinext/src/build/nitro-trace-includes.js");
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-app-only-"));
+    try {
+      await writeFiles(root, {
+        "app/page.tsx": "export default function Page() { return null; }",
+        "app/robots.ts": "export default function robots() { return {}; }",
+        "pages/.gitkeep": "",
+      });
+      const names = await collectTraceRouteNames({
+        appDir: path.join(root, "app"),
+        // A pages directory without pages is an app-only build.
+        pagesDir: path.join(root, "pages"),
+        pageExtensions: ["tsx", "ts", "jsx", "js"],
+      });
+      expect(names.sort()).toEqual(
+        ["/app", "/app/robots.txt", "/app/_not-found", "/app/_global-error"].sort(),
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("applies excludes to pnpm packages by their node_modules path", async () => {
+    const { createNitroTraceIncludes } =
+      await import("../packages/vinext/src/build/nitro-trace-includes.js");
+    const root = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-pnpm-")),
+    );
+    try {
+      const store = path.join(root, PNPM_NATIVE);
+      await writeFiles(root, {
+        [`${PNPM_NATIVE}/package.json`]: pkg("@native/core-x", "1.0.0"),
+        [`${PNPM_NATIVE}/index.js`]: "",
+        [`${PNPM_NATIVE}/lib/a.js`]: "",
+      });
+      // Nitro lists the real paths in the store.
+      const tracedPackages: TracedPackages = {
+        "@native/core-x": {
+          name: "@native/core-x",
+          versions: {
+            "1.0.0": {
+              path: store,
+              files: [path.join(store, "index.js"), path.join(store, "lib/a.js")],
+              pkgJSON: { name: "@native/core-x", version: "1.0.0" },
+            },
+          },
+        },
+      };
+      createNitroTraceIncludes({
+        root,
+        routes: ["/app"],
+        includes: {},
+        excludes: { "/": ["node_modules/@native/core-x/lib/**"] },
+        warn: () => {},
+      })!.tracedPackages(tracedPackages);
+      expect(tracedPackages["@native/core-x"].versions["1.0.0"].files).toEqual([
+        path.join(store, "index.js"),
+      ]);
     } finally {
       await fs.rm(root, { recursive: true, force: true }).catch(() => {});
     }

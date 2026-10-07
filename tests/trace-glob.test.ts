@@ -3,10 +3,10 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
+import { braceExpand } from "../packages/vinext/src/build/glob-match.js";
 import {
   createContainsMatcher,
   createPathMatcher,
-  expandBraces,
   globFiles,
 } from "../packages/vinext/src/build/trace-glob.js";
 
@@ -16,6 +16,10 @@ import {
 const require = createRequire(import.meta.url);
 const nextGlob = require("next/dist/compiled/glob") as {
   sync(pattern: string, options: Record<string, unknown>): string[];
+  GlobSync: new (
+    pattern: string,
+    options: Record<string, unknown>,
+  ) => { minimatch: { globSet: string[] } };
 };
 const picomatch = require("next/dist/compiled/picomatch") as (
   pattern: string | string[],
@@ -49,6 +53,8 @@ beforeAll(async () => {
   await write("file-10.txt");
   for (const name of ["a", "aa", "ab", "b", "xa", "xb", "a.js", "b.js", "c.js", "ac", "bc"])
     await write(`neg/${name}`);
+  for (const name of ["-01", "000", "001", "0-1", "1", "-1", "a[", "a(b", "+(a", "xab"])
+    await write(`odd/${name}`);
   await fs.mkdir(path.join(root, "node_modules/@native"), { recursive: true });
   await fs.symlink(
     "../.pnpm/@native+core-x@1.0.0/node_modules/@native/core-x",
@@ -106,6 +112,27 @@ describe("globFiles", () => {
     "neg/!(!(a))",
     "neg/!(a|!(b))",
     "neg/!(a)c",
+    "neg/@(!(a)|b)",
+    "neg/+(!(a)|b)",
+    "neg/x@(!(a))b",
+    "neg/@(x)!(a)b",
+    "neg/!(a)*(c)",
+    "neg/*(a|b)",
+    "neg/?(a)b",
+    "odd/{-01..01}",
+    "odd/{-1..1}",
+    "odd/{0..1}",
+    "odd/{1..010..3}",
+    "odd/a[",
+    "odd/a(b",
+    "odd/+(a",
+    "odd/\\+(a",
+    "odd/x{a,b{c,d}}b",
+    "odd/{a}",
+    "odd/[!-]*",
+    "odd/[^0]*",
+    "odd/[z-a]*",
+    "include-me//hello.txt",
   ];
 
   it.each(patterns)("matches node-glob { nodir, dot } for %s", (pattern) => {
@@ -124,15 +151,35 @@ describe("globFiles", () => {
   });
 });
 
-describe("expandBraces", () => {
-  it("expands lists, nested lists and ranges", () => {
-    expect(expandBraces("a/{b,c}/d")).toEqual(["a/b/d", "a/c/d"]);
-    expect(expandBraces("{a,b{c,d}}")).toEqual(["a", "bc", "bd"]);
-    expect(expandBraces("x{1..3}")).toEqual(["x1", "x2", "x3"]);
-    expect(expandBraces("x{08..10}")).toEqual(["x08", "x09", "x10"]);
-    expect(expandBraces("{a..c}")).toEqual(["a", "b", "c"]);
-    expect(expandBraces("{a}")).toEqual(["{a}"]);
-    expect(expandBraces("\\{a,b}")).toEqual(["\\{a,b}"]);
+describe("braceExpand", () => {
+  const patterns = [
+    "a/{b,c}/d",
+    "{a,b{c,d}}",
+    "x{1..3}",
+    "x{08..10}",
+    "{a..c}",
+    "{a..e..2}",
+    "{-01..01}",
+    "{1..010..3}",
+    "{3..1}",
+    "{a}",
+    "{a}{b,c}",
+    "{a},b}",
+    "x{{a,b}}y",
+    "\\{a,b}",
+    "a\\,b{c,d}",
+    "${a,b}",
+    "{}a{b,c}",
+    "{a,}",
+    "{,a}",
+    "{a,b",
+    "a{b,c}d{e,f}",
+    "{[,]}",
+  ];
+
+  it.each(patterns)("matches minimatch's brace expansion for %s", (pattern) => {
+    const expected = new nextGlob.GlobSync(pattern, { cwd: root, nonull: true }).minimatch.globSet;
+    expect(braceExpand(pattern)).toEqual(expected);
   });
 });
 
@@ -151,6 +198,20 @@ describe("createContainsMatcher", () => {
     "/app/products/[id]",
     "ab",
     "a",
+    "aa",
+    "b",
+    "app",
+    "/a",
+    "a/b",
+    "-01",
+    "01",
+    "1",
+    "0",
+    "2",
+    "xb",
+    "{a,b",
+    "a.js",
+    "/app/a.js",
   ];
   const keys = [
     "/",
@@ -186,6 +247,25 @@ describe("createContainsMatcher", () => {
     "!(!(a))",
     "/app/x!(a)*",
     "!(a)b",
+    "/*/**",
+    "*/**",
+    "/app/*/**",
+    "/a*/**",
+    "/app/**/**",
+    "@(!(a)|b)",
+    "+(!(a)|b)",
+    "{1..3}",
+    "{-01..01}",
+    "{01..03}",
+    "{1..10..2}",
+    "x{a..c}",
+    "{a,b",
+    "{a}",
+    "*(a)",
+    "?(a)b",
+    "!(*).js",
+    "/app/+(a)",
+    "!(a)",
   ];
 
   it.each(keys)("matches picomatch { dot, contains } for route key %s", (key) => {
@@ -218,6 +298,9 @@ describe("createPathMatcher", () => {
     "include-me/**/*",
     "src/temp/**/*.log",
     "**/index.js",
+    "node_modules/pkg{,-other}/**",
+    "node_modules/*/**",
+    "node_modules/@swc/core-{darwin,linux}-*/*.node",
   ];
 
   it.each(excludes)("matches picomatch on path.join(dir, glob) for %s", (exclude) => {
