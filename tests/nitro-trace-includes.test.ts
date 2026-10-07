@@ -453,6 +453,40 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
     }
   });
 
+  it("fails safe on glob syntax it does not match exactly", async () => {
+    const { createNitroTraceIncludes } =
+      await import("../packages/vinext/src/build/nitro-trace-includes.js");
+    const root = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-inexact-")),
+    );
+    try {
+      await writeFiles(root, {
+        "node_modules/inc/package.json": pkg("inc", "1.0.0"),
+        "node_modules/inc/a.txt": "",
+        "node_modules/inc/b.txt": "",
+      });
+      const warnings: string[] = [];
+      const tracedPackages: TracedPackages = {};
+      createNitroTraceIncludes({
+        root,
+        routes: ["/app"],
+        // A POSIX class key applies to every route; an extglob spanning `/` is ignored.
+        includes: { "/[[:digit:]]": ["node_modules/inc/*.txt"] },
+        excludes: { "/": ["node_modules/@(inc/a).txt"] },
+        warn: (message) => warnings.push(message),
+      })!.tracedPackages(tracedPackages);
+      const inc = path.join(root, "node_modules/inc");
+      expect(tracedPackages.inc.versions["1.0.0"].files.sort()).toEqual([
+        path.join(inc, "a.txt"),
+        path.join(inc, "b.txt"),
+      ]);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("/[[:digit:]], node_modules/@(inc/a).txt");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
   it("applies excludes to pnpm packages by their node_modules path", async () => {
     const { createNitroTraceIncludes } =
       await import("../packages/vinext/src/build/nitro-trace-includes.js");

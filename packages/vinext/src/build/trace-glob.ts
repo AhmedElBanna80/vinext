@@ -267,6 +267,15 @@ function toRegExp(source: string, literal: string): RegExp {
 }
 
 /**
+ * Whether {@link createContainsMatcher} and {@link createPathMatcher} match a
+ * pattern exactly like picomatch. POSIX classes (`[[:alpha:]]`) and extglobs
+ * that span path segments (`@(a/b)`) are not translated.
+ */
+export function isTranslatedExactly(pattern: string): boolean {
+  return !/\[:[a-z]+:\]/.test(pattern) && !/[@?+*!]\([^)]*\//.test(pattern);
+}
+
+/**
  * Match a value against globs anywhere in the string, like
  * `picomatch(patterns, { dot: true, contains: true })`.
  */

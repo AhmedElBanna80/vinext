@@ -3,7 +3,12 @@ import path, { toSlash } from "pathslash";
 import { createValidFileMatcher, type ValidFileMatcher } from "../routing/file-matcher.js";
 import type { MetadataFileRoute } from "../server/metadata-routes.js";
 import { hasExportedName } from "./report.js";
-import { createContainsMatcher, createPathMatcher, globFiles } from "./trace-glob.js";
+import {
+  createContainsMatcher,
+  createPathMatcher,
+  globFiles,
+  isTranslatedExactly,
+} from "./trace-glob.js";
 
 /**
  * Apply Next.js `outputFileTracingIncludes` / `outputFileTracingExcludes` to
@@ -232,12 +237,18 @@ type TraceSelection = {
 
 function selectFiles(options: NitroTraceIncludesOptions): TraceSelection {
   const { root, routes, includes, excludes } = options;
-  const includeKeys = Object.keys(includes).map(
-    (key) => [key, createContainsMatcher([key])] as const,
-  );
-  const excludeKeys = Object.keys(excludes).map(
-    (key) => [key, createContainsMatcher([key])] as const,
-  );
+  // Patterns vinext cannot match exactly fail safe: such an include key
+  // applies to every route, and such an exclude key or glob is ignored.
+  const inexact = new Set<string>();
+  const keyMatcher = (key: string, fallback: boolean) => {
+    if (isTranslatedExactly(key)) return createContainsMatcher([key]);
+    inexact.add(key);
+    return () => fallback;
+  };
+  const includeKeys = Object.keys(includes).map((key) => [key, keyMatcher(key, true)] as const);
+  const excludeKeys = Object.keys(excludes).map((key) => [key, keyMatcher(key, false)] as const);
+  const exactExcludes = (globs: readonly string[]) =>
+    globs.filter((glob) => isTranslatedExactly(glob) || (inexact.add(glob), false));
 
   // Routes that match the same keys select the same files.
   const groups = new Map<string, { includes: string[]; excludes: string[] }>();
@@ -246,8 +257,15 @@ function selectFiles(options: NitroTraceIncludesOptions): TraceSelection {
     const matchedExcludes = excludeKeys.filter(([, matches]) => matches(route)).map(([key]) => key);
     groups.set(JSON.stringify([matchedIncludes, matchedExcludes]), {
       includes: [...new Set(matchedIncludes.flatMap((key) => includes[key]))],
-      excludes: [...new Set(matchedExcludes.flatMap((key) => excludes[key]))],
+      excludes: exactExcludes([...new Set(matchedExcludes.flatMap((key) => excludes[key]))]),
     });
+  }
+  if (inexact.size > 0) {
+    options.warn(
+      `[vinext] outputFileTracingIncludes/outputFileTracingExcludes pattern(s) ${[...inexact].join(", ")} ` +
+        "use glob syntax vinext does not match exactly (POSIX classes, extglobs spanning `/`): " +
+        "such include keys apply to every route, and such excludes are ignored.",
+    );
   }
 
   // Nitro lists traced files by real path, so excludes also match from the
