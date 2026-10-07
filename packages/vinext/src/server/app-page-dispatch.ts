@@ -43,7 +43,9 @@ import {
   resolveAppPageParentHttpAccessBoundaryModule,
 } from "./app-page-boundary.js";
 import {
+  resolveAppPageSpecialErrorStoredHeaders,
   buildAppPageSpecialErrorResponse,
+  resolveAppPageShellSpecialError,
   resolveAppPageSpecialError,
   type AppPageFontPreload,
   type AppPageSpecialError,
@@ -108,6 +110,7 @@ import {
 } from "./cacheability-manifest.js";
 import type { AppRenderErrorContextOverrides } from "./app-rsc-error-handler.js";
 import { traceResponseStart } from "./response-start-tracing.js";
+import { getFrameworkLinkHeader } from "./app-response-header-provenance.js";
 
 type AppPageParams = Record<string, string | string[]>;
 type AppPageElement = ReactNode | Readonly<Record<string, ReactNode>>;
@@ -416,6 +419,8 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
       boundaryComponent?: unknown;
       boundaryModule?: AppPageModule | null;
       intercept?: AppPageDispatchInterceptOptions | null;
+      /** The document may be stored, so it must not carry the request's query. */
+      isCacheCandidate?: boolean;
       layouts?: readonly AppPageModule[];
       matchedParams: AppPageParams;
     },
@@ -1009,7 +1014,8 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
               revalidationTarget.route.pattern,
               { renderSource: "server-rendering", revalidateReason: "stale" },
             );
-            revalidationRscErrorTracker = createAppPageRscErrorTracker(baseRevalidatedOnError);
+            const rscErrorTracker = createAppPageRscErrorTracker(baseRevalidatedOnError);
+            revalidationRscErrorTracker = rscErrorTracker;
             // No inner runWithFetchDedupe here: this renderFn is already
             // wrapped in runWithFetchDedupe by runAppPageRevalidationContext.
             const rendered = await renderAppPageCacheArtifacts({
@@ -1025,13 +1031,56 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
               loadSsrHandler: options.loadSsrHandler,
               mountedSlotsHeader: options.mountedSlotsHeader,
               navigationParams: revalidationTarget.navigationParams,
-              isCapturedRscError: revalidationRscErrorTracker.isCapturedError,
-              onError: revalidationRscErrorTracker.onRenderError,
+              isCapturedRscError: rscErrorTracker.isCapturedError,
+              onError: rscErrorTracker.onRenderError,
               onSsrError(error) {
                 reportedSsrRevalidationErrors.add(error);
                 return baseRevalidatedOnSsrError(error, undefined, undefined);
               },
               reactMaxHeadersLength: options.reactMaxHeadersLength,
+              async renderShellSpecialError(error) {
+                const specialError = resolveAppPageShellSpecialError(
+                  error,
+                  rscErrorTracker.getCapturedSpecialErrors(error),
+                );
+                // Next.js stores generateMetadata()'s special error with the
+                // status its triggering request's metadata streaming gives
+                // it. This render always blocks on metadata, so it fails
+                // instead, keeping the previous entry, as a miss stores
+                // nothing for it.
+                if (!specialError || specialError.fromMetadata === true) return null;
+                // An RSC request regenerates only its RSC entry, so needs no
+                // document.
+                if (options.isRscRequest) {
+                  return {
+                    headers: resolveAppPageSpecialErrorStoredHeaders(
+                      specialError,
+                      options.basePath,
+                    ),
+                    html: "",
+                    status: specialError.statusCode,
+                  };
+                }
+                // The fallback boundaries are resolved for the matched route.
+                if (revalidationTarget.route !== route) return null;
+                const document = await renderPageSpecialError(
+                  options,
+                  specialError,
+                  false,
+                  revalidationTarget.interceptOpts,
+                  true,
+                );
+                // As on a miss, only the special error's own document is stored.
+                if (document.status !== specialError.statusCode) return null;
+                return {
+                  headers: resolveAppPageSpecialErrorStoredHeaders(specialError, options.basePath),
+                  html: await document.text(),
+                  // Only the renderer's own Link, as on a miss: middleware's is
+                  // merged again on replay.
+                  linkHeader: getFrameworkLinkHeader(document.headers) ?? undefined,
+                  status: specialError.statusCode,
+                };
+              },
               renderToReadableStream: options.renderToReadableStream,
               rootParams: options.rootParams,
               route: revalidationTarget.route,
@@ -1040,6 +1089,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
             });
             options.clearRequestContext();
             return {
+              headers: rendered.headers,
               html: rendered.html,
               htmlRenderObservation: rendered.htmlRenderObservation,
               linkHeader: rendered.linkHeader,
@@ -1048,6 +1098,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
               tags: rendered.tags,
               cacheControl: rendered.cacheControl,
               revalidateSeconds: revalidationRouteRevalidateSeconds,
+              status: rendered.status,
               usedDynamicApi: rendered.usedDynamicApi,
             };
           },
@@ -1438,12 +1489,13 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     renderLayoutSpecialError(specialError, layoutIndex) {
       return renderLayoutSpecialError(options, specialError, layoutIndex, serveStreamingMetadata);
     },
-    renderPageSpecialError(specialError) {
+    renderPageSpecialError(specialError, renderOptions) {
       return renderPageSpecialError(
         options,
         specialError,
         serveStreamingMetadata,
         interceptResult.interceptOpts,
+        renderOptions?.isCacheCandidate === true,
       );
     },
     renderToReadableStream: options.renderToReadableStream,
@@ -1510,6 +1562,7 @@ async function renderPageSpecialError<TRoute extends AppPageDispatchRoute>(
   specialError: AppPageSpecialError,
   serveStreamingMetadata: boolean,
   intercept: AppPageDispatchInterceptOptions | null | undefined,
+  isCacheCandidate = false,
 ): Promise<Response> {
   return buildAppPageSpecialErrorResponse({
     basePath: options.basePath,
@@ -1559,6 +1612,7 @@ async function renderPageSpecialError<TRoute extends AppPageDispatchRoute>(
         (routeBoundaryModule === null || routeBoundaryModule === parentBoundaryModule);
       const fallbackOptions: Parameters<typeof options.renderHttpAccessFallbackPage>[1] = {
         intercept,
+        ...(isCacheCandidate ? { isCacheCandidate } : {}),
         matchedParams: options.params,
       };
       if (useLayoutAlignedBoundary && boundaryLayoutIndex !== null) {

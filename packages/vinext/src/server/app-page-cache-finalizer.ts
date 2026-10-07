@@ -91,6 +91,12 @@ type FinalizeAppPageHtmlCacheResponseOptions = {
   isStaticEligible: boolean;
   revalidateSeconds: number | null;
   linkHeader: string | null;
+  /**
+   * The status and headers stored with both entries, for a render that ended
+   * in a special error: 404/403/401, or 307/308 with its `location`.
+   */
+  status?: number;
+  headers?: Record<string, string>;
   waitUntil?: (promise: Promise<void>) => void;
 };
 
@@ -305,11 +311,8 @@ export function finalizeAppPageHtmlCacheResponse(
     markFrameworkLinkHeaders(clientResponse.headers, options.linkHeader);
     return clientResponse;
   }
-  if (!response.body) {
-    return response;
-  }
-
-  const [streamForClient, streamForCache] = response.body.tee();
+  // A redirect has no body, so its entry stores an empty document.
+  const [streamForClient, streamForCache] = response.body ? response.body.tee() : [null, null];
   const htmlKey = options.isrHtmlKey(options.cleanPathname);
   const rscKey = options.isrRscKey(
     options.cleanPathname,
@@ -327,7 +330,12 @@ export function finalizeAppPageHtmlCacheResponse(
 
   const cachePromise = (async () => {
     try {
-      let cachedHtml = await readStreamAsText(streamForCache);
+      let cachedHtml = streamForCache ? await readStreamAsText(streamForCache) : "";
+      // The page's Flight render can outlive a document it didn't render, such
+      // as a special error's, and the store reads what that render observed.
+      const rscData = options.capturedRscDataPromise
+        ? await options.capturedRscDataPromise
+        : undefined;
 
       if (
         options.capturedDynamicUsageBeforeContextCleanup?.() === true ||
@@ -364,6 +372,7 @@ export function finalizeAppPageHtmlCacheResponse(
         state: observationState,
       });
       const linkHeader = options.linkHeader;
+      const status = options.status ?? 200;
       // Every query shares these entries, so a render not proven to leave the
       // query unread is never stored.
       if (
@@ -379,21 +388,20 @@ export function finalizeAppPageHtmlCacheResponse(
           buildAppPageCacheValue(
             cachedHtml,
             undefined,
-            200,
+            status,
             htmlRenderObservation,
-            linkHeader ? { link: linkHeader } : undefined,
+            linkHeader ? { ...options.headers, link: linkHeader } : options.headers,
           ),
           { cacheControl, tags: pageTags },
         ),
       ];
 
-      if (options.capturedRscDataPromise) {
+      if (rscData) {
         writes.push(
-          options.capturedRscDataPromise.then((rscData) =>
-            options.isrSet(rscKey, buildAppPageCacheValue("", rscData, 200, rscRenderObservation), {
-              cacheControl,
-              tags: pageTags,
-            }),
+          options.isrSet(
+            rscKey,
+            buildAppPageCacheValue("", rscData, status, rscRenderObservation, options.headers),
+            { cacheControl, tags: pageTags },
           ),
         );
       }
