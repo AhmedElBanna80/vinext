@@ -210,6 +210,43 @@ test.describe("Next.js compat: navigation (browser)", () => {
     expect(await page.evaluate(() => (window as any).__NAV_MARKER__)).toBe(true);
   });
 
+  // Next.js refetches a page that redirects to itself forever. vinext doesn't
+  // follow it and logs an error instead.
+  for (const [pathname, linkId] of [
+    ["/nextjs-compat/self-redirect", "link-to-self-redirect"],
+    ["/nextjs-compat/self-redirect-streamed", "link-to-self-redirect-streamed"],
+  ]) {
+    test(`Link to ${pathname} (redirects to itself) does not refetch it forever`, async ({
+      page,
+    }) => {
+      const errors: string[] = [];
+      page.on("console", (message) => {
+        if (message.type() === "error") errors.push(message.text());
+      });
+      let rscRequests = 0;
+      let documentRequests = 0;
+      page.on("request", (request) => {
+        if (new URL(request.url()).pathname.replace(/\.rsc$/, "") !== pathname) return;
+        if (request.resourceType() === "document") documentRequests++;
+        else rscRequests++;
+      });
+
+      await page.goto(`${BASE}/nextjs-compat/nav-link-test`);
+      await waitForAppRouterHydration(page);
+      await page.click(`#${linkId}`);
+
+      await expect
+        .poll(() =>
+          errors.some((error) => error.includes("redirect() resolved to the current URL")),
+        )
+        .toBe(true);
+      await page.waitForTimeout(1000);
+      expect(new URL(page.url()).pathname).toBe(pathname);
+      expect(documentRequests).toBe(0);
+      expect(rscRequests).toBeLessThanOrEqual(2);
+    });
+  }
+
   // A parallel slot page's redirect() is caught in the slot, as in Next.js, so
   // the shared layout keeps its client state.
   test("slot page calling redirect() keeps the layout's state", async ({ page }) => {

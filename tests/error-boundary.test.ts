@@ -474,6 +474,42 @@ describe("RedirectBoundary digest classification", () => {
   });
 });
 
+describe("isRedirectToCurrentUrl", () => {
+  // A page whose redirect() targets its own URL would refetch forever, so the
+  // page and slot boundaries don't follow it.
+  it("matches only a redirect to the URL the browser is at", async () => {
+    const { isRedirectToCurrentUrl } =
+      await import("../packages/vinext/src/shims/error-boundary-navigation.js");
+    vi.stubGlobal("window", { location: { href: "https://example.test/self?x=1" } });
+    try {
+      expect(isRedirectToCurrentUrl("/self?x=1")).toBe(true);
+      expect(isRedirectToCurrentUrl("https://example.test/self?x=1")).toBe(true);
+      expect(isRedirectToCurrentUrl("?x=1")).toBe(true);
+      expect(isRedirectToCurrentUrl("/self")).toBe(false);
+      expect(isRedirectToCurrentUrl("/self?x=1#top")).toBe(false);
+      expect(isRedirectToCurrentUrl("https://other.test/self?x=1")).toBe(false);
+      expect(isRedirectToCurrentUrl("javascript:alert(1)")).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  // Only the exact URL, hash included, refetches the page; a hash change scrolls.
+  it("compares the hash exactly", async () => {
+    const { isRedirectToCurrentUrl } =
+      await import("../packages/vinext/src/shims/error-boundary-navigation.js");
+    vi.stubGlobal("window", { location: { href: "https://example.test/self#section" } });
+    try {
+      expect(isRedirectToCurrentUrl("/self#section")).toBe(true);
+      expect(isRedirectToCurrentUrl("https://example.test/self#section")).toBe(true);
+      expect(isRedirectToCurrentUrl("/self")).toBe(false);
+      expect(isRedirectToCurrentUrl("/self#other")).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe("RedirectBoundary reset", () => {
   type RedirectState = {
     redirect: string | null;

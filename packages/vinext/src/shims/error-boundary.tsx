@@ -2,7 +2,11 @@
 
 import React from "react";
 import { decodeRedirectError, isRedirectError } from "./navigation-server.js";
-import { useErrorBoundaryPathname, useErrorBoundaryRouter } from "./error-boundary-navigation.js";
+import {
+  isRedirectToCurrentUrl,
+  useErrorBoundaryPathname,
+  useErrorBoundaryRouter,
+} from "./error-boundary-navigation.js";
 import DefaultGlobalError from "./default-global-error.js";
 import { handleAppNavigationFailure } from "../client/app-nav-failure-handler.js";
 import { VINEXT_DEV_ERROR_RECOVERY_EVENT } from "../utils/dev-error-recovery-event.js";
@@ -111,14 +115,23 @@ function HandleRedirect({
   redirect,
   redirectType,
   reset,
+  stopsSelfRedirect,
 }: {
   redirect: string;
   redirectType: "push" | "replace";
   reset: () => void;
+  stopsSelfRedirect: boolean;
 }) {
   const router = useErrorBoundaryRouter();
 
   React.useEffect(() => {
+    if (stopsSelfRedirect && isRedirectToCurrentUrl(redirect)) {
+      // Following it would refetch the same page forever, as Next.js does.
+      console.error(
+        "[vinext] redirect() resolved to the current URL — not following it, to prevent an infinite loop.",
+      );
+      return;
+    }
     React.startTransition(() => {
       if (redirectType === "push") {
         router.push(redirect);
@@ -127,7 +140,7 @@ function HandleRedirect({
       }
       reset();
     });
-  }, [redirect, redirectType, reset, router]);
+  }, [redirect, redirectType, reset, router, stopsSelfRedirect]);
 
   return null;
 }
@@ -198,6 +211,10 @@ export class RedirectErrorBoundary extends React.Component<
           redirect={redirect}
           redirectType={redirectType}
           reset={() => this.setState({ redirect: null, redirectType: null })}
+          // Page and slot boundaries (the ones with a reset key) render inside
+          // the committed route, so the browser URL is already the redirecting
+          // page's. The root boundary can catch a redirect before that commit.
+          stopsSelfRedirect={this.props.resetKey !== undefined}
         />
       );
     }
