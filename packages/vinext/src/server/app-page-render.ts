@@ -4,6 +4,7 @@ import type { NavigationContext } from "vinext/shims/navigation";
 import type { AppPageCacheSetter } from "./isr-cache.js";
 import type { RootParams } from "vinext/shims/root-params";
 import { runWithFetchDedupe } from "vinext/shims/fetch-cache";
+import { getRequestExecutionContext } from "vinext/shims/request-context";
 import { resolveClientStaleTimeSeconds } from "../utils/cache-control-metadata.js";
 import { AppElementsWire, isAppElementsRecord, type AppOutgoingElements } from "./app-elements.js";
 import { hasDigest } from "./app-rsc-errors.js";
@@ -104,6 +105,10 @@ import {
 } from "vinext/shims/unified-request-context";
 import { setCacheStateHeaders } from "./cache-headers.js";
 import { VINEXT_RSC_COMPLETION_METADATA_HEADER } from "./headers.js";
+import {
+  applyPrerenderCacheLifeHeader,
+  applyPrerenderCacheTagsHeader,
+} from "./prerender-cache-life-header.js";
 import { appendRscCompletionMetadata } from "./rsc-completion-metadata.js";
 import type { AppRenderErrorContextOverrides } from "./app-rsc-error-handler.js";
 import { recordAppPageRenderError, traceAppPageRender } from "./app-page-tracing.js";
@@ -1392,6 +1397,76 @@ async function renderAppPageLifecycleImpl(
     capturedRscDataRef.value !== null &&
     resolveEarlyResponseCacheControl(options) === null;
 
+  // Whether a prerender writes a special error that escaped the shell, as
+  // Next.js's build does. A speculative or fallback-shell prerender doesn't.
+  const mayPrerenderShellSpecialError = (): boolean =>
+    options.isPrerender === true &&
+    options.isSpeculativePrerender !== true &&
+    options.pprFallbackShellSignal === undefined &&
+    shouldCaptureRscForCacheMetadata &&
+    capturedRscDataRef.value !== null &&
+    resolveEarlyResponseCacheControl(options) === null;
+  type PrerenderCacheMetadata = {
+    cacheTags: string[];
+    requestCacheLife: AppPageRequestCacheLife | null;
+  };
+  const readPrerenderCacheMetadata = (): PrerenderCacheMetadata => ({
+    cacheTags: options.getPageTags(),
+    requestCacheLife: readRequestCacheLifeForPrerender(options),
+  });
+  // A redirect's metadata is read while the request context is alive, since
+  // its response clears it. A boundary's is read once it has rendered.
+  let prerenderedSpecialError: {
+    dynamicUsed: boolean;
+    redirectMetadata: PrerenderCacheMetadata | null;
+  } | null = null;
+
+  // The special-error response replaces the page's document. prerender.ts
+  // writes it with its status and `location` when the header marks it, and
+  // the page's RSC payload from an RSC request.
+  const finalizePrerenderedShellSpecialErrorResponse = async (
+    response: Response,
+    specialError: AppPageSpecialError,
+    prerendered: NonNullable<typeof prerenderedSpecialError>,
+  ): Promise<Response> => {
+    if (response.status !== specialError.statusCode) {
+      return applyIneligibleRouteCachePolicy(response, options);
+    }
+    // The boundary renders as its document streams, so its tagged fetches,
+    // cacheLife() and dynamic API use are known once the document is read.
+    const body = await response.arrayBuffer();
+    const { cacheTags, requestCacheLife } =
+      prerendered.redirectMetadata ?? readPrerenderCacheMetadata();
+    ({ expireSeconds, revalidateSeconds } = applyRequestCacheLife({
+      expireSeconds,
+      requestCacheLife,
+      revalidateSeconds,
+    }));
+    const { htmlResponsePolicy } = resolveHtmlCacheWrite(
+      prerendered.dynamicUsed || consumeRenderDynamicUsage(),
+    );
+    const headers = new Headers(response.headers);
+    // Middleware's merged policy wins, as on a normal response.
+    if (htmlResponsePolicy.cacheControl && !headers.has("cache-control")) {
+      headers.set("Cache-Control", htmlResponsePolicy.cacheControl);
+    }
+    applyPrerenderCacheLifeHeader(headers, requestCacheLife);
+    applyPrerenderCacheTagsHeader(headers, cacheTags);
+    // Recorded outside the response, which middleware can also produce, with
+    // the redirect's own location. The prerender server marks the response.
+    getRequestExecutionContext()?.recordPrerenderSpecialError?.({
+      headers: resolveAppPageSpecialErrorStoredHeaders(specialError, options.basePath) ?? {},
+      status: response.status,
+    });
+    const prerenderResponse = new Response(body, {
+      headers,
+      status: response.status,
+      statusText: response.statusText,
+    });
+    copyLinkHeaderProvenance(response.headers, prerenderResponse.headers);
+    return prerenderResponse;
+  };
+
   // The special-error response replaces the page's document, and is stored as
   // a normal render would be, with its status and redirect `location`. The
   // RSC entry is the page's own payload, captured from the same render.
@@ -1558,7 +1633,8 @@ async function renderAppPageLifecycleImpl(
     },
     async renderSpecialErrorResponse(specialError) {
       shellSpecialError = specialError;
-      if (mayStoreShellSpecialError()) {
+      const mayPrerender = mayPrerenderShellSpecialError();
+      if (mayStoreShellSpecialError() || mayPrerender) {
         // The page's Flight render goes on after its shell rejected, such as
         // a layout's Suspense boundary reading cookies(). Let it finish while
         // the request context is alive, before the special-error response
@@ -1569,6 +1645,12 @@ async function renderAppPageLifecycleImpl(
           capturedRscDataRef.value,
           peekRenderDynamicUsage,
         );
+      }
+      if (mayPrerender) {
+        prerenderedSpecialError = {
+          dynamicUsed: consumeRenderDynamicUsage(),
+          redirectMetadata: specialError.kind === "redirect" ? readPrerenderCacheMetadata() : null,
+        };
       }
       return options.renderPageSpecialError(specialError, {
         isCacheCandidate: isCacheCandidateHtmlRender,
@@ -1593,6 +1675,13 @@ async function renderAppPageLifecycleImpl(
       resolveEarlyResponseCacheControl(options) === null
     ) {
       return finalizeShellSpecialErrorResponse(htmlRender.response, shellSpecialError);
+    }
+    if (shellSpecialError && prerenderedSpecialError) {
+      return finalizePrerenderedShellSpecialErrorResponse(
+        htmlRender.response,
+        shellSpecialError,
+        prerenderedSpecialError,
+      );
     }
     return applyIneligibleRouteCachePolicy(htmlRender.response, options);
   }

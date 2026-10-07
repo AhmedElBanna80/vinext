@@ -119,6 +119,15 @@ export const VINEXT_PRERENDER_REWRITTEN_HEADER = "x-vinext-prerender-rewritten";
 /** Marks a local prerender-server 500 that originated from a thrown render error. */
 export const VINEXT_PRERENDER_RENDER_ERROR_HEADER = "x-vinext-prerender-render-error";
 
+/**
+ * Prerender-only marker: the response's 401, 403, 404 or redirect is its page's
+ * notFound(), forbidden(), unauthorized() or redirect(), which escaped the shell.
+ * Its value is the JSON of the headers to store: a redirect's own location, or
+ * `{}`. Only the prerender server sets it, from the special error the page
+ * recorded on its ctx, and it drops one that the response carries.
+ */
+export const VINEXT_PRERENDER_SPECIAL_ERROR_HEADER = "x-vinext-prerender-special-error";
+
 /** Internal marker persisted only inside metadata-route APP_ROUTE cache values. */
 export const VINEXT_METADATA_ROUTE_CACHE_HEADER = "x-vinext-metadata-route-cache";
 

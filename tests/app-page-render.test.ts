@@ -47,7 +47,11 @@ import {
   type RouteCacheabilityState,
 } from "../packages/vinext/src/shims/cacheability-classification.js";
 import { runWithNavigationContext } from "../packages/vinext/src/shims/navigation-state.js";
-import type { ExecutionContextLike } from "../packages/vinext/src/shims/request-context.js";
+import {
+  runWithExecutionContext,
+  type ExecutionContextLike,
+  type PrerenderSpecialErrorMarker,
+} from "../packages/vinext/src/shims/request-context.js";
 import {
   parseClientReuseManifestHeader,
   type ClientReuseManifestParseResult,
@@ -2705,6 +2709,144 @@ describe("ISR storage of a page's special error", () => {
       "html:/posts/post": { headers, html: "", policy, status: 307 },
       "rsc:/posts/post": { headers, html: "", policy, rsc: "page-flight-with-digest", status: 307 },
     });
+  });
+
+  // As in Next.js's build, a prerender writes the special error that escaped
+  // the shell with its status and location. The render records it on the
+  // prerender server's ctx, which marks the response for prerender.ts, with
+  // the redirect's own location, not the one middleware merged into it.
+  const recordPrerenderSpecialErrors = async (render: () => Promise<Response>) => {
+    const markers: PrerenderSpecialErrorMarker[] = [];
+    const ctx: ExecutionContextLike = {
+      recordPrerenderSpecialError: (marker) => markers.push(marker),
+      waitUntil() {},
+    };
+    return { markers, response: await runWithExecutionContext(ctx, render) };
+  };
+
+  it.each([
+    { name: "notFound()", error: notFoundError, status: 404, headers: {}, body: "page:404" },
+    {
+      name: "redirect()",
+      error: redirectError,
+      status: 307,
+      headers: { location: "/target" },
+      body: "",
+    },
+  ])(
+    "prerenders a page's $name that rejects the shell with its status",
+    async ({ error, status, headers, body }) => {
+      const common = createCommonOptions();
+
+      const { markers, response } = await recordPrerenderSpecialErrors(() =>
+        renderAppPageLifecycle({
+          ...common.options,
+          isPrerender: true,
+          isProduction: true,
+          loadSsrHandler: shellRejectingSsrHandler(error),
+          renderPageSpecialError: async (specialError) =>
+            new Response(
+              specialError.kind === "redirect" ? null : `page:${specialError.statusCode}`,
+              {
+                headers: { Location: "/middleware-location" },
+                status: specialError.statusCode,
+              },
+            ),
+          renderToReadableStream: () => createStream(["page-flight-with-digest"]),
+          revalidateSeconds: 60,
+        }),
+      );
+
+      expect(response.status).toBe(status);
+      expect(markers).toEqual([{ headers, status }]);
+      expect(response.headers.get("cache-control")).toContain("s-maxage=60");
+      expect(response.headers.get(NEXT_CACHE_TAGS_HEADER)).toBe("_N_T_/posts/post");
+      await expect(response.text()).resolves.toBe(body);
+      await Promise.all(common.waitUntilPromises);
+      expect(common.isrSet).not.toHaveBeenCalled();
+    },
+  );
+
+  // The boundary renders as its document streams, so its tagged fetches and
+  // cacheLife() are known only once the document has been read.
+  it("prerenders a notFound() boundary's tags and cacheLife", async () => {
+    const common = createCommonOptions();
+    const tags = ["_N_T_/posts/post"];
+    let requestCacheLife: { revalidate: number } | null = null;
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      getPageTags: () => [...tags],
+      getRequestCacheLife: () => requestCacheLife,
+      isPrerender: true,
+      isProduction: true,
+      loadSsrHandler: shellRejectingSsrHandler(notFoundError),
+      peekRequestCacheLife: () => requestCacheLife,
+      renderPageSpecialError: async (specialError) =>
+        new Response(
+          new ReadableStream<Uint8Array>(
+            {
+              pull(controller) {
+                tags.push("boundary-tag");
+                requestCacheLife = { revalidate: 30 };
+                controller.enqueue(new TextEncoder().encode("page:404"));
+                controller.close();
+              },
+            },
+            { highWaterMark: 0 },
+          ),
+          { status: specialError.statusCode },
+        ),
+      renderToReadableStream: () => createStream(["page-flight-with-digest"]),
+      revalidateSeconds: 60,
+    });
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get(NEXT_CACHE_TAGS_HEADER)).toBe("_N_T_/posts/post,boundary-tag");
+    expect(response.headers.get(VINEXT_PRERENDER_CACHE_LIFE_HEADER)).toBe('{"revalidate":30}');
+    await expect(response.text()).resolves.toBe("page:404");
+  });
+
+  it("doesn't mark a special error from a speculative prerender", async () => {
+    const common = createCommonOptions();
+
+    const { markers, response } = await recordPrerenderSpecialErrors(() =>
+      renderAppPageLifecycle({
+        ...common.options,
+        isPrerender: true,
+        isProduction: true,
+        isSpeculativePrerender: true,
+        loadSsrHandler: shellRejectingSsrHandler(notFoundError),
+        renderToReadableStream: () => createStream(["page-flight-with-digest"]),
+      }),
+    );
+
+    expect(response.status).toBe(404);
+    expect(markers).toEqual([]);
+    await response.text();
+  });
+
+  it("prerenders a special error whose page reads a dynamic API after its shell rejected as no-store", async () => {
+    const common = createCommonOptions();
+    let dynamicUsed = false;
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      consumeDynamicUsage: () => dynamicUsed,
+      isPrerender: true,
+      isProduction: true,
+      loadSsrHandler: shellRejectingSsrHandler(notFoundError),
+      peekDynamicUsage: () => dynamicUsed,
+      renderToReadableStream: () =>
+        lateFlightStream(() => {
+          dynamicUsed = true;
+        }),
+      revalidateSeconds: 60,
+    });
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    await response.text();
   });
 
   // Below a loading boundary the shell renders, so Next.js streams and stores
