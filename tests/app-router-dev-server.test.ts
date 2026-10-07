@@ -2,9 +2,10 @@ import http from "node:http";
 import fsp from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { toSlash } from "pathslash";
 import { stripVTControlCharacters } from "node:util";
 import { createLogger, createServer, type ViteDevServer } from "vite";
-import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vite-plus/test";
 import { APP_FIXTURE_DIR, fetchHtml, startFixtureServer } from "./helpers.js";
 import { createExternalStoreFixture } from "./use-sync-external-store-fixture.js";
 import vinext from "../packages/vinext/src/index.js";
@@ -2560,6 +2561,46 @@ describe("App Router custom publicDir in dev", () => {
 
     const defaultPublic = await fetch(`${baseUrl}/static.txt`, { method: "POST" });
     expect(defaultPublic.status).not.toBe(405);
+  });
+});
+
+describe("App Router class-based cache.data adapter in dev", () => {
+  // The fixture adapter answers the `/unstable-cache-test` page's
+  // `unstable_cache` lookup with a value taken from its constructor options, so
+  // the rendered page proves vinext constructed the class with
+  // `{ env, options }` and registered the instance as the data cache handler.
+  const label = "served-by-class-adapter";
+  let warn: ReturnType<typeof vi.spyOn>;
+  let server: ViteDevServer;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    warn = vi.spyOn(console, "warn");
+    ({ server, baseUrl } = await startFixtureServer(APP_FIXTURE_DIR, {
+      cache: {
+        data: {
+          adapter: toSlash(path.join(APP_FIXTURE_DIR, "lib/class-data-cache-adapter.ts")),
+          options: { label },
+        },
+      },
+    }));
+  }, 60_000);
+
+  afterAll(async () => {
+    warn?.mockRestore();
+    await server?.close();
+  });
+
+  it("constructs the class and serves unstable_cache from the instance", async () => {
+    const response = await fetch(`${baseUrl}/unstable-cache-test`);
+    const html = await response.text();
+
+    const adapterWarnings = warn.mock.calls
+      .map((call: unknown[]) => call.map(String).join(" "))
+      .filter((message: string) => message.includes("cache adapter"));
+    expect(adapterWarnings).toEqual([]);
+    expect(response.status).toBe(200);
+    expect(html).toMatch(new RegExp(`CachedValue: (?:<!-- -->)?${label}`));
   });
 });
 

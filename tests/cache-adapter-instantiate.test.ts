@@ -2,7 +2,7 @@
  * Unit tests for the shim the generated `virtual:vinext-cache-adapters` module
  * uses to turn a configured adapter module's default export into an adapter.
  * The end-to-end proof (a class adapter configured on a real fixture app) lives
- * in tests/cache-adapters-class-fixture.test.ts.
+ * in tests/app-router-dev-server.test.ts ("class-based cache.data adapter").
  */
 import { describe, expect, it, vi } from "vite-plus/test";
 import {

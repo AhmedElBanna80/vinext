@@ -1,5 +1,5 @@
 /**
- * A class-based data cache adapter. tests/cache-adapters-class-fixture.test.ts
+ * A class-based data cache adapter. tests/app-router-dev-server.test.ts
  * configures it with `vinext({ cache: { data: { adapter, options } } })`.
  *
  * It answers the `/unstable-cache-test` page's `unstable_cache` lookup with a
