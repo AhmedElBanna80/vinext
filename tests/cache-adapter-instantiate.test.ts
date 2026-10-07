@@ -76,7 +76,17 @@ describe("isClassExport", () => {
       return {};
     }
     function* generator() {}
+    function Es5Sub() {}
+    Es5Sub.prototype = Object.create(Es5Class.prototype, {
+      constructor: { value: Es5Sub, writable: true, configurable: true },
+    });
+    function nullPrototype() {
+      return {};
+    }
+    nullPrototype.prototype = Object.create(null);
     expect(isClassExport(DataAdapter)).toBe(true);
+    expect(isClassExport(Es5Sub)).toBe(true);
+    expect(isClassExport(nullPrototype)).toBe(false);
     expect(isClassExport(FieldsOnly)).toBe(true);
     expect(isClassExport(Es5Class)).toBe(true);
     expect(isClassExport(new Proxy(DataAdapter, {}))).toBe(true);
@@ -196,6 +206,20 @@ describe("instantiateCacheAdapter", () => {
     }
     Object.defineProperty(BabelAdapter, "prototype", { writable: false });
     expect(instantiateCacheAdapter(BabelAdapter, args, "data")).toBeInstanceOf(BabelAdapter);
+
+    // TypeScript `target: ES5` subclass (`__extends`): its own prototype holds
+    // only `constructor`, and every adapter method is inherited from the base.
+    function Es5Sub(this: { received: unknown }, input: unknown) {
+      Es5Adapter.call(this, input);
+    }
+    Object.setPrototypeOf(Es5Sub, Es5Adapter);
+    Es5Sub.prototype = Object.create(Es5Adapter.prototype, {
+      constructor: { value: Es5Sub, writable: true, configurable: true },
+    });
+    const sub = instantiateCacheAdapter<{ received: unknown }>(Es5Sub, args, "data");
+    expect(sub).toBeInstanceOf(Es5Sub);
+    expect(sub).toBeInstanceOf(Es5Adapter);
+    expect(sub.received).toBe(args);
   });
 
   it("calls a bound class like any bound function, surfacing the runtime's error", () => {

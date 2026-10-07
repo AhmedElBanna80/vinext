@@ -9,8 +9,10 @@
  *
  * - A class is invoked with `new`. A class is a constructor whose own
  *   `prototype` is non-writable (every `class` declaration, and Babel's
- *   compiled classes) or carries members besides `constructor` (methods that
- *   down-levelled classes and constructor functions put on the prototype).
+ *   compiled classes), carries members besides `constructor` (methods that
+ *   down-levelled classes and constructor functions put on the prototype), or
+ *   inherits from another prototype than the root object (down-levelled
+ *   subclasses, whose methods all live on the base class).
  *   Proxy-wrapped classes qualify through the Proxy's default traps.
  * - Any other function is called as a factory, with plain-call semantics
  *   (`this`, `new.target` and bound receivers are what a call gives them).
@@ -71,11 +73,12 @@ export function isClassExport(value: unknown): boolean {
     if (!descriptor) return false;
     if (descriptor.writable === false) return true;
     const prototype: unknown = descriptor.value;
-    return (
-      prototype !== null &&
-      typeof prototype === "object" &&
-      Reflect.ownKeys(prototype).some((key) => key !== "constructor")
-    );
+    if (prototype === null || typeof prototype !== "object") return false;
+    if (Reflect.ownKeys(prototype).some((key) => key !== "constructor")) return true;
+    // A plain function's prototype inherits straight from the root object
+    // (`Object.prototype` of its realm). Anything deeper is a subclass.
+    const parent: unknown = Object.getPrototypeOf(prototype);
+    return parent !== null && Object.getPrototypeOf(parent) !== null;
   } catch {
     return false;
   }

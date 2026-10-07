@@ -93,7 +93,7 @@ export type CacheAdapterDescriptor<O extends Record<string, unknown> = Record<st
    * default export creates the adapter from one `{ env, options }` argument:
    * either a factory `({ env, options }) => adapter` or a class
    * `new Adapter({ env, options })`. A class (a `class` declaration, or a
-   * transpiled class with methods on its `prototype`) is invoked with `new`;
+   * transpiled class with methods on its `prototype` chain) is invoked with `new`;
    * any other function, including a bound one, is called. The result must be
    * the adapter object itself, not a Promise.
    */
