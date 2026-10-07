@@ -103,8 +103,10 @@ import { parseNextHttpErrorDigest } from "./next-error-digest.js";
 import {
   DEFAULT_DEVICE_SIZES,
   DEFAULT_IMAGE_SIZES,
+  handleImageOptimizationFromSource,
   isImageOptimizationPath,
   resolveDevImageRedirect,
+  type ImageSourceFetch,
   type ImageConfig,
 } from "./image-optimization.js";
 import { runWithPrerenderWorkUnit } from "./prerender-work-unit-setup.js";
@@ -567,6 +569,13 @@ export type CreateAppRscHandlerOptions<TRoute extends AppRscHandlerRoute> = {
   ) => Promise<Response | null>;
   i18nConfig: NextI18nConfig | null;
   imageConfig?: ImageConfig;
+  /**
+   * Resolves the host's in-process fetch for same-origin source images. When
+   * it returns a function in production, `/_next/image` answers directly (like
+   * Next.js) instead of redirecting to the source. Generated only for Nitro
+   * builds; Workers and the Node server serve images themselves.
+   */
+  resolveImageSourceFetch?: () => ImageSourceFetch | undefined;
   isMetadataRoute?: (pathname: string) => boolean;
   isDev: boolean;
   hasInterceptionId: (interceptionId: string) => boolean;
@@ -1545,7 +1554,20 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     );
     if (!imageRedirect)
       return new Response("Invalid image optimization parameters", { status: 400 });
-    return Response.redirect(new URL(imageRedirect, url.origin).href, 302);
+    const assetUrl = new URL(imageRedirect, url.origin);
+    const imageSourceFetch = options.isDev ? undefined : options.resolveImageSourceFetch?.();
+    if (imageSourceFetch && !isImageOptimizationPath(assetUrl.pathname)) {
+      return handleImageOptimizationFromSource(request, imageSourceFetch, {
+        allowedWidths: [
+          ...(options.imageConfig?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
+          ...(options.imageConfig?.imageSizes ?? DEFAULT_IMAGE_SIZES),
+        ],
+        imageConfig: options.imageConfig,
+        basePath: options.basePath,
+        assetPrefix: options.assetPrefix,
+      });
+    }
+    return Response.redirect(assetUrl.href, 302);
   }
 
   const metadataRouteResponse = await renderMetadataRouteIfMatched();
