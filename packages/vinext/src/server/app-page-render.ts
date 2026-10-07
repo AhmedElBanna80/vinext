@@ -167,7 +167,6 @@ type RenderAppPageLifecycleOptionsBase = {
   getDraftModeCookieHeader: () => string | null | undefined;
   handlerStart: number;
   hasCustomGlobalError?: boolean;
-  hasLoadingBoundary: boolean;
   dynamicStaleTimeSeconds?: number;
   isDynamicError: boolean;
   isDraftMode: boolean;
@@ -189,7 +188,6 @@ type RenderAppPageLifecycleOptionsBase = {
   isPrerender?: boolean;
   isSpeculativePrerender?: boolean;
   isProduction: boolean;
-  probePageBeforeRender?: boolean;
   omitPendingDynamicCacheState?: boolean;
   isRscRequest: boolean;
   traceOperation?: "prerender" | "render";
@@ -217,7 +215,6 @@ type RenderAppPageLifecycleOptionsBase = {
   rootParams?: RootParams;
   peekRenderObservationState?: () => AppPageRenderObservationState;
   probeLayoutAt: (layoutIndex: number) => unknown;
-  probePage: () => unknown;
   expireSeconds?: number;
   formState?: ReactFormState | null;
   revalidateSeconds: number | null;
@@ -870,30 +867,18 @@ async function renderAppPageLifecycleImpl(
     }
     return dynamicUsageObserved;
   };
-  const configuredProbePageBeforeRender = options.probePageBeforeRender ?? options.isRscRequest;
-  const probePageBeforeRender =
-    options.isRscRequest ||
-    (configuredProbePageBeforeRender && !(options.peekDynamicUsage?.() ?? false));
-  // The probe runs layouts and the page outside React's render, without its
+  // The probe runs layouts outside React's render, without its
   // cache() scope, so what it sees can differ from the render. As in Next.js,
   // which has no probe, the render alone decides whether the page is dynamic.
   const probeOutcome = await runWithDetachedDynamicUsage(() =>
     probeAppPageBeforeRender({
-      hasLoadingBoundary: options.hasLoadingBoundary,
-      probePageBeforeRender,
       skipProbes: options.pprFallbackShellSignal !== undefined,
       layoutCount: options.layoutCount,
       probeLayoutAt(layoutIndex) {
         return options.probeLayoutAt(layoutIndex);
       },
-      probePage() {
-        return options.probePage();
-      },
       renderLayoutSpecialError(specialError, layoutIndex) {
         return options.renderLayoutSpecialError(specialError, layoutIndex);
-      },
-      renderPageSpecialError(specialError) {
-        return options.renderPageSpecialError(specialError);
       },
       resolveSpecialError: resolveAppPageSpecialError,
       runWithSuppressedHookWarning(probe) {
@@ -1398,9 +1383,9 @@ async function renderAppPageLifecycleImpl(
     await htmlRender.metadataReady;
   }
 
-  // Routes that skip the page probe render the page once, inside the RSC
-  // stream. Mirror Next.js's `app-render.tsx:4293` catch shape: by the time
-  // the SSR shell promise has resolved, any redirect()/notFound() throw whose
+  // The page renders once, inside the RSC stream. Mirror Next.js's
+  // `app-render.tsx:4293` catch shape: by the time the SSR shell promise has
+  // resolved, any redirect()/notFound() throw whose
   // async work settles in microtasks during shell rendering has already fired
   // through React's onError and been captured by the tracker. Convert that to
   // a 307/404 before any bytes are flushed.
@@ -1409,17 +1394,15 @@ async function renderAppPageLifecycleImpl(
   // I/O, setTimeout, etc.) — fall through to the streamed body, exactly
   // as Next.js does. The digest survives in the Flight payload for the
   // client router to consume.
-  if (options.hasLoadingBoundary || !probePageBeforeRender) {
-    const captured = rscErrorTracker.getCapturedSpecialError();
-    if (captured) {
-      const specialError = resolveAppPageSpecialError(captured);
-      if (specialError) {
-        void htmlStream.cancel().catch(() => {});
-        return applyIneligibleRouteCachePolicy(
-          await options.renderPageSpecialError(specialError),
-          options,
-        );
-      }
+  const captured = rscErrorTracker.getCapturedSpecialError();
+  if (captured) {
+    const specialError = resolveAppPageSpecialError(captured);
+    if (specialError) {
+      void htmlStream.cancel().catch(() => {});
+      return applyIneligibleRouteCachePolicy(
+        await options.renderPageSpecialError(specialError),
+        options,
+      );
     }
   }
 

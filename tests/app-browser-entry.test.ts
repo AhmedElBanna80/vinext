@@ -97,6 +97,8 @@ import {
 import {
   beginAppRouterScrollIntent,
   clearAppRouterScrollIntent,
+  getPendingAppRouterScrollIntent,
+  isLatestAppRouterScrollIntent,
 } from "../packages/vinext/src/shims/app-router-scroll-state.js";
 import * as navigationShim from "../packages/vinext/src/shims/navigation.js";
 import {
@@ -4226,6 +4228,71 @@ describe("app browser navigation controller", () => {
       ]);
       expect(settled).toBe(false);
     } finally {
+      detach();
+    }
+  });
+
+  it("discardPendingNavigation drops an uncommitted render and restores the visible tree", async () => {
+    // Next.js: a raw history.pushState/replaceState dispatches ACTION_RESTORE,
+    // which marks the pending navigation discarded so it never commits.
+    const commitClientNavigationState = vi.fn();
+    const visibleState = createState();
+    const { controller, detach, setBrowserRouterState, stateRef } = createControllerHarness(
+      visibleState,
+      { commitClientNavigationState },
+    );
+    const commitEffect = vi.fn();
+
+    try {
+      expect(controller.discardPendingNavigation(visibleState)).toBe(false);
+
+      const scrollIntent = beginAppRouterScrollIntent("#section");
+      const navId = controller.beginNavigation();
+      const renderPromise = renderCurrentStateNavigationPayload(controller, {
+        payloadOrigin: FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
+        actionType: "navigate",
+        createNavigationCommitEffect: () => commitEffect,
+        historyUpdateMode: "push",
+        navigationSnapshot: stateRef.current.navigationSnapshot,
+        nextElements: Promise.resolve(
+          createResolvedElements("route:/dashboard", "/", null, {
+            "page:/dashboard": React.createElement("main", null, "dashboard"),
+          }),
+        ),
+        operationLane: "navigation",
+        params: {},
+        pendingRouterState: null,
+        previousNextUrl: null,
+        scrollIntent,
+        targetHref: "https://example.com/dashboard#section",
+        navId,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(stateRef.current).not.toBe(visibleState);
+      expect(getPendingAppRouterScrollIntent()?.id).toBe(scrollIntent.id);
+
+      expect(controller.discardPendingNavigation(visibleState)).toBe(true);
+      await expect(renderPromise).resolves.toBe("no-commit");
+      expect(controller.isCurrentNavigation(navId)).toBe(false);
+      expect(setBrowserRouterState).toHaveBeenLastCalledWith(visibleState);
+      // The discarded render's snapshot is released without running its URL
+      // commit, and nothing is left to drain if a later render commits.
+      expect(commitEffect).not.toHaveBeenCalled();
+      expect(commitClientNavigationState).toHaveBeenCalledExactlyOnceWith(undefined, {
+        releaseSnapshot: true,
+      });
+      controller.drainPrePaintEffects(Number.MAX_SAFE_INTEGER);
+      expect(commitClientNavigationState).toHaveBeenCalledOnce();
+      // navigateClientSide's post-navigation scroll fallback must not scroll
+      // to the discarded destination's hash or to the top of the page.
+      expect(getPendingAppRouterScrollIntent()).toBeNull();
+      expect(isLatestAppRouterScrollIntent(scrollIntent)).toBe(false);
+
+      expect(controller.discardPendingNavigation(visibleState)).toBe(false);
+    } finally {
+      clearAppRouterScrollIntent();
       detach();
     }
   });

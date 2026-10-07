@@ -15,6 +15,7 @@ import {
 } from "vinext/shims/navigation";
 import {
   claimAppRouterScrollIntentForCommit,
+  clearAppRouterScrollIntent,
   consumeAppRouterScrollIntent,
   type AppRouterScrollIntent,
 } from "vinext/shims/app-router-scroll-state";
@@ -133,6 +134,8 @@ type BrowserNavigationController = {
   ): () => void;
   beginPendingBrowserRouterState(): PendingBrowserRouterState;
   finalizeNavigation(navId: number, pending: PendingBrowserRouterState | null | undefined): void;
+  discardPendingNavigation(visibleState: AppRouterState | null): boolean;
+  flushCommittingNavigationUrl(): void;
   restoreHistorySnapshotVisibleState(options: {
     restoreCopiedExternalHistoryEntry?: boolean;
     beforeCommit?: () => void;
@@ -297,6 +300,12 @@ export function createAppBrowserNavigationController(
   let activeNavigationId = 0;
   let pendingUserNavigationId: number | null = null;
   let pendingUserNavigationLane: OperationLane | null = null;
+  // Set between a navigation render's insertion and layout effects, while
+  // React commits it but before its URL update has run.
+  let committingNavigationRenderId: number | null = null;
+  // Whether a render has started committing since the pending user navigation
+  // began. From then on it is visible and can no longer be discarded.
+  let pendingUserNavigationCommitStarted = false;
   let latestHmrUpdateId = 0;
   const pendingNavigationCommits = new Map<
     number,
@@ -360,6 +369,7 @@ export function createAppBrowserNavigationController(
     activeNavigationId += 1;
     pendingUserNavigationId = activeNavigationId;
     pendingUserNavigationLane = null;
+    pendingUserNavigationCommitStarted = false;
     return activeNavigationId;
   }
 
@@ -435,6 +445,62 @@ export function createAppBrowserNavigationController(
     }
   }
 
+  /**
+   * Discard the user navigation that has not committed yet, keeping
+   * `visibleState` (the committed tree) on screen. Next.js does the same when
+   * a raw history.pushState/replaceState dispatches ACTION_RESTORE: the
+   * pending action is marked discarded and the restore commits the current
+   * tree in a transition, which replaces the navigation's suspended one.
+   * Returns whether a navigation was discarded.
+   */
+  function discardPendingNavigation(visibleState: AppRouterState | null): boolean {
+    // Once a render of the navigation starts committing, the destination is
+    // visible and later history writes (including from its own layout
+    // effects) land on top of it, so there is nothing left to discard.
+    if (pendingUserNavigationId === null || pendingUserNavigationCommitStarted) {
+      return false;
+    }
+
+    activeNavigationId += 1;
+    pendingUserNavigationId = null;
+    pendingUserNavigationLane = null;
+    // The discarded destination never shows, so neither its hash target nor
+    // the top-of-page fallback that navigateClientSide schedules may scroll.
+    clearAppRouterScrollIntent();
+
+    // These renders will never mount their NavigationCommitSignal, so release
+    // their render snapshots here; hooks then read the URL the history write
+    // just committed. Their commit effects would only do the same, since the
+    // navigation id above is no longer current.
+    for (const renderId of pendingNavigationPrePaintEffects.keys()) {
+      pendingNavigationPrePaintEffects.delete(renderId);
+      commitClientNavigationStateImpl(undefined, { releaseSnapshot: true });
+    }
+    clearCommittedNavigationFailureTargets(nextNavigationRenderId);
+    settleNavigationCommits(nextNavigationRenderId, false);
+
+    if (visibleState && setBrowserRouterState) {
+      const setter = setBrowserRouterState;
+      startTransition(() => {
+        setter(visibleState);
+      });
+    }
+    return true;
+  }
+
+  /**
+   * Run the URL update of a navigation render React is committing right now.
+   * It normally runs in NavigationCommitSignal's layout effect, after the
+   * route's own layout effects. Next.js writes the URL in an insertion effect
+   * instead, so a raw history write from a destination layout effect lands on
+   * top of the destination entry. Called before such a write to keep that order.
+   */
+  function flushCommittingNavigationUrl(): void {
+    if (committingNavigationRenderId !== null) {
+      drainPrePaintEffects(committingNavigationRenderId);
+    }
+  }
+
   function queuePrePaintNavigationEffect(renderId: number, effect: (() => void) | null): void {
     if (!effect) {
       return;
@@ -490,6 +556,7 @@ export function createAppBrowserNavigationController(
   }
 
   function commitNavigationRender(renderId: number): void {
+    committingNavigationRenderId = null;
     drainPrePaintEffects(renderId);
     settleNavigationCommits(renderId, true);
   }
@@ -563,6 +630,8 @@ export function createAppBrowserNavigationController(
     },
   ): ReactNode {
     useInsertionEffect(() => {
+      committingNavigationRenderId = renderId;
+      pendingUserNavigationCommitStarted = true;
       clearCommittedNavigationFailureTargets(renderId);
     }, [renderId]);
 
@@ -1047,6 +1116,8 @@ export function createAppBrowserNavigationController(
     attachBrowserRouterState,
     beginPendingBrowserRouterState,
     finalizeNavigation,
+    discardPendingNavigation,
+    flushCommittingNavigationUrl,
     restoreHistorySnapshotVisibleState,
     renderNavigationPayload,
     commitSameUrlNavigatePayload,

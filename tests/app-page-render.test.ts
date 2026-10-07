@@ -220,7 +220,6 @@ function createCommonOptions() {
         return null;
       },
       handlerStart: 10,
-      hasLoadingBoundary: false,
       isDynamicError: false,
       isDraftMode: false,
       isForceDynamic: false,
@@ -245,9 +244,6 @@ function createCommonOptions() {
       navigationParams: { slug: "post" },
       params: { slug: "post" },
       probeLayoutAt() {
-        return null;
-      },
-      probePage() {
         return null;
       },
       revalidateSeconds: null,
@@ -464,40 +460,64 @@ describe("form state rendering", () => {
 });
 
 describe("app page render lifecycle", () => {
-  it("returns pre-render special responses before starting the render stream", async () => {
+  it("returns layout special responses before starting the render stream", async () => {
     const common = createCommonOptions();
 
     const response = await renderAppPageLifecycle({
       ...common.options,
       isRscRequest: true,
-      probePage() {
+      layoutCount: 1,
+      probeLayoutAt() {
         throw { digest: "NEXT_NOT_FOUND" };
       },
     });
 
     expect(response.status).toBe(404);
-    await expect(response.text()).resolves.toBe("page:404");
+    await expect(response.text()).resolves.toBe("layout:404");
     expect(common.renderToReadableStream).not.toHaveBeenCalled();
-    expect(common.renderPageSpecialError).toHaveBeenCalledTimes(1);
+    expect(common.renderLayoutSpecialError).toHaveBeenCalledTimes(1);
   });
 
-  it("does not run the page probe before normal HTML rendering", async () => {
+  it("streams an RSC page's notFound() as part of the Flight payload", async () => {
     const common = createCommonOptions();
-    const probePage = vi.fn(() => {
-      throw new Error("page probe should not execute for HTML");
+    const notFoundError = Object.assign(new Error("NEXT_NOT_FOUND"), { digest: "NEXT_NOT_FOUND" });
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      isRscRequest: true,
+      renderToReadableStream(_element, opts) {
+        opts.onError(notFoundError, null, null);
+        return createStream(["flight-with-digest"]);
+      },
+    });
+
+    // As in Next.js, the client router renders the not-found boundary from the digest.
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe("flight-with-digest");
+    expect(common.renderPageSpecialError).not.toHaveBeenCalled();
+  });
+
+  it("stores an RSC render whose page called redirect(), as Next.js does", async () => {
+    const common = createCommonOptions();
+    const redirectError = Object.assign(new Error("NEXT_REDIRECT"), {
+      digest: "NEXT_REDIRECT;replace;/target;307;",
     });
 
     const response = await renderAppPageLifecycle({
       ...common.options,
-      isRscRequest: false,
-      probePage,
+      isProduction: true,
+      isRscRequest: true,
+      renderToReadableStream(_element, opts) {
+        opts.onError(redirectError, null, null);
+        return createStream(["flight-with-digest"]);
+      },
+      revalidateSeconds: 60,
     });
 
-    expect(probePage).not.toHaveBeenCalled();
-    expect(common.renderToReadableStream).toHaveBeenCalledTimes(1);
-    expect(common.renderPageSpecialError).not.toHaveBeenCalled();
     expect(response.status).toBe(200);
-    await expect(response.text()).resolves.toBe("<html>page</html>");
+    await response.text();
+    await Promise.all(common.waitUntilPromises);
+    expect(common.isrSet).toHaveBeenCalledOnce();
   });
 
   it("streams lazy HTML while pending dynamic usage determines the cache write", async () => {
@@ -548,14 +568,13 @@ describe("app page render lifecycle", () => {
     expect(common.isrSet).not.toHaveBeenCalled();
   });
 
-  it("recovers HTML page special errors from the real render when the page probe is skipped", async () => {
+  it("recovers HTML page special errors from the real render", async () => {
     const common = createCommonOptions();
     const notFoundError = Object.assign(new Error("NEXT_NOT_FOUND"), { digest: "NEXT_NOT_FOUND" });
     let capturedOnError: ((error: unknown, ...args: unknown[]) => void) | null = null;
 
     const response = await renderAppPageLifecycle({
       ...common.options,
-      hasLoadingBoundary: false,
       isRscRequest: false,
       loadSsrHandler: async () => ({
         async handleSsr() {
@@ -563,9 +582,6 @@ describe("app page render lifecycle", () => {
           return createStream(["<html>fallback</html>"]);
         },
       }),
-      probePage() {
-        throw new Error("page probe should not execute for HTML");
-      },
       renderToReadableStream(_element, opts) {
         capturedOnError = opts.onError;
         return createStream(["flight-data"]);
@@ -953,7 +969,8 @@ describe("app page render lifecycle", () => {
       isRscRequest: true,
       isProduction: true,
       isStaticEligible: false,
-      probePage() {
+      layoutCount: 1,
+      probeLayoutAt() {
         throw { digest: "NEXT_NOT_FOUND" };
       },
     });
@@ -2567,7 +2584,6 @@ describe("app page render lifecycle", () => {
     const response = await renderAppPageLifecycle({
       ...common.options,
       isPrerender: true,
-      hasLoadingBoundary: true,
       loadSsrHandler: async () => ({
         async handleSsr(_rscStream, _navContext, _fontData, _options) {
           // Trigger the captured onError callback representing a component throw
@@ -2917,7 +2933,6 @@ describe("layoutFlags injection into RSC payload", () => {
       getPageTags: () => overrides.pageTags ?? [],
       getRequestCacheLife: () => null,
       handlerStart: 0,
-      hasLoadingBoundary: false,
       isDynamicError: false,
       isDraftMode: false,
       isForceDynamic: false,
@@ -2935,7 +2950,6 @@ describe("layoutFlags injection into RSC payload", () => {
       navigationParams: {},
       params: {},
       probeLayoutAt: overrides.probeLayoutAt ?? (() => null),
-      probePage: () => null,
       revalidateSeconds: null,
       renderErrorBoundaryResponse: async () => null,
       renderLayoutSpecialError: async () => new Response("error", { status: 500 }),
