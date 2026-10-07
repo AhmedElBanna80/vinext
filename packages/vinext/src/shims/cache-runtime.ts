@@ -39,22 +39,35 @@ import {
   _hasPendingRevalidatedTag,
   _setRequestScopedCacheLife,
   _registerCacheContextAccessor,
+  runWithDetachedCacheObservations,
+  shouldServeStaleUnstableCacheEntry,
   type CacheLifeConfig,
 } from "./cache-request-state.js";
 import { VINEXT_RSC_MARKER_HEADER } from "../server/headers.js";
-import { addCollectedRequestTags, getCurrentFetchSoftTags } from "./fetch-cache.js";
+import {
+  addCollectedRequestTags,
+  getCurrentFetchSoftTags,
+  runWithDetachedFetchObservations,
+} from "./fetch-cache.js";
 import { getOrCreateAls } from "./internal/als-registry.js";
 import {
   isInsideUnifiedScope,
   getRequestContext,
   runWithUnifiedStateMutation,
 } from "./unified-request-context.js";
-import { isDraftModeEnabled, markDynamicUsage } from "./headers.js";
+import { isDraftModeEnabled, markDynamicUsage, throwIfInsideCacheScope } from "./headers.js";
+import { makeThenableParams } from "./thenable-params.js";
 import {
   createPprFallbackShellSuspensePromise,
   trackPprFallbackShellCacheTask,
 } from "./ppr-fallback-shell.js";
-import { isMarkedAppPagePropsObject } from "./internal/app-page-props-cache-key.js";
+import {
+  APP_PAGE_USE_CACHE_MARKER,
+  hasUseCachePageMarker,
+  isMarkedAppPagePropsObject,
+  isUseCacheFunctionReference,
+  markAppPagePropsForUseCache,
+} from "./internal/app-page-props-cache-key.js";
 import { getCurrentRootParams, type RootParams } from "./root-params.js";
 import {
   isRouteCacheabilityProbe,
@@ -567,20 +580,42 @@ export type RegisterCachedFunctionOptions = {
    * transform records this separately for metadata parent resolution.
    */
   acceptsSecondArgument?: boolean;
-  /**
-   * Internal transform metadata for file-level `"use cache"` default exports
-   * in App Router `page.*` files. Page components receive framework-owned
-   * `{ params, searchParams }` props. React may copy that props object before
-   * invocation, so this invariant must live at the cached function boundary
-   * rather than on the intermediate createElement config object.
-   */
-  appPageDefaultExport?: boolean;
   /** Number of declared arguments supplied by the directive transform. */
   argumentCount?: number;
   decryptCaptures?: (value: unknown) => Promise<unknown[] | undefined>;
   encodeInvocationArgs?: (args: unknown[]) => Promise<string>;
   serverReferenceId?: string;
 };
+
+// Like Next.js, an entry past its `expire` is a miss: it is regenerated, never served. A
+// stale entry is served only by a dynamic render, which regenerates it in the background;
+// static generation (a prerender, a cacheability probe, an ISR regeneration) regenerates it
+// first. The request's revalidation mode is set before its prerender work unit, so check
+// the prerender conditions too.
+function isServableCacheState(cacheState: string | undefined): boolean {
+  if (cacheState === "expired") return false;
+  if (cacheState !== "stale") return true;
+  return (
+    shouldServeStaleUnstableCacheEntry() &&
+    process.env.VINEXT_PRERENDER !== "1" &&
+    !isRouteCacheabilityProbe()
+  );
+}
+
+// Like Next.js, the background regeneration feeds neither its cache life nor its tags (its
+// own or its fetches') back into the request, or an enclosing cache, that served the stale
+// value.
+function regenerateInBackground(id: string, regenerate: () => Promise<unknown>): void {
+  const regeneration = runWithDetachedCacheObservations(() =>
+    runWithDetachedFetchObservations(() => cacheContextStorage.exit(regenerate)),
+  ).then(
+    () => undefined,
+    (error: unknown) => {
+      console.error(`[vinext] use cache: background regeneration failed for ${id}:`, error);
+    },
+  );
+  if (isInsideUnifiedScope()) getRequestContext().executionContext?.waitUntil(regeneration);
+}
 
 /**
  * Register a function as a cached function. This is called by the Vite
@@ -598,7 +633,10 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
   options: RegisterCachedFunctionOptions = {},
 ): (...args: TArgs) => Promise<TResult> {
   const cacheVariant = variant ?? "";
-  const omitAppPageSearchParamsFromFirstArg = options.appPageDefaultExport === true;
+  // Next.js omits page searchParams only from public caches. A private cache
+  // may read them, so they stay in its cache key (use-cache-wrapper.ts restores
+  // `outerSearchParams` when `isPrivate`).
+  const omitAppPageSearchParams = cacheVariant !== "private";
   // A replayable entry stores this reference ID for Response Store
   // regeneration. Keep entries produced with an older build's opaque alias
   // unreachable if a stable deployment/build ID is reused.
@@ -662,16 +700,46 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
       const keySeed = getUseCacheKeySeed();
       const captures = options.decryptCaptures ? await options.decryptCaptures(args[0]) : undefined;
       const hasCaptureEnvelope = captures !== undefined;
+      // Like Next.js (use-cache-wrapper.ts, `isPageSegmentFunction`), page
+      // semantics come only from the invocation: the page component, page
+      // probe and page metadata/viewport call sites mark a cache function's
+      // props with `$$isPage`, and Response Store replay args keep it. Where
+      // the function is defined does not matter, and a direct user call is an
+      // ordinary cache call. Read and remove the marker here.
+      //
+      // The call site passes the props as its first argument, but arguments
+      // bound ahead of it arrive first: a capture envelope, or values bound by
+      // user code with `.bind(null, ...)`. So locate the marked props instead
+      // of assuming an index. Positions are the same in `args`/`admittedArgs`
+      // (envelope) and `executionArgs` (captures).
+      const pagePropsArgIndex = args.findIndex(hasUseCachePageMarker);
+      const isPageInvocation = pagePropsArgIndex !== -1;
+      const invocationArgs = isPageInvocation
+        ? replaceArgument(
+            args,
+            pagePropsArgIndex,
+            withoutUseCachePageMarker(args[pagePropsArgIndex] as Record<string, unknown>),
+          )
+        : args;
       const admittedArgs =
         options.argumentCount === undefined
-          ? args
+          ? invocationArgs
           : hasCaptureEnvelope
-            ? [args[0], ...args.slice(1, 1 + options.argumentCount)]
-            : args.slice(0, options.argumentCount);
+            ? [invocationArgs[0], ...invocationArgs.slice(1, 1 + options.argumentCount)]
+            : invocationArgs.slice(0, options.argumentCount);
       const executionArgs = hasCaptureEnvelope
         ? [captures, ...admittedArgs.slice(1)]
         : admittedArgs;
-      const callArgs = executionArgs as TArgs;
+      const pagePropsIndex =
+        omitAppPageSearchParams && isPageInvocation ? pagePropsArgIndex : undefined;
+      // Rendered page props carry searchParams that throw inside a public cache
+      // scope. When they are absent, as on a Response Store replay of the
+      // encoded args, access must still fail like Next's erroring searchParams.
+      const callArgs = (
+        pagePropsIndex === undefined
+          ? executionArgs
+          : withErroringPageSearchParams(executionArgs, pagePropsIndex)
+      ) as TArgs;
 
       // Build the cache key. Use encodeReply (RSC protocol) when available —
       // it correctly handles React elements as temporary references (excluded
@@ -680,7 +748,10 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
       try {
         const processedArgs =
           executionArgs.length > 0
-            ? unwrapThenableObjectArray(executionArgs, { omitAppPageSearchParamsFromFirstArg })
+            ? unwrapThenableObjectArray(executionArgs, {
+                pagePropsIndex,
+                omitMarkedAppPageSearchParams: omitAppPageSearchParams,
+              })
             : [];
         if (rsc && executionArgs.length > 0) {
           // Temporary references let encodeReply handle non-serializable values
@@ -761,7 +832,7 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
       const redirectValue = existing?.value;
       if (
         isRootParamRedirect(existing) &&
-        existing?.cacheState !== "stale" &&
+        isServableCacheState(existing?.cacheState) &&
         rootParams &&
         redirectValue?.kind === "FETCH" &&
         !_hasPendingRevalidatedTag([...(redirectValue.tags ?? []), ...softTags])
@@ -776,10 +847,122 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
           existing = null;
         }
       }
+      // Execute the function and store its result. A background regeneration doesn't
+      // propagate: the request already used the stale value.
+      const generate = async (propagate: boolean): Promise<TResult> => {
+        const { result, ctx, effectiveLife, collectedResult } = await runCachedFunctionWithContext(
+          fn,
+          callArgs,
+          cacheVariant,
+          (value) => serializeCacheResult(value, rsc),
+        );
+
+        const rootParamNames =
+          ctx.readRootParamNames && ctx.readRootParamNames.size > 0
+            ? addKnownRootParamNames(id, ctx.readRootParamNames)
+            : knownRootParamsByFunctionId.get(id);
+
+        if (propagate) {
+          recordRequestScopedCacheLife(effectiveLife);
+          // Bubble the cache scope's tags up to the surrounding request so the
+          // enclosing page / route-handler ISR entry is tagged for on-demand
+          // revalidation (issue #1453). `ctx.tags` already includes any nested
+          // child cache's tags via `runCachedFunctionWithContext`.
+          propagateCacheTagsToRequest(ctx.tags);
+        }
+        const revalidateSeconds =
+          effectiveLife.revalidate ?? cacheLifeProfiles.default.revalidate ?? 900;
+
+        // Serialization ran while the cache ALS was active so lazy Server
+        // Component work is reflected in `ctx` before selecting the final key.
+        if (collectedResult?.cacheEntry) {
+          try {
+            let cacheFunctionInvocation: VinextCacheFunctionInvocation | undefined;
+            if (options.serverReferenceId && options.encodeInvocationArgs) {
+              try {
+                cacheFunctionInvocation = {
+                  // Like the cache key, a public page cache replays without the
+                  // page's searchParams: encoding them would read search params
+                  // and turn every cached page render dynamic.
+                  encryptedArgs: await options.encodeInvocationArgs(
+                    pagePropsIndex === undefined
+                      ? admittedArgs
+                      : toReplayablePageArgs(admittedArgs, pagePropsIndex),
+                  ),
+                  referenceId: options.serverReferenceId,
+                  rootParams: Object.fromEntries(
+                    Object.entries(rootParams ?? {}).filter((entry) => entry[1] !== undefined),
+                  ) as Record<string, string | string[]>,
+                  softTags,
+                };
+              } catch {
+                // Some request-local values cannot be replayed after this render.
+              }
+            }
+            const serialized = collectedResult.cacheEntry;
+            const cacheValue = {
+              kind: "FETCH",
+              data: {
+                headers: serialized.headers,
+                body: serialized.body,
+                url: cacheKey,
+              },
+              tags: ctx.tags,
+              revalidate: revalidateSeconds,
+            } satisfies CachedFetchValue;
+            const cacheContext = {
+              fetchCache: true,
+              tags: ctx.tags,
+              ...(cacheFunctionInvocation ? { cacheFunctionInvocation } : {}),
+              cacheControl: {
+                revalidate: revalidateSeconds,
+                expire: effectiveLife.expire,
+                // Persisted so a later hit re-registers the same claim; otherwise
+                // the enclosing render's minimum depends on cache temperature.
+                stale: effectiveLife.stale,
+              },
+            };
+
+            if (rootParamNames && rootParamNames.size > 0 && rootParams) {
+              const specificCacheKey =
+                coarseCacheKey + computeRootParamsCacheKeySuffix(rootParams, rootParamNames);
+              const redirectTags = [
+                ...ctx.tags,
+                ...[...rootParamNames].map((name) => ROOT_PARAM_TAG_PREFIX + name),
+              ];
+              await handler.set(
+                coarseCacheKey,
+                {
+                  kind: "FETCH",
+                  data: {
+                    headers: { [ROOT_PARAM_REDIRECT_HEADER]: "1" },
+                    body: "",
+                    url: coarseCacheKey,
+                  },
+                  tags: redirectTags,
+                  revalidate: revalidateSeconds,
+                },
+                { ...cacheContext, tags: redirectTags },
+              );
+              // Write the useful entry last. A bounded LRU that can retain only
+              // one of the pair must keep the specific value, not the redirect.
+              cacheValue.data.url = specificCacheKey;
+              await handler.set(specificCacheKey, cacheValue, cacheContext);
+            } else {
+              await handler.set(cacheKey, cacheValue, cacheContext);
+            }
+          } catch {
+            // A handler failure skips caching but must not fail the render.
+          }
+        }
+
+        return collectedResult ? collectedResult.result : result;
+      };
+
       if (
         existing?.value &&
         existing.value.kind === "FETCH" &&
-        existing.cacheState !== "stale" &&
+        isServableCacheState(existing.cacheState) &&
         !_hasPendingRevalidatedTag([...(existing.value.tags ?? []), ...softTags])
       ) {
         try {
@@ -789,126 +972,29 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
           // cache HIT — otherwise `revalidateTag()` could not evict the rendered
           // output that embeds this cached value (issue #1453).
           propagateCacheTagsToRequest(existing.value.tags);
+          let result: TResult;
           if (rsc && existing.value.data.headers[VINEXT_RSC_MARKER_HEADER] === "1") {
             // RSC-serialized entry: base64 → bytes → stream → deserialize
             const bytes = base64ToUint8(existing.value.data.body);
             const stream = uint8ToStream(bytes);
-            const result = await rsc.createFromReadableStream<TResult>(
+            result = await rsc.createFromReadableStream<TResult>(
               stream,
               {},
               { preserveServerReferences: true },
             );
-            recordRequestScopedCacheControl(existing.cacheControl);
-            return result;
+          } else {
+            // JSON-serialized entry (legacy or no RSC available)
+            result = JSON.parse(existing.value.data.body);
           }
-          // JSON-serialized entry (legacy or no RSC available)
-          const result = JSON.parse(existing.value.data.body);
           recordRequestScopedCacheControl(existing.cacheControl);
+          if (existing.cacheState === "stale") regenerateInBackground(id, () => generate(false));
           return result;
         } catch {
           // Corrupted entry, fall through to re-execute
         }
       }
 
-      // Cache miss (or stale) — execute with context
-      const { result, ctx, effectiveLife, collectedResult } = await runCachedFunctionWithContext(
-        fn,
-        callArgs,
-        cacheVariant,
-        (value) => serializeCacheResult(value, rsc),
-      );
-
-      const rootParamNames =
-        ctx.readRootParamNames && ctx.readRootParamNames.size > 0
-          ? addKnownRootParamNames(id, ctx.readRootParamNames)
-          : knownRootParamsByFunctionId.get(id);
-
-      recordRequestScopedCacheLife(effectiveLife);
-      // Bubble the cache scope's tags up to the surrounding request so the
-      // enclosing page / route-handler ISR entry is tagged for on-demand
-      // revalidation (issue #1453). `ctx.tags` already includes any nested
-      // child cache's tags via `runCachedFunctionWithContext`.
-      propagateCacheTagsToRequest(ctx.tags);
-      const revalidateSeconds =
-        effectiveLife.revalidate ?? cacheLifeProfiles.default.revalidate ?? 900;
-
-      // Serialization ran while the cache ALS was active so lazy Server
-      // Component work is reflected in `ctx` before selecting the final key.
-      if (collectedResult?.cacheEntry) {
-        try {
-          let cacheFunctionInvocation: VinextCacheFunctionInvocation | undefined;
-          if (options.serverReferenceId && options.encodeInvocationArgs) {
-            try {
-              cacheFunctionInvocation = {
-                encryptedArgs: await options.encodeInvocationArgs(admittedArgs),
-                referenceId: options.serverReferenceId,
-                rootParams: Object.fromEntries(
-                  Object.entries(rootParams ?? {}).filter((entry) => entry[1] !== undefined),
-                ) as Record<string, string | string[]>,
-                softTags,
-              };
-            } catch {
-              // Some request-local values cannot be replayed after this render.
-            }
-          }
-          const serialized = collectedResult.cacheEntry;
-          const cacheValue = {
-            kind: "FETCH",
-            data: {
-              headers: serialized.headers,
-              body: serialized.body,
-              url: cacheKey,
-            },
-            tags: ctx.tags,
-            revalidate: revalidateSeconds,
-          } satisfies CachedFetchValue;
-          const cacheContext = {
-            fetchCache: true,
-            tags: ctx.tags,
-            ...(cacheFunctionInvocation ? { cacheFunctionInvocation } : {}),
-            cacheControl: {
-              revalidate: revalidateSeconds,
-              expire: effectiveLife.expire,
-              // Persisted so a later hit re-registers the same claim; otherwise
-              // the enclosing render's minimum depends on cache temperature.
-              stale: effectiveLife.stale,
-            },
-          };
-
-          if (rootParamNames && rootParamNames.size > 0 && rootParams) {
-            const specificCacheKey =
-              coarseCacheKey + computeRootParamsCacheKeySuffix(rootParams, rootParamNames);
-            const redirectTags = [
-              ...ctx.tags,
-              ...[...rootParamNames].map((name) => ROOT_PARAM_TAG_PREFIX + name),
-            ];
-            await handler.set(
-              coarseCacheKey,
-              {
-                kind: "FETCH",
-                data: {
-                  headers: { [ROOT_PARAM_REDIRECT_HEADER]: "1" },
-                  body: "",
-                  url: coarseCacheKey,
-                },
-                tags: redirectTags,
-                revalidate: revalidateSeconds,
-              },
-              { ...cacheContext, tags: redirectTags },
-            );
-            // Write the useful entry last. A bounded LRU that can retain only
-            // one of the pair must keep the specific value, not the redirect.
-            cacheValue.data.url = specificCacheKey;
-            await handler.set(specificCacheKey, cacheValue, cacheContext);
-          } else {
-            await handler.set(cacheKey, cacheValue, cacheContext);
-          }
-        } catch {
-          // A handler failure skips caching but must not fail the render.
-        }
-      }
-
-      return collectedResult ? collectedResult.result : result;
+      return generate(true);
     }, cacheVariant);
   };
 
@@ -944,7 +1030,7 @@ const USE_CACHE_ACCEPTS_SECOND_ARGUMENT_SYMBOL = Symbol.for("vinext.useCacheAcce
 export function isUseCacheFunction(
   value: unknown,
 ): value is (...args: unknown[]) => Promise<unknown> {
-  return typeof value === "function" && Reflect.get(value, USE_CACHE_FUNCTION_SYMBOL) === true;
+  return isUseCacheFunctionReference(value);
 }
 
 function throwPrivateUseCacheInsidePublicUseCacheError(): never {
@@ -1331,37 +1417,42 @@ async function runCachedFunctionWithContext<
  */
 type UnwrapThenableObjectsOptions = {
   omitAppPageSearchParamsAtRoot?: boolean;
+  /**
+   * Omit searchParams from props marked by `markAppPagePropsForUseCache` at
+   * any depth. False for private caches, which key by search params.
+   */
+  omitMarkedAppPageSearchParams: boolean;
 };
 
 type UnwrapThenableObjectArrayOptions = {
-  omitAppPageSearchParamsFromFirstArg: boolean;
+  /** Index of the page props whose searchParams are omitted, if any. */
+  pagePropsIndex: number | undefined;
+  omitMarkedAppPageSearchParams: boolean;
 };
 
-function unwrapThenableObjects(
-  value: unknown,
-  options: UnwrapThenableObjectsOptions = {},
-): unknown {
+function unwrapThenableObjects(value: unknown, options: UnwrapThenableObjectsOptions): unknown {
   if (value === null || value === undefined || typeof value !== "object") {
     return value;
   }
 
+  const childOptions: UnwrapThenableObjectsOptions = {
+    omitMarkedAppPageSearchParams: options.omitMarkedAppPageSearchParams,
+  };
+
   if (Array.isArray(value)) {
-    return value.map((item) => unwrapThenableObjects(item));
+    return value.map((item) => unwrapThenableObjects(item, childOptions));
   }
 
-  // Detect thenable (Promise-like) with own enumerable properties —
-  // this is the Object.assign(Promise.resolve(obj), obj) pattern.
+  if (isThenableObject(value)) {
+    const plain: Record<string, unknown> = {};
+    for (const key of Object.keys(value)) {
+      // oxlint-disable-next-line typescript/no-explicit-any
+      plain[key] = unwrapThenableObjects((value as any)[key], childOptions);
+    }
+    return plain;
+  }
   // oxlint-disable-next-line @typescript-eslint/no-explicit-any
   if (typeof (value as any).then === "function") {
-    const keys = Object.keys(value);
-    if (keys.length > 0) {
-      const plain: Record<string, unknown> = {};
-      for (const key of keys) {
-        // oxlint-disable-next-line typescript/no-explicit-any
-        plain[key] = unwrapThenableObjects((value as any)[key]);
-      }
-      return plain;
-    }
     // Pure Promise with no own properties — leave as-is
     return value;
   }
@@ -1371,14 +1462,78 @@ function unwrapThenableObjects(
   for (const key of Object.keys(value)) {
     if (
       key === "searchParams" &&
-      (options.omitAppPageSearchParamsAtRoot || isMarkedAppPagePropsObject(value))
+      (options.omitAppPageSearchParamsAtRoot ||
+        (options.omitMarkedAppPageSearchParams && isMarkedAppPagePropsObject(value)))
     ) {
       continue;
     }
     // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-    result[key] = unwrapThenableObjects((value as any)[key]);
+    result[key] = unwrapThenableObjects((value as any)[key], childOptions);
   }
   return result;
+}
+
+/**
+ * A thenable (not an array) with own enumerable properties — the
+ * `Object.assign(Promise.resolve(obj), obj)` pattern Next.js params use. The
+ * cache key is built from its fields instead of the promise.
+ */
+export function isThenableObject(value: object): value is PromiseLike<unknown> {
+  return (
+    !Array.isArray(value) &&
+    "then" in value &&
+    typeof value.then === "function" &&
+    Object.keys(value).length > 0
+  );
+}
+
+function isPagePropsObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function replaceArgument(args: readonly unknown[], index: number, value: unknown): unknown[] {
+  const result = [...args];
+  result[index] = value;
+  return result;
+}
+
+/** Remove the `$$isPage` invocation marker before props reach the key or user code. */
+function withoutUseCachePageMarker(props: Record<string, unknown>): Record<string, unknown> {
+  const { [APP_PAGE_USE_CACHE_MARKER]: _marker, ...pageProps } = props;
+  // Keep the page probe's non-enumerable marker, which the spread drops.
+  return isMarkedAppPagePropsObject(props) ? markAppPagePropsForUseCache(pageProps) : pageProps;
+}
+
+/**
+ * Response Store replay args for a public page cache: drop `searchParams` from
+ * the page props at `index` (after a capture envelope, if any), as Next.js does
+ * for the serialized arguments (use-cache-wrapper.ts, `isPageSegmentFunction`),
+ * and keep the `$$isPage` marker so a replay regains page semantics, including
+ * the erroring searchParams fallback.
+ */
+function toReplayablePageArgs(args: readonly unknown[], index: number): unknown[] {
+  const props = args[index];
+  if (!isPagePropsObject(props)) return [...args];
+  const { searchParams: _searchParams, ...pageProps } = props;
+  return replaceArgument(args, index, { ...pageProps, [APP_PAGE_USE_CACHE_MARKER]: true });
+}
+
+/**
+ * Give page props at `index` without `searchParams` (a Response Store replay of
+ * args encoded by `toReplayablePageArgs`) a value that throws on
+ * access inside the cache scope, like Next.js's
+ * `makeErroringSearchParamsForUseCache`, instead of `undefined`.
+ */
+function withErroringPageSearchParams(args: readonly unknown[], index: number): readonly unknown[] {
+  const props = args[index];
+  if (!isPagePropsObject(props) || "searchParams" in props) return args;
+  return replaceArgument(args, index, {
+    ...props,
+    searchParams: makeThenableParams(
+      {},
+      { observeParamAccess: () => throwIfInsideCacheScope("searchParams") },
+    ),
+  });
 }
 
 function unwrapThenableObjectArray(
@@ -1387,7 +1542,8 @@ function unwrapThenableObjectArray(
 ): unknown[] {
   return values.map((value, index) =>
     unwrapThenableObjects(value, {
-      omitAppPageSearchParamsAtRoot: index === 0 && options.omitAppPageSearchParamsFromFirstArg,
+      omitAppPageSearchParamsAtRoot: index === options.pagePropsIndex,
+      omitMarkedAppPageSearchParams: options.omitMarkedAppPageSearchParams,
     }),
   );
 }
