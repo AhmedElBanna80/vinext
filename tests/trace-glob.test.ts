@@ -8,6 +8,7 @@ import {
   createContainsMatcher,
   createPathMatcher,
   globFiles,
+  isTranslatedExactly,
 } from "../packages/vinext/src/build/trace-glob.js";
 
 // Next.js expands outputFileTracingIncludes with its compiled node-glob and
@@ -266,14 +267,36 @@ describe("createContainsMatcher", () => {
     "!(*).js",
     "/app/+(a)",
     "!(a)",
+    "!foo",
+    "!/app",
+    "!!/app",
+    "!/app/*",
+    "!{/app,/pages}",
+    "**(a)",
+    "/app/**(a)",
+    "/pages/*(_)app",
   ];
 
   it.each(keys)("matches picomatch { dot, contains } for route key %s", (key) => {
     const expected = picomatch(key, { dot: true, contains: true });
-    const actual = createContainsMatcher([key]);
+    const actual = createContainsMatcher(key);
     for (const route of routes) {
       expect([route, actual(route)]).toEqual([route, expected(route)]);
     }
+  });
+});
+
+describe("isTranslatedExactly", () => {
+  it("flags the shapes the picomatch translation does not cover", () => {
+    expect(isTranslatedExactly("/[[:alpha:]]pp")).toBe(false);
+    expect(isTranslatedExactly("@(a/b)")).toBe(false);
+    expect(isTranslatedExactly("@([)]/a)")).toBe(false);
+    expect(isTranslatedExactly("+(a|@(b/c))")).toBe(false);
+    expect(isTranslatedExactly("a[/]b")).toBe(false);
+    expect(isTranslatedExactly("!(/app)")).toBe(false);
+    expect(isTranslatedExactly("/app/@(a|b)/c")).toBe(true);
+    expect(isTranslatedExactly("/app/[id]/x")).toBe(true);
+    expect(isTranslatedExactly("!foo")).toBe(true);
   });
 });
 
@@ -287,6 +310,8 @@ describe("createPathMatcher", () => {
     "public/exclude-me/hello.txt",
     "include-me/.dot-folder/another-file.txt",
     "src/temp/a/b.log",
+    "node_modules/pkg/aa",
+    "node_modules/pkg/ab",
   ];
   const excludes = [
     "./node_modules/@swc/core-linux-x64-gnu",
@@ -301,6 +326,9 @@ describe("createPathMatcher", () => {
     "node_modules/pkg{,-other}/**",
     "node_modules/*/**",
     "node_modules/@swc/core-{darwin,linux}-*/*.node",
+    "pkg/**(a)",
+    "node_modules/pkg/**(a)",
+    "node_modules/pkg/a**(b)",
   ];
 
   it.each(excludes)("matches picomatch on path.join(dir, glob) for %s", (exclude) => {

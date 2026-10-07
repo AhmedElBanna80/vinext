@@ -195,9 +195,10 @@ function parseSegment(
       }
     }
     if (char === "*") {
-      // A segment-leading wildcard matches at least one character.
+      // A segment-leading wildcard matches at least one character. Repeated
+      // stars collapse, except one that starts a `*()` extglob.
       source += index === 0 ? "(?=.)[^/]*" : "[^/]*";
-      while (segment[index + 1] === "*") index++;
+      while (segment[index + 1] === "*" && segment[index + 2] !== "(") index++;
       index++;
       continue;
     }
@@ -268,23 +269,59 @@ function toRegExp(source: string, literal: string): RegExp {
 
 /**
  * Whether {@link createContainsMatcher} and {@link createPathMatcher} match a
- * pattern exactly like picomatch. POSIX classes (`[[:alpha:]]`) and extglobs
- * that span path segments (`@(a/b)`) are not translated.
+ * pattern exactly like picomatch. Path segments are translated one at a time,
+ * so POSIX classes (`[[:alpha:]]`), and extglobs or classes containing a `/`
+ * (`@(a/b)`, `a[/]b`), are not.
  */
 export function isTranslatedExactly(pattern: string): boolean {
-  return !/\[:[a-z]+:\]/.test(pattern) && !/[@?+*!]\([^)]*\//.test(pattern);
+  if (/\[:[a-z]+:\]/.test(pattern)) return false;
+  let extglobDepth = 0;
+  for (let index = 0; index < pattern.length; index++) {
+    const char = pattern[index];
+    if (char === "\\") {
+      index++;
+    } else if (char === "[") {
+      const close = pattern.indexOf("]", index + 2);
+      if (close !== -1) {
+        if (pattern.slice(index, close).includes("/")) return false;
+        index = close;
+      }
+    } else if ("@?+*!".includes(char) && pattern[index + 1] === "(") {
+      extglobDepth++;
+      index++;
+    } else if (char === "(" && extglobDepth > 0) {
+      extglobDepth++;
+    } else if (char === ")" && extglobDepth > 0) {
+      extglobDepth--;
+    } else if (char === "/" && extglobDepth > 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
- * Match a value against globs anywhere in the string, like
- * `picomatch(patterns, { dot: true, contains: true })`.
+ * Match a value against a glob anywhere in the string, like
+ * `picomatch(pattern, { dot: true, contains: true })`.
  */
-export function createContainsMatcher(patterns: readonly string[]): (value: string) => boolean {
-  const regexes = patterns
-    .flatMap(expandBraces)
-    .map((pattern) => toRegExp(containsSource(pattern, true), pattern));
+export function createContainsMatcher(pattern: string): (value: string) => boolean {
+  // Leading `!`s (not starting a `!()` extglob) negate the pattern; picomatch
+  // then only rejects values the pattern matches at their start.
+  let negated = false;
+  let body = pattern;
+  while (body.startsWith("!") && (body[1] !== "(" || body[2] === "?")) {
+    negated = !negated;
+    body = body.slice(1);
+  }
+  const expansions = expandBraces(body);
+  if (negated) {
+    const sources = expansions.map((expanded) => containsSource(expanded, true));
+    const regex = toRegExp(`^(?!(?:${sources.join("|")})).*$`, pattern);
+    return (value) => value === pattern || regex.test(value);
+  }
+  const regexes = expansions.map((expanded) => toRegExp(containsSource(expanded, true), expanded));
   // picomatch also matches a value equal to the pattern itself.
-  return (value) => patterns.includes(value) || regexes.some((regex) => regex.test(value));
+  return (value) => value === pattern || regexes.some((regex) => regex.test(value));
 }
 
 /**

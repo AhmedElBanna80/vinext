@@ -198,16 +198,12 @@ export async function collectTraceRouteNames(options: {
   }
 
   if (appDir) {
-    const [{ appRouter }, { metadataRouteSuffix, scanMetadataFiles }] = await Promise.all([
-      import("../routing/app-router.js"),
-      import("../server/metadata-routes.js"),
-    ]);
+    const { metadataRouteSuffix, scanMetadataFiles } = await import("../server/metadata-routes.js");
     const appNames = new Set<string>();
-    for (const route of await appRouter(appDir, options.pageExtensions, matcher)) {
-      const file = route.pagePath ?? route.routePath;
-      if (!file) continue;
-      const entry = matcher.stripExtension(toSlash(path.relative(appDir, file)));
-      appNames.add(normalizeAppPath(`app/${entry}`));
+    // Every page and route file is an entry, including pages that only fill
+    // a parallel route slot (`app/@modal/photo/page` is `/app/photo`).
+    for (const file of collectAppEntryFiles(appDir, matcher)) {
+      appNames.add(normalizeAppPath(`app/${matcher.stripExtension(file)}`));
     }
     for (const route of scanMetadataFiles(appDir)) {
       appNames.add(metadataRouteName(route, appDir, matcher, metadataRouteSuffix));
@@ -218,6 +214,41 @@ export async function collectTraceRouteNames(options: {
   }
 
   return [...names];
+}
+
+/**
+ * App directory `page` and `route` files relative to `appDir`, like Next.js's
+ * `collectAppFiles`, which skips private (`_`-prefixed) folders.
+ */
+function collectAppEntryFiles(appDir: string, matcher: ValidFileMatcher): string[] {
+  const files: string[] = [];
+  const walk = (dir: string, relative: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith("_")) continue;
+      const file = relative ? `${relative}/${entry.name}` : entry.name;
+      const absolute = path.join(dir, entry.name);
+      const isDirectory =
+        entry.isDirectory() || (entry.isSymbolicLink() && isDirectoryPath(absolute));
+      if (isDirectory) walk(absolute, file);
+      else if (matcher.isAppRouterPage(file)) files.push(file);
+    }
+  };
+  walk(appDir, "");
+  return files;
+}
+
+function isDirectoryPath(file: string): boolean {
+  try {
+    return fs.statSync(file).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function realPath(file: string): string | null {
@@ -241,7 +272,7 @@ function selectFiles(options: NitroTraceIncludesOptions): TraceSelection {
   // applies to every route, and such an exclude key or glob is ignored.
   const inexact = new Set<string>();
   const keyMatcher = (key: string, fallback: boolean) => {
-    if (isTranslatedExactly(key)) return createContainsMatcher([key]);
+    if (isTranslatedExactly(key)) return createContainsMatcher(key);
     inexact.add(key);
     return () => fallback;
   };
