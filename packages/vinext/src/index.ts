@@ -141,6 +141,7 @@ import { normalizePath } from "./server/normalize-path.js";
 import {
   canonicalizeRequestUrlPathname,
   filterInternalHeaders,
+  getRepeatedSlashRedirectLocation,
   INTERNAL_HEADERS,
   isOpenRedirectShaped,
   normalizeTrailingSlash,
@@ -5602,7 +5603,16 @@ export const loadServerActionClient = ${
       configureServer(server: ViteDevServer) {
         const devBuildId = nextConfig?.buildId ?? process.env.__VINEXT_BUILD_ID ?? "development";
 
-        server.middlewares.use((req, _res, next) => {
+        server.middlewares.use((req, res, next) => {
+          // Like Next.js, redirect any path containing a backslash or a
+          // repeated slash before anything else parses it (`new URL("//", base)`
+          // throws, and `//host/x` parses as a different origin).
+          const slashRedirect = getRepeatedSlashRedirectLocation(req.url ?? "/");
+          if (slashRedirect !== null) {
+            res.writeHead(308, { Location: slashRedirect, Refresh: `0;url=${slashRedirect}` });
+            res.end(slashRedirect);
+            return;
+          }
           req.__vinextOriginalEncodedUrl ??= req.url;
           // Only the hybrid Pages handler below may attach the forwarded
           // middleware context. The App Router trusts req.headers for it, so a

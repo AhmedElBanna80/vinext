@@ -6,6 +6,7 @@ import {
   cloneRequestWithUrl,
   createStaticFileSignal,
   filterInternalHeaders,
+  getRepeatedSlashRedirectLocation,
   guardProtocolRelativeUrl,
   INTERNAL_HEADERS,
   isOpenRedirectShaped,
@@ -74,16 +75,26 @@ describe("canonicalizeRequestPathname", () => {
 // ── guardProtocolRelativeUrl ────────────────────────────────────────────
 
 describe("guardProtocolRelativeUrl", () => {
-  it("returns 404 for // protocol-relative paths", () => {
-    const res = guardProtocolRelativeUrl("//evil.com");
-    expect(res).not.toBeNull();
-    expect(res!.status).toBe(404);
+  // Next.js 308s literal `//` and `\` to the collapsed same-origin path
+  // (base-server.ts / resolve-routes.ts) instead of 404ing them.
+  it("308s // protocol-relative paths to the collapsed path", async () => {
+    const res = guardProtocolRelativeUrl("//evil.com", "?a=1");
+    expect(res?.status).toBe(308);
+    expect(res?.headers.get("location")).toBe("/evil.com?a=1");
+    expect(res?.headers.get("refresh")).toBe("0;url=/evil.com?a=1");
+    expect(await res?.text()).toBe("/evil.com?a=1");
   });
 
-  it("returns 404 for backslash protocol-relative paths", () => {
+  it("308s backslash protocol-relative paths to the collapsed path", () => {
     const res = guardProtocolRelativeUrl("/\\evil.com");
-    expect(res).not.toBeNull();
-    expect(res!.status).toBe(404);
+    expect(res?.status).toBe(308);
+    expect(res?.headers.get("location")).toBe("/evil.com");
+  });
+
+  it("308s a bare double slash to the root", () => {
+    const res = guardProtocolRelativeUrl("//");
+    expect(res?.status).toBe(308);
+    expect(res?.headers.get("location")).toBe("/");
   });
 
   // Regression for VULN-126915 / H1 #3576997: encoded backslash in the
@@ -143,6 +154,76 @@ describe("guardProtocolRelativeUrl", () => {
   });
 });
 
+// ── getRepeatedSlashRedirectLocation ────────────────────────────────────
+
+describe("getRepeatedSlashRedirectLocation", () => {
+  // Expected values observed against `next start` (Next.js 16.2.7).
+  it.each([
+    ["//", "/"],
+    ["//?a=1", "/?a=1"],
+    ["//?", "/"],
+    ["///", "/"],
+    ["/\\", "/"],
+    ["//evil.com", "/evil.com"],
+    ["///evil.com", "/evil.com"],
+    ["/\\evil.com", "/evil.com"],
+    ["/\\\\evil.com", "/evil.com"],
+    ["/\\/evil.com", "/evil.com"],
+    ["/about//", "/about/"],
+    ["/about//?x=1//y", "/about/?x=1//y"],
+    ["/docs//", "/docs/"],
+    ["//docs/about", "/docs/about"],
+    ["/a/..//b", "/b"],
+    ["/..//evil.com", "/evil.com"],
+    ["/.//evil.com", "/evil.com"],
+    ["/_next//static/x.js", "/_next/static/x.js"],
+    ["/%2F//evil.com", null],
+    ["//%2Fevil.com", null],
+    ["//%5Cevil.com", null],
+  ])("%s → %s", (rawUrl, expected) => {
+    expect(getRepeatedSlashRedirectLocation(rawUrl)).toBe(expected);
+  });
+
+  it("never returns a protocol-relative or cross-origin Location", () => {
+    const prefixes = ["", "/", "//", "/\\", "\\/", "\\\\", "/./", "/../", "/a/../"];
+    const middles = ["", "/", "\\", "//", "\\\\", "%2F", "%5C", "%2f", "%5c", "\t", "\n"];
+    for (const prefix of prefixes) {
+      for (const middle of middles) {
+        for (const suffix of ["evil.com", "/evil.com", "\\evil.com", "evil.com/?q=//x"]) {
+          const location = getRepeatedSlashRedirectLocation(`${prefix}${middle}${suffix}`);
+          if (location === null) continue;
+          expect(location.startsWith("/")).toBe(true);
+          expect(isOpenRedirectShaped(location)).toBe(false);
+          expect(new URL(location, "https://victim.example").origin).toBe("https://victim.example");
+        }
+      }
+    }
+  });
+
+  it("leaves paths without literal repeated slashes or backslashes alone", () => {
+    expect(getRepeatedSlashRedirectLocation("/")).toBeNull();
+    expect(getRepeatedSlashRedirectLocation("/about/")).toBeNull();
+    expect(getRepeatedSlashRedirectLocation("/about?next=//evil.com")).toBeNull();
+    expect(getRepeatedSlashRedirectLocation("/%2F")).toBeNull();
+    expect(getRepeatedSlashRedirectLocation("/%5C")).toBeNull();
+    expect(getRepeatedSlashRedirectLocation("/%2F/evil.com")).toBeNull();
+    expect(getRepeatedSlashRedirectLocation("/%5C%5Cevil.com")).toBeNull();
+  });
+
+  it("leaves absolute-form request targets to the 404 guard", () => {
+    expect(getRepeatedSlashRedirectLocation("http://evil.com//x")).toBeNull();
+    expect(getRepeatedSlashRedirectLocation("\\/evil.com")).toBeNull();
+  });
+
+  it("matches WHATWG URL parsing, which strips tabs and newlines first", () => {
+    // Node rejects raw tabs/newlines in the request target with a 400; Worker
+    // and Request-based entries see the URL after the parser has stripped them.
+    const url = new URL("http://victim.example//\tevil.com");
+    expect(url.pathname).toBe("//evil.com");
+    expect(getRepeatedSlashRedirectLocation(url.pathname)).toBe("/evil.com");
+  });
+});
+
 // ── isOpenRedirectShaped ────────────────────────────────────────────────
 
 describe("isOpenRedirectShaped", () => {
@@ -170,22 +251,12 @@ describe("isOpenRedirectShaped", () => {
     expect(isOpenRedirectShaped("/%61dmin")).toBe(false);
   });
 
-  it("returns false for a bare double slash with no host-like segment after it", () => {
-    // Ported from Next.js: test/e2e/hydration (browsing "//" hydrates
-    // normally, matching "/"). A bare "//" — in any of its literal or
-    // percent-encoded forms — has nothing after it that looks like a host,
-    // so there is no open-redirect shape to reject; Next.js serves it as the
-    // index route.
-    expect(isOpenRedirectShaped("//")).toBe(false);
-    expect(isOpenRedirectShaped("/\\")).toBe(false);
-    expect(isOpenRedirectShaped("/%5C")).toBe(false);
-    expect(isOpenRedirectShaped("/%2F")).toBe(false);
-    expect(isOpenRedirectShaped("/%2f")).toBe(false);
-
-    // The real attack shapes — anything non-empty after the double slash —
-    // must still be rejected.
-    expect(isOpenRedirectShaped("//evil.com")).toBe(true);
-    expect(isOpenRedirectShaped("/%2F/evil.com")).toBe(true);
+  it("detects bare double-slash forms", () => {
+    // A same-origin `http://host//` must not be relativized to `Location: //`.
+    expect(isOpenRedirectShaped("//")).toBe(true);
+    expect(isOpenRedirectShaped("/\\")).toBe(true);
+    expect(isOpenRedirectShaped("/%2F")).toBe(true);
+    expect(isOpenRedirectShaped("/%5c")).toBe(true);
   });
 });
 

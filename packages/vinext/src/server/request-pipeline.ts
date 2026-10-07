@@ -7,10 +7,10 @@ import {
   methodNotAllowedResponse,
   notFoundResponse,
 } from "./http-error-responses.js";
-import { isOpenRedirectShaped } from "./open-redirect.js";
+import { isOpenRedirectShaped, repeatedSlashRedirectResponse } from "./open-redirect.js";
 import { createStaticFileSignal, type StaticFileSignalContext } from "./static-file-signal.js";
 
-export { isOpenRedirectShaped } from "./open-redirect.js";
+export { getRepeatedSlashRedirectLocation, isOpenRedirectShaped } from "./open-redirect.js";
 export { createStaticFileSignal };
 
 const PATHNAME_CANONICALIZATION_BASE = new URL("http://vinext.invalid/");
@@ -63,10 +63,13 @@ export function canonicalizeRequestUrlPathname(url: string): string {
  * Backslashes are equivalent to forward slashes in the URL spec
  * (e.g. `/\evil.com` is treated as `//evil.com` by browsers).
  *
- * Next.js returns 404 for these paths. We check the RAW pathname before
- * normalization so the guard fires before normalizePath collapses `//`.
+ * Like Next.js, any raw path containing a literal backslash or a repeated
+ * slash first gets a 308 to the collapsed path (`//evil.com` → `/evil.com`,
+ * `//` → `/`); see `getRepeatedSlashRedirectLocation`. We check the RAW
+ * pathname before normalization so this fires before normalizePath collapses
+ * `//`.
  *
- * Percent-encoded variants are also blocked because:
+ * Percent-encoded variants get a 404, as in Next.js, because:
  *   - `%5C` decodes to `\` (browsers treat `/\evil.com` as `//evil.com`).
  *   - `%2F` decodes to `/` (so `/%2F/evil.com` effectively becomes `//evil.com`).
  * These forms survive segment-wise decoding that re-encodes path delimiters
@@ -75,9 +78,12 @@ export function canonicalizeRequestUrlPathname(url: string): string {
  * `isOpenRedirectShaped` for the full list of rejected leading-segment forms.
  *
  * @param rawPathname - The raw pathname from the URL, before any normalization
- * @returns A 404 Response if the path is protocol-relative, or null to continue
+ * @param search - The raw query string (including `?`), kept in the 308 Location
+ * @returns A 308 or 404 Response, or null to continue
  */
-export function guardProtocolRelativeUrl(rawPathname: string): Response | null {
+export function guardProtocolRelativeUrl(rawPathname: string, search = ""): Response | null {
+  const slashRedirect = repeatedSlashRedirectResponse(rawPathname + search);
+  if (slashRedirect) return slashRedirect;
   if (isOpenRedirectShaped(rawPathname)) {
     return notFoundResponse();
   }

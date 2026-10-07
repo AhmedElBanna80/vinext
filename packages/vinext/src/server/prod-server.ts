@@ -41,6 +41,7 @@ import { registerPrerenderCloudflareLoader } from "../build/prerender-cloudflare
 import {
   canonicalizeRequestPathname,
   filterInternalHeaders,
+  getRepeatedSlashRedirectLocation,
   isOpenRedirectShaped,
 } from "./request-pipeline.js";
 import { notFoundResponse } from "./http-error-responses.js";
@@ -1259,6 +1260,18 @@ async function sendWebResponse(
   }
 }
 
+/**
+ * Send Next.js's 308 for a raw request target containing a backslash or a
+ * repeated slash. Returns true when the response was sent.
+ */
+function sendRepeatedSlashRedirect(rawUrl: string, res: ServerResponse): boolean {
+  const location = getRepeatedSlashRedirectLocation(rawUrl);
+  if (location === null) return false;
+  res.writeHead(308, { Location: location, Refresh: `0;url=${location}` });
+  res.end(location);
+  return true;
+}
+
 function waitForNodeResponseCompletion(res: ServerResponse): Promise<void> {
   if (res.writableFinished || res.destroyed) return Promise.resolve();
   return new Promise((resolve) => {
@@ -1709,10 +1722,12 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
     const rawUrl = req.url ?? "/";
     const rawPathname = rawUrl.split("?")[0];
 
-    // Guard against protocol-relative URL open redirect attacks.
+    // Redirect repeated slashes / backslashes like Next.js (`//evil.com` →
+    // `/evil.com`), then guard against encoded protocol-relative shapes.
     // Run BEFORE decoding so both literal (`//`, `/\`) and encoded (`%5C`, `%2F`)
-    // variants are rejected — the encoded forms survive segment-wise decoding
+    // variants are handled — the encoded forms survive segment-wise decoding
     // below and would otherwise reach the trailing-slash redirect emitter.
+    if (sendRepeatedSlashRedirect(rawUrl, res)) return;
     if (isOpenRedirectShaped(rawPathname)) {
       res.writeHead(404);
       res.end("This page could not be found");
@@ -1916,8 +1931,9 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
       },
       getStatus: () => res.statusCode,
       headers,
-      isRsc:
-        new URL(target, "http://localhost").pathname.endsWith(".rsc") || headers.get("RSC") === "1",
+      // Read the raw path: `new URL("//", base)` throws, and `//host/x` would
+      // parse as a different origin.
+      isRsc: target.split("?", 1)[0].endsWith(".rsc") || headers.get("RSC") === "1",
       method: req.method ?? "GET",
       target,
     });
@@ -2097,10 +2113,12 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
     const rawUrl = req.url ?? "/";
     const rawPagesPathnameBeforeNormalize = rawUrl.split("?")[0];
 
-    // Guard against protocol-relative URL open redirect attacks.
+    // Redirect repeated slashes / backslashes like Next.js (`//evil.com` →
+    // `/evil.com`), then guard against encoded protocol-relative shapes.
     // Run BEFORE decoding so both literal (`//`, `/\`) and encoded (`%5C`, `%2F`)
-    // variants are rejected — the encoded forms survive segment-wise decoding
+    // variants are handled — the encoded forms survive segment-wise decoding
     // below and would otherwise reach the trailing-slash redirect emitter.
+    if (sendRepeatedSlashRedirect(rawUrl, res)) return;
     if (isOpenRedirectShaped(rawPagesPathnameBeforeNormalize)) {
       res.writeHead(404);
       res.end("This page could not be found");
