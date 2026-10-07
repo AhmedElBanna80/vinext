@@ -222,6 +222,23 @@ describe("instantiateCacheAdapter", () => {
     expect(sub.received).toBe(args);
   });
 
+  it("treats an ES5 class with only instance-field methods as a factory, as documented", () => {
+    // TypeScript `target: ES5` output for `class A { get = ...; set = ...; ... }`:
+    // the prototype holds only `constructor`, like any `function` factory's.
+    function FieldsAdapter(this: Record<string, unknown>, input: unknown) {
+      Object.assign(this, dataMethods(), { received: input });
+    }
+    expect(isClassExport(FieldsAdapter)).toBe(false);
+    expect(() => instantiateCacheAdapter(FieldsAdapter, args, "data")).toThrow(TypeError);
+
+    // The documented form for such a module: a factory that constructs it.
+    const factory = (input: unknown) =>
+      new (FieldsAdapter as unknown as new (input: unknown) => { received: unknown })(input);
+    const adapter = instantiateCacheAdapter<{ received: unknown }>(factory, args, "data");
+    expect(adapter).toBeInstanceOf(FieldsAdapter);
+    expect(adapter.received).toBe(args);
+  });
+
   it("calls a bound class like any bound function, surfacing the runtime's error", () => {
     expect(() => instantiateCacheAdapter(DataAdapter.bind(null), args, "data")).toThrow(TypeError);
   });

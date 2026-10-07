@@ -94,7 +94,9 @@ export type CacheAdapterDescriptor<O extends Record<string, unknown> = Record<st
    * either a factory `({ env, options }) => adapter` or a class
    * `new Adapter({ env, options })`. A class (a `class` declaration, or a
    * transpiled class with methods on its `prototype` chain) is invoked with `new`;
-   * any other function, including a bound one, is called. The result must be
+   * any other function, including a bound one, is called. (An ES5-compiled
+   * class whose methods are all instance fields is indistinguishable from a
+   * factory; export `(args) => new Adapter(args)` for it.) The result must be
    * the adapter object itself, not a Promise.
    */
   adapter: string;

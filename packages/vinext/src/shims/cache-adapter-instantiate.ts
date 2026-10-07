@@ -17,7 +17,11 @@
  * - Any other function is called as a factory, with plain-call semantics
  *   (`this`, `new.target` and bound receivers are what a call gives them).
  *   That includes bound functions, which expose no `prototype`: export the
- *   class itself rather than a bound copy.
+ *   class itself rather than a bound copy. It also includes an ES5-compiled
+ *   class whose methods are all instance fields: its prototype holds only
+ *   `constructor`, exactly like a `function` factory's, so nothing short of
+ *   invoking it tells them apart. Such a module exports
+ *   `(args) => new Adapter(args)` instead.
  *
  * Both checks read language-level facts without invoking the export, so no
  * source sniffing, no error-message matching and no second invocation.
