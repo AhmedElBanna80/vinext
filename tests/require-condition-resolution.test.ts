@@ -359,11 +359,12 @@ describe("vinext:require-condition-resolution", () => {
 
   function expectRewritten(root: string, code: string | undefined, rewritten: boolean) {
     const virtualId = `${path.join(root, "node_modules", "lib-cjs", "index.js")}.vinext-require.js`;
-    if (rewritten) expect(code).toContain(`require(${JSON.stringify(virtualId)})`);
-    else expect(code).toContain(`require("lib-cjs")`);
+    const call = rewritten ? `require(${JSON.stringify(virtualId)})` : `require("lib-cjs")`;
+    // The fixture requires the package twice; both calls must agree.
+    expect(code?.split(call).length).toBe(3);
   }
 
-  it.each<[string, Record<string, unknown>, boolean, Plugin[]?]>([
+  it.each<[string, Record<string, unknown>, boolean, Plugin[]?, Record<string, unknown>?]>([
     ["bundles the require target of a default-externalized package", {}, true],
     [
       "bundles past a bundler external that does not match",
@@ -425,10 +426,32 @@ describe("vinext:require-condition-resolution", () => {
     ],
     ["leaves a package that a plugin resolves elsewhere", {}, false, [redirectPlugin]],
     ["leaves a package that a plugin externalizes", {}, false, [externalPlugin]],
-  ])("%s", async (_name, environment, rewritten, plugins = []) => {
+    [
+      "leaves a require whose synthetic id an options-hook external matches",
+      {},
+      false,
+      [
+        {
+          name: "add-node-modules-external",
+          options(options) {
+            return { ...options, external: /node_modules/ };
+          },
+        },
+      ],
+    ],
+    // Vite leaves `packageJsonPath` off its resolutions with the legacy interop.
+    [
+      "bundles the require target with the legacy CJS interop",
+      {},
+      true,
+      [],
+      { legacy: { inconsistentCjsInterop: true } },
+    ],
+  ])("%s", async (_name, environment, rewritten, plugins = [], config = {}) => {
     await withConditionalPackage(async (root) => {
       let page: string | undefined;
       const builder = await createBuilder({
+        ...config,
         root,
         configFile: false,
         logLevel: "silent",

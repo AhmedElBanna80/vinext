@@ -207,10 +207,19 @@ export function createRequireConditionResolutionPlugin(
   };
   let defaultResolvers: ResolverPair | undefined;
   let bundlingResolvers: ResolverPair | undefined;
+  // The bundler's final `external` option per build environment, including
+  // entries other plugins add from their own `options` hooks.
+  const bundlerExternals = new WeakMap<object, BundlerExternal>();
 
   return {
     name: "vinext:require-condition-resolution",
     enforce: "pre",
+    options: {
+      order: "post",
+      handler(options) {
+        if (this.environment) bundlerExternals.set(this.environment, options.external);
+      },
+    },
     configResolved(config) {
       defaultResolvers = {
         require: createResolver(config, { isRequire: true }),
@@ -274,9 +283,14 @@ export function createRequireConditionResolutionPlugin(
         const keepExternals = this.environment.config.resolve.external === true;
         // Build-only: the dev module runner does not apply this option.
         const bundlerExternal =
-          this.environment.config.command === "build"
-            ? this.environment.config.build.rolldownOptions?.external
-            : undefined;
+          this.environment.config.command !== "build"
+            ? undefined
+            : bundlerExternals.has(this.environment)
+              ? bundlerExternals.get(this.environment)
+              : this.environment.config.build.rolldownOptions?.external;
+        // Vite only tags its resolutions with `packageJsonPath` without the
+        // legacy CJS interop.
+        const tagsPackageJson = !this.environment.config.legacy?.inconsistentCjsInterop;
 
         const output = new MagicString(code);
         let changed = false;
@@ -322,7 +336,7 @@ export function createRequireConditionResolutionPlugin(
             if (
               !resolved?.external ||
               resolved.id !== specifier ||
-              resolved.packageJsonPath === undefined ||
+              (tagsPackageJson && resolved.packageJsonPath === undefined) ||
               (bundlerExternal !== undefined &&
                 (isBundlerExternal(bundlerExternal, specifier, id) ||
                   isBundlerExternal(bundlerExternal, virtualId, id) ||
