@@ -24,8 +24,9 @@
  * Classification never invokes the export, matches no error messages and
  * never retries, so the export runs exactly once.
  *
- * The produced value must be an adapter object (not a Promise) with the slot's
- * required members; anything else throws an error naming what is wrong.
+ * The produced value must be an adapter (an object or a function, not a
+ * Promise) with the slot's required members; anything else throws an error
+ * naming what is wrong.
  */
 export type CacheAdapterFactoryArgs = { env: unknown; options: unknown };
 
@@ -116,11 +117,12 @@ export function instantiateCacheAdapter<T>(
     ? new (exported as new (args: CacheAdapterFactoryArgs) => unknown)(args)
     : (exported as (args: CacheAdapterFactoryArgs) => unknown)(args);
 
-  if (
-    adapter !== null &&
-    typeof adapter === "object" &&
-    typeof (adapter as { then?: unknown }).then === "function"
-  ) {
+  // Adapter contracts are structural, so a callable value with the required
+  // members is as valid as a plain object.
+  const isObjectLike =
+    (adapter !== null && typeof adapter === "object") || typeof adapter === "function";
+
+  if (isObjectLike && typeof (adapter as { then?: unknown }).then === "function") {
     // The result is discarded; keep a rejection from becoming unhandled.
     (adapter as PromiseLike<unknown>).then(undefined, () => {});
     throw new TypeError(
@@ -128,7 +130,7 @@ export function instantiateCacheAdapter<T>(
     );
   }
 
-  if (adapter === null || typeof adapter !== "object") {
+  if (!isObjectLike) {
     throw new TypeError(
       `${label}: the default export must produce an adapter object, got ${describeValue(
         adapter,

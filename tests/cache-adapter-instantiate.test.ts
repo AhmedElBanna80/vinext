@@ -310,9 +310,18 @@ describe("instantiateCacheAdapter", () => {
     expect(() => instantiateCacheAdapter(forgetsToReturn, args, "data")).toThrow(
       /must produce an adapter object, got undefined\./,
     );
-    expect(() => instantiateCacheAdapter(() => DataAdapter, args, "data")).toThrow(
-      /must produce an adapter object, got a function\./,
+    expect(() => instantiateCacheAdapter(() => 42, args, "data")).toThrow(
+      /must produce an adapter object, got a number\./,
     );
+    // A class returned instead of an instance fails member validation.
+    expect(() => instantiateCacheAdapter(() => DataAdapter, args, "data")).toThrow(
+      /is missing method get, method set, method revalidateTag\./,
+    );
+  });
+
+  it("accepts a callable adapter that has the required members", () => {
+    const handler = Object.assign(function handler() {}, dataMethods());
+    expect(instantiateCacheAdapter(() => handler, args, "data")).toBe(handler);
   });
 
   it("names the members a data adapter is missing", () => {
