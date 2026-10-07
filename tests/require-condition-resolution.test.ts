@@ -314,6 +314,13 @@ describe("vinext:require-condition-resolution", () => {
       if (id === "\0lib-cjs-redirect") return "export default 'redirect';";
     },
   };
+  const externalPlugin: Plugin = {
+    name: "externalize-lib-cjs",
+    enforce: "pre",
+    resolveId(source) {
+      if (source === "lib-cjs") return { id: source, external: true };
+    },
+  };
 
   async function withConditionalPackage<T>(run: (root: string) => Promise<T>): Promise<T> {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vinext-require-condition-")));
@@ -417,6 +424,7 @@ describe("vinext:require-condition-resolution", () => {
       true,
     ],
     ["leaves a package that a plugin resolves elsewhere", {}, false, [redirectPlugin]],
+    ["leaves a package that a plugin externalizes", {}, false, [externalPlugin]],
   ])("%s", async (_name, environment, rewritten, plugins = []) => {
     await withConditionalPackage(async (root) => {
       let page: string | undefined;
@@ -458,6 +466,52 @@ describe("vinext:require-condition-resolution", () => {
       });
       await builder.build(builder.environments.ssr);
       expectRewritten(root, page, true);
+    });
+  });
+
+  it("resolves nested requires from the directory of the synthetic target", async () => {
+    await withConditionalPackage(async (root) => {
+      const packageDir = path.join(root, "node_modules", "lib-cjs");
+      const privateDir = path.join(packageDir, "node_modules", "private-dep");
+      await mkdir(privateDir, { recursive: true });
+      await writeFile(
+        path.join(privateDir, "package.json"),
+        JSON.stringify({
+          name: "private-dep",
+          version: "1.0.0",
+          type: "commonjs",
+          exports: { ".": { import: "./index.mjs", default: "./index.js" } },
+        }),
+      );
+      await writeFile(path.join(privateDir, "index.js"), "module.exports = 'cjs';\n");
+      await writeFile(path.join(privateDir, "index.mjs"), "export default 'esm';\n");
+      await writeFile(
+        path.join(packageDir, "index.js"),
+        `module.exports = require("private-dep");\n`,
+      );
+
+      let target: string | undefined;
+      const builder = await createBuilder({
+        root,
+        configFile: false,
+        logLevel: "silent",
+        build: { ssr: "page.js", write: false },
+        plugins: [
+          createRequireConditionResolutionPlugin(createIdResolver, (id) =>
+            isConditionalRequireScriptModuleId(id) ? true : undefined,
+          ),
+          {
+            name: "record-target",
+            transform(code, id) {
+              if (id.endsWith("/lib-cjs/index.js.vinext-require.js")) target = code;
+            },
+          },
+        ],
+      });
+      await builder.build(builder.environments.ssr);
+      expect(target).toContain(
+        `require(${JSON.stringify(`${path.join(privateDir, "index.js")}.vinext-require.js`)})`,
+      );
     });
   });
 

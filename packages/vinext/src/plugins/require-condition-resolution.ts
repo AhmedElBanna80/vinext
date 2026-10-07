@@ -309,19 +309,20 @@ export function createRequireConditionResolutionPlugin(
 
           const moduleType = syntheticModuleType(requirePath);
           const virtualId = `${requirePath}.vinext-require.${moduleType}`;
-          // Only take over an import that would otherwise just be externalized.
-          // A plugin that resolves it elsewhere still wins (left to Vite, dev
-          // resolves it to the `import` entry and build to the external bare
-          // id). So does a bundler external matching the bare specifier, the
-          // only id it tests once the environment externalizes the package, or
-          // the synthetic id, which would become an import of a missing file.
+          // Only take over an import that would otherwise just be externalized
+          // by Vite: the hoisted import must resolve to the bare id, external,
+          // with the package.json Vite's resolver found. A plugin that resolves
+          // or externalizes it itself still wins. So does a bundler external
+          // matching the bare specifier, the only id it tests once Vite
+          // externalizes the package, or the synthetic id, which would become
+          // an import of a missing file. (Vite's dev resolver returns the
+          // package entry, so only builds get here.)
           if (bundlesExternal) {
             const resolved = await this.resolve(specifier, id, { skipSelf: true });
             if (
-              !resolved ||
-              (resolved.external
-                ? resolved.id !== specifier
-                : stripViteModuleQuery(resolved.id) !== importPath) ||
+              !resolved?.external ||
+              resolved.id !== specifier ||
+              resolved.packageJsonPath === undefined ||
               (bundlerExternal !== undefined &&
                 (isBundlerExternal(bundlerExternal, specifier, id) ||
                   isBundlerExternal(bundlerExternal, virtualId, id) ||
