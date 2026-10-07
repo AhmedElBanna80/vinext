@@ -326,11 +326,17 @@ function dynamic<P = {}>(
           );
         }
       }
+      // The preload hints go inside the boundary, next to the lazy component,
+      // as Next.js renders <PreloadChunks> beside <Lazy>. A hoisted <link>
+      // rendered right after a text node makes React emit a `<!-- -->` text
+      // separator, so in front of the boundary it would add a stray marker
+      // between the preceding text and `<!--$-->`. Inside the boundary nothing
+      // precedes it, and React still hoists the link into <head>.
       return React.createElement(
-        React.Fragment,
-        null,
+        React.Suspense,
+        { fallback },
         React.createElement(DynamicPreloadChunks, { moduleIds: preloadModuleIds }),
-        React.createElement(React.Suspense, { fallback }, content),
+        content,
       );
     };
 

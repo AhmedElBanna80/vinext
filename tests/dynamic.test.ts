@@ -11,6 +11,7 @@ import React from "react";
 import ReactDOMServer from "react-dom/server";
 import { renderToReadableStream } from "react-dom/server.edge";
 import dynamic, { flushPreloads } from "../packages/vinext/src/shims/dynamic.js";
+import { setPagesClientAssets } from "../packages/vinext/dist/server/pages-client-assets.js";
 
 // ─── Test components ────────────────────────────────────────────────────
 
@@ -166,6 +167,80 @@ describe("next/dynamic defaults", () => {
   it("handles undefined options", () => {
     const DynamicNoOpts = dynamic(() => Promise.resolve({ default: Hello }), undefined);
     expect(DynamicNoOpts.displayName).toBe("DynamicServer");
+  });
+});
+
+// ─── Preload hints and SSR text separators ──────────────────────────────
+//
+// Ported from Next.js test/e2e/next-dynamic: text followed by dynamic()
+// components must SSR as `Index<!--$-->1<!--/$-->...`, i.e. one marker
+// between the text and each component. React adds a `<!-- -->` text separator
+// before a hoisted <link> that follows text, so the preload links have to sit
+// inside the Suspense boundary (as Next.js renders <PreloadChunks> next to
+// <Lazy>), not in front of it.
+
+describe("next/dynamic preload hints", () => {
+  const Text = (props: { value: string }) => props.value;
+
+  async function renderWithPreloads(element: React.ReactElement) {
+    setPagesClientAssets({
+      dynamicPreloads: { "components/one.js": ["_next/static/chunks/one.js"] },
+    });
+    try {
+      const stream = await renderToReadableStream(element);
+      await stream.allReady;
+      return await new Response(stream).text();
+    } finally {
+      setPagesClientAssets(undefined);
+    }
+  }
+
+  it("does not add a text separator between preceding text and the boundary", async () => {
+    const One = dynamic(() => Promise.resolve({ default: () => Text({ value: "1" }) }), {
+      loadableGenerated: { modules: ["components/one.js"] },
+    } as unknown as Parameters<typeof dynamic>[1]);
+
+    // First render suspends on the lazy import; render twice so the second
+    // pass sees the resolved module, as a warm server does.
+    const element = React.createElement("div", { id: "foo" }, "Index", React.createElement(One));
+    await renderWithPreloads(element);
+    const html = await renderWithPreloads(element);
+
+    expect(html).toContain('<div id="foo">Index<!--$-->1<!--/$--></div>');
+    // The preload hint is still emitted (hoisted out of the boundary).
+    expect(html).toMatch(/<link rel="modulepreload" href="\/_next\/static\/chunks\/one\.js"[^>]*>/);
+  });
+
+  it("keeps the preload hint for a boundary that shows a loading fallback", async () => {
+    let resolveModule: (mod: { default: () => string }) => void = () => {};
+    const pending = new Promise<{ default: () => string }>((resolve) => {
+      resolveModule = resolve;
+    });
+    const Slow = dynamic(() => pending, {
+      loading: () => React.createElement("span", null, "loading"),
+      loadableGenerated: { modules: ["components/one.js"] },
+    } as unknown as Parameters<typeof dynamic>[1]);
+
+    setPagesClientAssets({
+      dynamicPreloads: { "components/one.js": ["_next/static/chunks/one.js"] },
+    });
+    try {
+      const stream = await renderToReadableStream(
+        React.createElement("div", null, "Index", React.createElement(Slow)),
+      );
+      const reader = stream.getReader();
+      const first = new TextDecoder().decode((await reader.read()).value);
+      // The shell flushes with the fallback while the import is pending, and
+      // the hint is already part of it.
+      expect(first).toContain("loading");
+      expect(first).toMatch(/<link rel="modulepreload" href="\/_next\/static\/chunks\/one\.js"/);
+      resolveModule({ default: () => Text({ value: "1" }) });
+      while (!(await reader.read()).done) {
+        // drain
+      }
+    } finally {
+      setPagesClientAssets(undefined);
+    }
   });
 });
 
