@@ -69,6 +69,14 @@ export function canonicalizeRequestUrlPathname(url: string): string {
  * pathname before normalization so this fires before normalizePath collapses
  * `//`.
  *
+ * Request-based (Worker) entries only see `request.url` after WHATWG URL
+ * parsing, which has already turned `\` into `/`; the raw request target is
+ * not available there. `/\evil.com` still redirects (it arrives as
+ * `//evil.com`), but a lone backslash such as `/foo\bar` arrives as
+ * `/foo/bar` and is routed without the redirect. On Cloudflare, requests that
+ * match a static asset are also answered by the asset layer before the
+ * Worker runs. Node entries (dev and `vinext start`) check the raw target.
+ *
  * Percent-encoded variants get a 404, as in Next.js, because:
  *   - `%5C` decodes to `\` (browsers treat `/\evil.com` as `//evil.com`).
  *   - `%2F` decodes to `/` (so `/%2F/evil.com` effectively becomes `//evil.com`).
