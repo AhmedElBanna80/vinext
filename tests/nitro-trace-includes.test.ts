@@ -515,19 +515,27 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
     }
   });
 
-  it("applies excludes to pnpm packages by their node_modules path", async () => {
+  it.each([
+    ["the default virtual store", PNPM_NATIVE],
+    ["a custom virtualStoreDir", ".pnpm-store/@native+core-x@1.0.0/node_modules/@native/core-x"],
+  ])("applies excludes to pnpm packages in %s by their node_modules path", async (_, storeDir) => {
     const { createNitroTraceIncludes } =
       await import("../packages/vinext/src/build/nitro-trace-includes.js");
     const root = await fs.realpath(
       await fs.mkdtemp(path.join(os.tmpdir(), "vinext-nitro-trace-pnpm-")),
     );
     try {
-      const store = path.join(root, PNPM_NATIVE);
+      const store = path.join(root, storeDir);
+      // A copy no `node_modules/<name>` link resolves to.
+      const other = path.join(root, ".pnpm-store/other@1.0.0/node_modules/@native/core-x");
       await writeFiles(root, {
-        [`${PNPM_NATIVE}/package.json`]: pkg("@native/core-x", "1.0.0"),
-        [`${PNPM_NATIVE}/index.js`]: "",
-        [`${PNPM_NATIVE}/lib/a.js`]: "",
+        [`${storeDir}/package.json`]: pkg("@native/core-x", "1.0.0"),
+        [`${storeDir}/index.js`]: "",
+        [`${storeDir}/lib/a.js`]: "",
+        [`${path.relative(root, other)}/lib/a.js`]: "",
       });
+      await fs.mkdir(path.join(root, "node_modules/@native"), { recursive: true });
+      await fs.symlink(store, path.join(root, "node_modules/@native/core-x"));
       // Nitro lists the real paths in the store.
       const tracedPackages: TracedPackages = {
         "@native/core-x": {
@@ -537,6 +545,11 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
               path: store,
               files: [path.join(store, "index.js"), path.join(store, "lib/a.js")],
               pkgJSON: { name: "@native/core-x", version: "1.0.0" },
+            },
+            "2.0.0": {
+              path: other,
+              files: [path.join(other, "lib/a.js")],
+              pkgJSON: { name: "@native/core-x", version: "2.0.0" },
             },
           },
         },
@@ -550,6 +563,9 @@ module.exports = () => fs.readdirSync(dir).join(",");`,
       })!.tracedPackages(tracedPackages);
       expect(tracedPackages["@native/core-x"].versions["1.0.0"].files).toEqual([
         path.join(store, "index.js"),
+      ]);
+      expect(tracedPackages["@native/core-x"].versions["2.0.0"].files).toEqual([
+        path.join(other, "lib/a.js"),
       ]);
     } finally {
       await fs.rm(root, { recursive: true, force: true }).catch(() => {});

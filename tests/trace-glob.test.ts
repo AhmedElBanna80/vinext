@@ -222,6 +222,8 @@ describe("createContainsMatcher", () => {
     "-a",
     "/-",
     "/app/-x",
+    "/",
+    "/app/",
   ];
   const keys = [
     "/",
@@ -324,6 +326,13 @@ describe("createContainsMatcher", () => {
     "**/!(foo)",
     "/**/!(foo)",
     "/app/**/x/**",
+    // A run of stars that starts a segment may match nothing.
+    "/**(a)",
+    "/app/***",
+    "/app/**!(a)",
+    "/app/**?(a)",
+    "/app/a**",
+    "/app/{foo,@(bar|x)}",
   ];
 
   it.each(keys)("matches picomatch { dot, contains } for route key %s", (key) => {
@@ -354,6 +363,16 @@ describe("isTranslatedExactly", () => {
     expect(isTranslatedExactly("a)+")).toBe(false);
     expect(isTranslatedExactly("x)?")).toBe(false);
     expect(isTranslatedExactly("a(b|c")).toBe(false);
+    // Braces inside an extglob, globstars inside a segment, escaped `/`.
+    expect(isTranslatedExactly("/app/!({api,admin})")).toBe(false);
+    expect(isTranslatedExactly("/app/+({foo,bar})/x")).toBe(false);
+    expect(isTranslatedExactly("/root/**@(a|b)/file")).toBe(false);
+    expect(isTranslatedExactly("/root/**{a,b}/file")).toBe(false);
+    expect(isTranslatedExactly("/root/**@(a)**")).toBe(false);
+    expect(isTranslatedExactly("/app/a\\/b")).toBe(false);
+    expect(isTranslatedExactly("/**(a)")).toBe(true);
+    expect(isTranslatedExactly("/app/{foo,@(bar|x)}")).toBe(true);
+    expect(isTranslatedExactly("/app/a\\*b")).toBe(true);
     expect(isTranslatedExactly("/app/@(foo|bar)?")).toBe(true);
     expect(isTranslatedExactly("/app/(api)")).toBe(true);
     expect(isTranslatedExactly("(a|b)+")).toBe(true);
@@ -401,6 +420,7 @@ describe("createPathMatcher", () => {
     "node_modules/pkg/**/!(index.js)",
     "node_modules/**/!(swc.node)",
     "node_modules/pkg[^-a]*/**",
+    "node_modules/pkg/***",
   ];
 
   it.each(excludes)("matches picomatch on path.join(dir, glob) for %s", (exclude) => {

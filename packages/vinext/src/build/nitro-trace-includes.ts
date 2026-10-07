@@ -277,8 +277,11 @@ function realPath(file: string): string | null {
 type TraceSelection = {
   /** Included files (matched path to real path) that some route keeps. */
   included: Map<string, string>;
-  /** Whether every route excludes a traced file. */
-  isTracedFileExcluded: (file: string) => boolean;
+  /**
+   * Whether every route excludes a traced file, by its real path or by
+   * `linked`, its path through the package's `node_modules/<name>` link.
+   */
+  isTracedFileExcluded: (file: string, linked: string | null) => boolean;
 };
 
 function selectFiles(options: NitroTraceIncludesOptions): TraceSelection {
@@ -309,7 +312,7 @@ function selectFiles(options: NitroTraceIncludesOptions): TraceSelection {
   if (inexact.size > 0) {
     options.warn(
       `[vinext] outputFileTracingIncludes/outputFileTracingExcludes pattern(s) ${[...inexact].join(", ")} ` +
-        "use glob syntax vinext does not match exactly (POSIX classes, extglobs spanning `/`): " +
+        "use glob syntax vinext does not match exactly like Next.js: " +
         "such include keys apply to every route, and such excludes are ignored.",
     );
   }
@@ -343,26 +346,24 @@ function selectFiles(options: NitroTraceIncludesOptions): TraceSelection {
 
   return {
     included,
-    isTracedFileExcluded: (file) => {
-      if (routeExcludes.length === 0) return false;
-      const linked = pnpmLinkedPath(file, root);
-      return routeExcludes.every(
+    isTracedFileExcluded: (file, linked) =>
+      routeExcludes.length > 0 &&
+      routeExcludes.every(
         (isExcluded) => isExcluded(file) || (linked !== null && isExcluded(linked)),
-      );
-    },
+      ),
   };
 }
 
 /**
- * Nitro lists a pnpm package's files by their real path in the `.pnpm` store,
- * but the package ships as `node_modules/<name>`, the path apps write excludes
- * against. Map a store path to that path so those excludes apply too.
+ * Where a traced package is linked as `node_modules/<name>`, the path apps
+ * write excludes against, when Nitro lists it by another real path (pnpm's
+ * virtual store, wherever `virtualStoreDir` puts it). `null` otherwise.
  */
-function pnpmLinkedPath(file: string, root: string): string | null {
-  const match = /\/node_modules\/\.pnpm\/[^/]+\/node_modules\/((?:@[^/]+\/)?[^/]+)\/(.+)$/.exec(
-    file,
-  );
-  return match ? path.join(path.resolve(root), "node_modules", match[1], match[2]) : null;
+function linkedPackagePath(root: string, name: string, pkgPath: string): string | null {
+  const linked = path.join(path.resolve(root), "node_modules", name);
+  if (path.resolve(pkgPath) === linked) return null;
+  const real = realPath(linked);
+  return real !== null && real === realPath(pkgPath) ? linked : null;
 }
 
 function splitPackageName(segments: readonly string[]): string[] {
@@ -422,11 +423,16 @@ function groupByPackage(files: ReadonlyMap<string, string>): {
  */
 function removeExcludedTracedFiles(
   tracedPackages: TracedPackages,
-  isExcluded: (file: string) => boolean,
+  root: string,
+  isExcluded: TraceSelection["isTracedFileExcluded"],
 ): void {
   for (const [name, pkg] of Object.entries(tracedPackages)) {
     for (const [version, entry] of Object.entries(pkg.versions)) {
-      entry.files = entry.files.filter((file) => !isExcluded(toSlash(file)));
+      const linkedBase = linkedPackagePath(root, name, entry.path);
+      entry.files = entry.files.filter((file) => {
+        const linked = linkedBase && path.join(linkedBase, path.relative(entry.path, file));
+        return !isExcluded(toSlash(file), linked && toSlash(linked));
+      });
       if (entry.files.length === 0) delete pkg.versions[version];
     }
     if (Object.keys(pkg.versions).length === 0) delete tracedPackages[name];
@@ -469,7 +475,7 @@ export function createNitroTraceIncludes(
     applied = true;
     pendingCopies = new Map();
     const { included, isTracedFileExcluded } = selectFiles(options);
-    removeExcludedTracedFiles(tracedPackages, isTracedFileExcluded);
+    removeExcludedTracedFiles(tracedPackages, options.root, isTracedFileExcluded);
 
     const { packages, outsideNodeModules } = groupByPackage(included);
     if (outsideNodeModules > 0) {

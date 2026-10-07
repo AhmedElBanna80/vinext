@@ -22,8 +22,10 @@ import { compileGlob, type GlobSegment } from "./glob-match.js";
  *   its parser.
  *
  * Supported picomatch syntax: `*`, `**`, `?`, `[...]` classes, `{a,b}` lists
- * and `{a..b}` ranges, the `@()`, `?()`, `+()`, `*()` and `!()` extglobs
- * within one path segment, and backslash escapes.
+ * and `{a..b}` ranges, `(...)` groups and the `@()`, `?()`, `+()`, `*()` and
+ * `!()` extglobs within one path segment (optionally followed by a `?` or `+`
+ * quantifier), and backslash escapes. {@link isTranslatedExactly} detects
+ * the shapes this does not cover.
  */
 
 const REGEX_SPECIAL_CHARS = /[\\^$.*+?()[\]{}|]/g;
@@ -207,9 +209,10 @@ function parseSegment(
       }
     }
     if (char === "*") {
-      // A segment-leading wildcard matches at least one character. Repeated
-      // stars collapse, except one that starts a `*()` extglob.
-      source += index === 0 ? "(?=.)[^/]*" : "[^/]*";
+      // A segment-leading wildcard matches at least one character, unless it
+      // is a run of stars. Repeated stars collapse, except one that starts a
+      // `*()` extglob.
+      source += index === 0 && segment[1] !== "*" ? "(?=.)[^/]*" : "[^/]*";
       while (segment[index + 1] === "*" && segment[index + 2] !== "(") index++;
       index++;
       continue;
@@ -288,21 +291,31 @@ function toRegExp(source: string, literal: string): RegExp {
 
 /**
  * Whether {@link createContainsMatcher} and {@link createPathMatcher} match a
- * pattern exactly like picomatch. Path segments are translated one at a time,
- * so POSIX classes (`[[:alpha:]]`), and extglobs, groups or classes containing
- * a `/` (`@(a/b)`, `a[/]b`), are not. Neither are the shapes where picomatch
- * passes regex syntax through: a `+` after a class or brace (`[ab]+`) or
- * inside a group (`@(a+)`), a `?` starting a group (`(?a)`), a `?` or `+`
- * after an unmatched `)`, and an unterminated `(`.
+ * pattern exactly like picomatch. Path segments are translated one at a time
+ * and braces are expanded first, so these are not:
+ *
+ * - POSIX classes (`[[:alpha:]]`), and extglobs, groups or classes containing
+ *   a `/` (`@(a/b)`, `a[/]b`), or an escaped `/` (`a\/b`).
+ * - Braces inside an extglob or group (`!({a,b})`).
+ * - A run of stars that picomatch reads as a globstar inside a segment: one
+ *   before `@(` or `{` (`**@(a|b)`), or after `)` or `}` (`@(a)**`).
+ * - The shapes where picomatch passes regex syntax through: a `+` after a
+ *   class or brace (`[ab]+`) or inside a group (`@(a+)`), a `?` starting a
+ *   group (`(?a)`), a `?` or `+` after an unmatched `)`, and an unterminated
+ *   `(`.
  */
 export function isTranslatedExactly(pattern: string): boolean {
   if (/\[:[a-z]+:\]/.test(pattern)) return false;
+  if (/\*\*+(?:@\(|\{)|[)}]\*\*/.test(pattern)) return false;
   let depth = 0;
   for (let index = 0; index < pattern.length; index++) {
     const char = pattern[index];
     const next = pattern[index + 1];
     if (char === "\\") {
+      if (next === "/") return false;
       index++;
+    } else if (char === "{" && depth > 0) {
+      return false;
     } else if (char === "[") {
       const close = pattern.indexOf("]", index + 2);
       if (close !== -1) {
