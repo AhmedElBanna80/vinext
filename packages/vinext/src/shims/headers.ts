@@ -267,10 +267,6 @@ export async function runWithConnectionProbe<T>(
       probe.interrupted = true;
       interruptProbe();
     },
-    // `connection()` suspends forever inside speculative probes, matching
-    // Next.js's prerender/probe contract: code after `await connection()`
-    // must not run while classifying a route.
-    pending: new Promise<never>(() => {}),
   };
 
   const runInChildState = async (childState: VinextHeadersShimState) => {
@@ -281,11 +277,18 @@ export async function runWithConnectionProbe<T>(
       return await Promise.race([completed, interrupted]);
     } finally {
       probe.active = false;
-      // Async resources created inside this ALS scope retain `childState` after
-      // the probe returns. Restore the inherited probe when nested; otherwise
-      // retain this inactive probe so late dynamic usage can still propagate
-      // to its parent without suspending. Reading the parent at cleanup time
-      // preserves the right lifecycle if an outer probe completed separately.
+      // Async resources created inside this ALS scope retain `childState`, and
+      // through it this probe, after the probe returns. A completed probe would
+      // otherwise leave `interrupted` pending forever, holding Promise.race's
+      // reaction, which captured the caller's async context. workerd holds
+      // async context values through strong handles, so that cycle is never
+      // collected and retained every request's context. The race is already
+      // decided here, so settling `interrupted` only drops the reaction.
+      interruptProbe();
+      // Restore the inherited probe when nested; otherwise retain this inactive
+      // probe so late dynamic usage can still propagate to its parent without
+      // suspending. Reading the parent at cleanup time preserves the right
+      // lifecycle if an outer probe completed separately.
       childState.connectionProbe = parentState.connectionProbe ?? probe;
 
       // Dynamic usage discovered by a speculative probe still classifies the
@@ -335,7 +338,12 @@ export function suspendConnectionProbe(): Promise<never> | null {
   if (!probe?.active) return null;
 
   probe.interrupt();
-  return probe.pending;
+  // `connection()` suspends forever inside speculative probes, matching
+  // Next.js's prerender/probe contract: code after `await connection()` must
+  // not run while classifying a route. Each call gets its own promise that
+  // the probe does not keep, so the suspended code (and the async context its
+  // continuation captured) is collected with the request.
+  return new Promise<never>(() => {});
 }
 
 export function peekRenderRequestApiUsage(): RenderRequestApiKind[] {
