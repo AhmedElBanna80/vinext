@@ -1732,6 +1732,61 @@ describe("App Router Production server (startProdServer)", () => {
     expect(await res.text()).toBe("Method Not Allowed");
   });
 
+  // Ported from Next.js: test/integration/image-optimizer/test/util.ts
+  // https://github.com/vercel/next.js/blob/v16.2.6/test/integration/image-optimizer/test/util.ts
+  // vinext keeps no image cache, so it matches Next.js with the image cache
+  // disabled (`images.maximumDiskCacheSize: 0`): every 200 is a MISS.
+  it("labels every /_next/image response x-nextjs-cache and x-vinext-cache: MISS", async () => {
+    const imageUrl = `${baseUrl}/_next/image?url=%2Fheart.png&w=64&q=75`;
+
+    const first = await fetch(imageUrl, { headers: { Accept: "image/webp" } });
+    expect(first.status).toBe(200);
+    expect(first.headers.get("content-type")).toContain("image/png");
+    expect(first.headers.get("x-nextjs-cache")).toBe("MISS");
+    expect(first.headers.get("x-vinext-cache")).toBe("MISS");
+    await first.arrayBuffer();
+
+    const repeat = await fetch(imageUrl, { headers: { Accept: "image/webp" } });
+    expect(repeat.status).toBe(200);
+    expect(repeat.headers.get("x-nextjs-cache")).toBe("MISS");
+    expect(repeat.headers.get("x-vinext-cache")).toBe("MISS");
+    await repeat.arrayBuffer();
+
+    const head = await fetch(imageUrl, { method: "HEAD" });
+    expect(head.status).toBe(200);
+    expect(head.headers.get("x-nextjs-cache")).toBe("MISS");
+    expect(head.headers.get("x-vinext-cache")).toBe("MISS");
+  });
+
+  it("sends no x-nextjs-cache or x-vinext-cache on a 304 or an error from /_next/image", async () => {
+    const imageUrl = `${baseUrl}/_next/image?url=%2Fheart.png&w=64&q=75`;
+    const first = await fetch(imageUrl);
+    const etag = first.headers.get("etag");
+    expect(etag).toBeTruthy();
+    await first.arrayBuffer();
+
+    // fetch() adds `Cache-Control: no-cache` to conditional requests, which
+    // forces a full response, so revalidate over raw HTTP like a browser does.
+    const notModified = await rawHttpRequest(new URL(imageUrl), {
+      headers: { "If-None-Match": etag! },
+    });
+    expect(notModified.status).toBe(304);
+    expect(notModified.headers["x-nextjs-cache"]).toBeUndefined();
+    expect(notModified.headers["x-vinext-cache"]).toBeUndefined();
+
+    for (const [query, status] of [
+      ["url=%2Fheart.png&w=65&q=75", 400],
+      ["url=%2Flogo%2Flogo.svg&w=64&q=75", 400],
+      ["url=%2Fmissing.png&w=64&q=75", 404],
+    ] as const) {
+      const res = await fetch(`${baseUrl}/_next/image?${query}`);
+      expect(res.status, query).toBe(status);
+      expect(res.headers.get("x-nextjs-cache"), query).toBeNull();
+      expect(res.headers.get("x-vinext-cache"), query).toBeNull();
+      await res.arrayBuffer();
+    }
+  });
+
   it("serves public files under basePath and 404s without it", async () => {
     // Ported from Next.js: test/e2e/basepath/basepath.test.ts
     // https://github.com/vercel/next.js/blob/canary/test/e2e/basepath/basepath.test.ts
