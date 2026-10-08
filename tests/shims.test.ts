@@ -5457,6 +5457,56 @@ describe("next/server shim", () => {
     });
   });
 
+  it("completed connection probes do not keep their caller's async context alive", async () => {
+    // Async resources created inside a probe keep the probe's scope state, and
+    // through it the probe, alive after it returns. On workerd every async
+    // context store value is held by a strong handle, so whatever the probe
+    // still references from there is never collected. A completed probe left
+    // its `interrupted` promise pending forever with Promise.race's reaction
+    // on it, and that reaction captured the caller's async context (with the
+    // request, its headers and streams): every request leaked ~20 KB until the
+    // isolate ran out of heap. Holding the scope state here plays the part of
+    // workerd's handle; the caller's context must still be collectable.
+    const { AsyncLocalStorage } = await import("node:async_hooks");
+    const v8 = await import("node:v8");
+    const vm = await import("node:vm");
+    const { runWithConnectionProbe, suspendConnectionProbe } =
+      await import("../packages/vinext/src/shims/headers.js");
+    const { createRequestContext, getRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+
+    v8.setFlagsFromString("--expose-gc");
+    const gc = vm.runInNewContext("gc") as () => void;
+    const callerContext = new AsyncLocalStorage<{ request: object }>();
+
+    const probe = async (interrupt: boolean) => {
+      let scope: object | null = null;
+      let request: WeakRef<object> | null = null;
+      await callerContext.run({ request: {} }, () => {
+        request = new WeakRef(callerContext.getStore()!.request);
+        return runWithRequestContext(createRequestContext(), () =>
+          runWithConnectionProbe(async () => {
+            scope = getRequestContext();
+            // connection() inside a probe suspends until the probe is dropped.
+            if (interrupt) await suspendConnectionProbe();
+            return "completed";
+          }),
+        );
+      });
+      return { scope: scope!, request: request! };
+    };
+
+    for (const interrupt of [false, true]) {
+      const { scope, request } = await probe(interrupt);
+      for (let round = 0; round < 3 && request.deref(); round += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+        gc();
+      }
+      expect(scope).toBeTruthy();
+      expect(request.deref(), interrupt ? "interrupted probe" : "completed probe").toBeUndefined();
+    }
+  });
+
   it("connection probes propagate invalid dynamic usage from late work", async () => {
     const { cacheContextStorage } = await import("../packages/vinext/src/shims/cache-runtime.js");
     const { consumeInvalidDynamicUsageError, runWithConnectionProbe } =
@@ -14536,6 +14586,36 @@ describe("proxyExternalRequest", () => {
       ]);
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("aborts the upstream fetch silently when the client disconnects", async () => {
+    const { proxyExternalRequest } =
+      await import("../packages/vinext/src/config/config-matchers.js");
+
+    const client = new AbortController();
+    const request = new Request("http://localhost:3000/test", { signal: client.signal });
+
+    const originalFetch = globalThis.fetch;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let upstreamSignal: AbortSignal | undefined;
+    globalThis.fetch = (_url: any, init: any) => {
+      upstreamSignal = init.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      });
+    };
+
+    try {
+      const pending = proxyExternalRequest(request, "https://api.example.com/test");
+      client.abort();
+      const response = await pending;
+      expect(upstreamSignal?.aborted).toBe(true);
+      expect(response.status).toBe(499);
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = originalFetch;
+      errorSpy.mockRestore();
     }
   });
 
@@ -27508,6 +27588,64 @@ describe("handleImageOptimization", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("transformed");
     expect(capturedOptions).toEqual({ width: 640, format: "image/webp", quality: 90 });
+  });
+
+  // Ported from Next.js: test/integration/image-optimizer/test/util.ts
+  // https://github.com/vercel/next.js/blob/v16.2.6/test/integration/image-optimizer/test/util.ts
+  // vinext keeps no image cache, so it matches Next.js with the image cache
+  // disabled (`images.maximumDiskCacheSize: 0`): every 200 is a MISS, and
+  // errors carry no x-nextjs-cache or x-vinext-cache.
+  it("labels every successful image response x-nextjs-cache and x-vinext-cache: MISS", async () => {
+    const { handleImageOptimization } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    const source = (contentType: string) => async () =>
+      new Response("source", { status: 200, headers: { "Content-Type": contentType } });
+    const imageRequest = (url = "%2Fimg.jpg") =>
+      new Request(`http://localhost/_next/image?url=${url}&w=640&q=75`);
+
+    const passthrough = { fetchAsset: source("image/jpeg") };
+    for (const attempt of ["first", "repeat"]) {
+      const response = await handleImageOptimization(imageRequest(), passthrough);
+      expect(response.status, attempt).toBe(200);
+      expect(response.headers.get("x-nextjs-cache"), attempt).toBe("MISS");
+      expect(response.headers.get("x-vinext-cache"), attempt).toBe("MISS");
+    }
+
+    const transformed = await handleImageOptimization(imageRequest(), {
+      fetchAsset: source("image/jpeg"),
+      transformImage: async (_body, { format }) =>
+        new Response("transformed", {
+          headers: { "Content-Type": format, "x-nextjs-cache": "HIT", "x-vinext-cache": "HIT" },
+        }),
+    });
+    expect(transformed.status).toBe(200);
+    expect(transformed.headers.get("x-nextjs-cache")).toBe("MISS");
+    expect(transformed.headers.get("x-vinext-cache")).toBe("MISS");
+
+    const svg = await handleImageOptimization(
+      imageRequest("%2Fimg.svg"),
+      { fetchAsset: source("image/svg+xml") },
+      undefined,
+      { dangerouslyAllowSVG: true },
+    );
+    expect(svg.status).toBe(200);
+    expect(svg.headers.get("x-nextjs-cache")).toBe("MISS");
+    expect(svg.headers.get("x-vinext-cache")).toBe("MISS");
+
+    const errors = [
+      await handleImageOptimization(new Request("http://localhost/_next/image"), passthrough),
+      await handleImageOptimization(imageRequest(), {
+        fetchAsset: async () => new Response("", { status: 404 }),
+      }),
+      await handleImageOptimization(imageRequest("%2Fimg.svg"), {
+        fetchAsset: source("image/svg+xml"),
+      }),
+    ];
+    expect(errors.map((response) => response.status)).toEqual([400, 404, 400]);
+    for (const response of errors) {
+      expect(response.headers.get("x-nextjs-cache")).toBeNull();
+      expect(response.headers.get("x-vinext-cache")).toBeNull();
+    }
   });
 
   it("falls back to original on transform error", async () => {
