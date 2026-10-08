@@ -91,35 +91,54 @@ function describeValue(value: unknown): string {
   return typeof value === "undefined" ? "undefined" : `a ${typeof value}`;
 }
 
+const ignore = () => {};
+
 /**
- * Whether `value` is a Promise, judged by its internal slot, prototype chain
- * or `Promise` tag rather than by a `then` member: adapter contracts are
+ * Attach a no-op rejection handler with the intrinsic `Promise.prototype.then`,
+ * which throws on a non-Promise before reading anything from it. Returns the
+ * derived promise, which a Promise subclass's species constructor chooses.
+ */
+function handleRejection(promise: unknown): unknown {
+  return Promise.prototype.then.call(promise, undefined, ignore);
+}
+
+/**
+ * Whether `value` is a Promise, judged by its internal slot or this realm's
+ * Promise prototype chain, never by a `then` member: adapter contracts are
  * structural and do not reserve `then`, so an adapter's own `then` method is
  * never read or invoked.
  *
- * `Promise.prototype.then` throws on a non-Promise before touching it, and on
- * a Promise (from any realm) attaches a no-op rejection handler, so the
- * discarded result cannot become an unhandled rejection. It can also throw
- * after the brand check, when a Promise subclass's `constructor` or
- * `Symbol.species` lookup throws while deriving the returned promise. That
- * Promise is still recognised and rejected, by its prototype chain (this
- * realm) or by the `Symbol.toStringTag` every realm's `Promise.prototype`
- * carries. No handler can be attached to it: every way of observing a
- * Promise goes through that same species lookup or its `then`.
+ * A Promise from any realm passes the intrinsic `then`'s brand check, which
+ * also attaches a no-op rejection handler, so the discarded result cannot
+ * become an unhandled rejection. The derived promise that call returns is
+ * handled too, since a subclass's species constructor may return a rejected
+ * one.
+ *
+ * Known limitation: when a Promise subclass's `constructor` or
+ * `Symbol.species` lookup throws, that call fails after the brand check, and
+ * no handler can be attached (every way of observing a Promise goes through
+ * that lookup or its `then`). Such a Promise is still rejected when it comes
+ * from this realm, the one adapter modules are evaluated in; one from another
+ * realm is judged by its members like any other value.
  */
 function markHandledIfPromise(value: unknown): boolean {
+  let derived: unknown;
   try {
-    void Promise.prototype.then.call(value, undefined, () => {});
-    return true;
+    derived = handleRejection(value);
   } catch {
     try {
-      return (
-        value instanceof Promise || Object.prototype.toString.call(value) === "[object Promise]"
-      );
+      return value instanceof Promise;
     } catch {
       return false;
     }
   }
+  try {
+    handleRejection(derived);
+  } catch {
+    // The species constructor returned a non-Promise, or one whose own species
+    // lookup throws; nothing more can be handled.
+  }
+  return true;
 }
 
 export function instantiateCacheAdapter<T>(

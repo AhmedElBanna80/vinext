@@ -42,6 +42,20 @@ function Es5Base(this: { received: unknown }, input: unknown) {
 }
 Object.assign(Es5Base.prototype, dataMethods());
 
+const ignore = () => {};
+
+async function expectNoUnhandledRejection(run: () => void) {
+  const unhandled = vi.fn();
+  process.on("unhandledRejection", unhandled);
+  try {
+    run();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(unhandled).not.toHaveBeenCalled();
+  } finally {
+    process.off("unhandledRejection", unhandled);
+  }
+}
+
 describe("isConstructor", () => {
   it("classifies functions by [[Construct]] without invoking them or reading their properties", () => {
     let calls = 0;
@@ -294,9 +308,7 @@ describe("instantiateCacheAdapter", () => {
   });
 
   it("does not leave a rejected Promise result unhandled", async () => {
-    const unhandled = vi.fn();
-    process.on("unhandledRejection", unhandled);
-    try {
+    await expectNoUnhandledRejection(() => {
       expect(() =>
         instantiateCacheAdapter(
           () => Promise.reject(new Error("async setup failed")),
@@ -304,11 +316,7 @@ describe("instantiateCacheAdapter", () => {
           "data",
         ),
       ).toThrow(/returned a Promise/);
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(unhandled).not.toHaveBeenCalled();
-    } finally {
-      process.off("unhandledRejection", unhandled);
-    }
+    });
   });
 
   it("rejects a Promise subclass whose species lookup throws", () => {
@@ -335,27 +343,47 @@ describe("instantiateCacheAdapter", () => {
     }
   });
 
-  it("rejects another realm's Promise subclass whose species lookup throws", () => {
-    const foreign = vm.runInNewContext(`
-      const state = { armed: true };
-      class HostilePromise extends Promise {
-        static get [Symbol.species]() {
-          if (state.armed) throw new Error("species lookup");
-          return Promise;
-        }
-      }
-      ({ state, promise: HostilePromise.reject(new Error("async setup failed")) });
-    `) as { state: { armed: boolean }; promise: Promise<unknown> };
-    const result = Object.assign(foreign.promise, dataMethods());
+  it("rejects and handles another realm's Promise", async () => {
+    const foreign = vm.runInNewContext(
+      `Promise.reject(new Error("async setup failed"))`,
+    ) as Promise<unknown>;
+    const result = Object.assign(foreign, dataMethods());
     expect(result instanceof Promise).toBe(false);
-    try {
+    await expectNoUnhandledRejection(() => {
       expect(() => instantiateCacheAdapter(() => result, args, "data")).toThrow(
         /returned a Promise/,
       );
-    } finally {
-      foreign.state.armed = false;
-      result.catch(() => {});
+    });
+  });
+
+  it("handles the derived promise a subclass's species constructor returns", async () => {
+    function RejectingSpecies(executor: (resolve: () => void, reject: () => void) => void) {
+      executor(ignore, ignore);
+      return Promise.reject(new Error("derived"));
     }
+    class DerivedRejects<T> extends Promise<T> {
+      static get [Symbol.species]() {
+        return RejectingSpecies as unknown as PromiseConstructor;
+      }
+    }
+    const result = Object.assign(new DerivedRejects(ignore), dataMethods());
+    await expectNoUnhandledRejection(() => {
+      expect(() => instantiateCacheAdapter(() => result, args, "data")).toThrow(
+        /returned a Promise/,
+      );
+    });
+  });
+
+  it("judges a Promise by its brand, not its Symbol.toStringTag", () => {
+    const tagged = { ...dataMethods(), [Symbol.toStringTag]: "Promise" };
+    expect(instantiateCacheAdapter(() => tagged, args, "data")).toBe(tagged);
+
+    const masked = Object.defineProperty(
+      Object.assign(Promise.resolve(), dataMethods()),
+      Symbol.toStringTag,
+      { value: "CacheHandler" },
+    );
+    expect(() => instantiateCacheAdapter(() => masked, args, "data")).toThrow(/returned a Promise/);
   });
 
   it("accepts a synchronous adapter that has its own then method", () => {
