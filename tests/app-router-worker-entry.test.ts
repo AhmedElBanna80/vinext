@@ -689,6 +689,61 @@ export default {
     }
   });
 
+  it("honors next.config compress for Worker-style entries", async () => {
+    // Next.js skips its compression middleware for `compress: false`
+    // (server/lib/router-server.ts). The build records the setting in
+    // vinext-server.json, which the Node server reads for any entry shape.
+    const outDirs: string[] = [];
+    function writeWorkerEntry(manifest: Record<string, unknown>): string {
+      const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-prod-worker-compress-"));
+      outDirs.push(outDir);
+      const serverDir = path.join(outDir, "server");
+      fs.mkdirSync(serverDir, { recursive: true });
+      fs.mkdirSync(path.join(outDir, "client"), { recursive: true });
+      fs.writeFileSync(path.join(outDir, "package.json"), JSON.stringify({ type: "module" }));
+      fs.writeFileSync(path.join(serverDir, "vinext-server.json"), JSON.stringify(manifest));
+      fs.writeFileSync(
+        path.join(serverDir, "index.js"),
+        `export default {
+  async fetch() {
+    return new Response("0:" + "x".repeat(2000) + "\\n", {
+      headers: { "content-type": "text/x-component" },
+    });
+  },
+};
+`,
+      );
+      return outDir;
+    }
+
+    const servers: import("node:http").Server[] = [];
+    try {
+      const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+      for (const [manifest, expectedEncoding, expectedVary] of [
+        [{ prerenderSecret: "secret", compress: false }, null, null],
+        [{ prerenderSecret: "secret", compress: true }, "gzip", "Accept-Encoding"],
+        // Builds that predate the field keep the default.
+        [{ prerenderSecret: "secret" }, "gzip", "Accept-Encoding"],
+      ] as const) {
+        const { server, port } = await startProdServer({
+          port: 0,
+          outDir: writeWorkerEntry(manifest),
+        });
+        servers.push(server);
+        const res = await fetch(`http://localhost:${port}/page.rsc`, {
+          headers: { "Accept-Encoding": "gzip" },
+        });
+        expect(res.status).toBe(200);
+        expect(res.headers.get("content-encoding")).toBe(expectedEncoding);
+        expect(res.headers.get("vary")).toBe(expectedVary);
+        expect(await res.text()).toBe("0:" + "x".repeat(2000) + "\n");
+      }
+    } finally {
+      for (const server of servers) server.close();
+      for (const outDir of outDirs) fs.rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
   it("reports a clear error for unsupported app router entry shapes", async () => {
     const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-prod-worker-invalid-"));
     const serverDir = path.join(outDir, "server");

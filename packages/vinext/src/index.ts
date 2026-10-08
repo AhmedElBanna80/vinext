@@ -7935,6 +7935,9 @@ export const loadServerActionClient = ${
           }
           const manifest = {
             prerenderSecret,
+            // next.config `compress`, read by the Node production server for
+            // every entry shape (including Worker-style facades).
+            compress: nextConfig?.compress !== false,
             ...(serverRuntimeOutputDirs.size === 0
               ? {}
               : {
