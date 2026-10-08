@@ -27,6 +27,7 @@ import fsp from "node:fs/promises";
 import path from "pathslash";
 import zlib from "node:zlib";
 import { StaticFileCache, contentTypeForPath, etagFromFilenameHash } from "./static-file-cache.js";
+import { signalFromNodeResponse } from "./node-response-signal.js";
 import {
   isImageOptimizationPath,
   IMAGE_CONTENT_SECURITY_POLICY,
@@ -505,6 +506,38 @@ function cancelResponseBody(response: Response): void {
   void body.cancel().catch(() => {
     /* ignore cancellation failures on discarded bodies */
   });
+}
+
+/**
+ * Buffer a response body, cancelling it if the client disconnects first so a
+ * stalled stream does not outlive the connection. Resolves null when aborted.
+ */
+async function bufferResponseBodyUntilAborted(
+  response: Response,
+  signal: AbortSignal,
+): Promise<Buffer | null> {
+  const body = response.body;
+  if (!body) return Buffer.alloc(0);
+  const reader = body.getReader();
+  const cancel = () => {
+    reader.cancel(signal.reason).catch(() => {
+      /* ignore cancellation failures on discarded bodies */
+    });
+  };
+  if (signal.aborted) cancel();
+  else signal.addEventListener("abort", cancel, { once: true });
+  const chunks: Uint8Array[] = [];
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      chunks.push(result.value);
+    }
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    reader.releaseLock();
+  }
+  return signal.aborted ? null : Buffer.concat(chunks);
 }
 
 type ResponseWithVinextStreamingMetadata = Response & {
@@ -1128,6 +1161,7 @@ function nodeToWebRequest(
   prerenderSecret?: string,
   i18nConfig?: NextI18nConfig | null,
   authorizeOnDemandRevalidate?: (headerValue: string | null) => boolean,
+  signal?: AbortSignal,
 ): Request {
   const proto = resolveRequestProtocol(req);
   const rawHeaders = nodeHeadersToWebHeaders(req.headers);
@@ -1167,9 +1201,12 @@ function nodeToWebRequest(
   const init: RequestInit & { duplex?: string } = {
     method,
     headers,
+    signal,
   };
 
-  if (hasBody) {
+  // Match Next.js: a request that is already aborted carries no body, since
+  // its stream may never settle.
+  if (hasBody && !signal?.aborted) {
     init.body = readNodeStream(req);
     init.duplex = "half"; // Required for streaming request bodies
   }
@@ -1866,6 +1903,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
         prerenderSecret,
         appRouterI18nConfig,
         appRouterAuthorizeOnDemandRevalidate,
+        signalFromNodeResponse(res),
       );
       const ctx = createNodeExecutionContext(resolveTrustedNodeRevalidateOrigin(req, host, port));
       const recorded: { marker?: PrerenderSpecialErrorMarker } = {};
@@ -1875,6 +1913,10 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
         };
       }
       const response = await rscHandler(request, ctx);
+      if (request.signal.aborted) {
+        cancelResponseBody(response);
+        return;
+      }
 
       const staticFileSignal = readStaticFileSignal(response);
       if (staticFileSignal) {
@@ -2321,10 +2363,13 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       const reqHeaders = filterInternalHeaders(rawReqHeaders);
       if (revalidationHostname) reqHeaders.set("host", revalidationHostname);
       const method = req.method ?? "GET";
-      const hasBody = method !== "GET" && method !== "HEAD";
+      const signal = signalFromNodeResponse(res);
+      // Match Next.js: an already-aborted request carries no body.
+      const hasBody = method !== "GET" && method !== "HEAD" && !signal.aborted;
       const webRequest = new Request(`${protocol}://${revalidationHostname ?? hostHeader}${url}`, {
         method,
         headers: reqHeaders,
+        signal,
         body: hasBody ? readNodeStream(req) : undefined,
         // @ts-expect-error — duplex needed for streaming request bodies
         duplex: hasBody ? "half" : undefined,
@@ -2484,6 +2529,10 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
 
       if (result.type === "response") {
         const { response } = result;
+        if (webRequest.signal.aborted) {
+          cancelResponseBody(response);
+          return;
+        }
         const streamedApi = isVinextStreamedApiResponse(response);
         const shouldStream = isVinextStreamedHtmlResponse(response) || streamedApi;
         // Passthrough responses (middleware short-circuits, external proxies, redirects)
@@ -2505,7 +2554,8 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
           return;
         }
 
-        const responseBody = Buffer.from(await response.arrayBuffer());
+        const responseBody = await bufferResponseBodyUntilAborted(response, webRequest.signal);
+        if (!responseBody) return;
         // render → text/html, api → application/octet-stream (set by the pipeline).
         const ct = response.headers.get("content-type") ?? result.defaultContentType;
         const responseHeaders: Record<string, string | string[]> = {};

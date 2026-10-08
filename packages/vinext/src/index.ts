@@ -49,6 +49,7 @@ import {
 } from "./routing/file-matcher.js";
 import { createSSRHandler } from "./server/dev-server.js";
 import { handleApiRoute } from "./server/api-handler.js";
+import { signalFromNodeResponse } from "./server/node-response-signal.js";
 import {
   DEFAULT_DEVICE_SIZES,
   DEFAULT_IMAGE_SIZES,
@@ -6719,6 +6720,7 @@ export const loadServerActionClient = ${
               const webRequest = new Request(new URL(routeUrl, requestOrigin), {
                 method,
                 headers: nodeRequestHeaders,
+                signal: signalFromNodeResponse(res),
               });
 
               const applyRequestHeadersToNodeRequest = (nextRequestHeaders: Headers) => {
@@ -6752,6 +6754,7 @@ export const loadServerActionClient = ${
                       const middlewareRequest = new Request(new URL(middlewareUrl, mwOrigin), {
                         method: req.method,
                         headers: nodeRequestHeaders,
+                        signal: webRequest.signal,
                       });
                       const result = await runMiddleware(
                         getPagesRunner(),
@@ -6880,6 +6883,7 @@ export const loadServerActionClient = ${
                     method: externalMethod,
                     // Use the pipeline's current request headers (post-middleware)
                     headers: currentRequest.headers,
+                    signal: currentRequest.signal,
                   };
                   if (hasBody) {
                     const { Readable } = await import("node:stream");
@@ -8558,6 +8562,13 @@ async function writeWebResponseToNodeRes(
   res: import("node:http").ServerResponse,
   response: Response,
 ): Promise<void> {
+  if (res.destroyed) {
+    // The client left while the response was produced; nobody will read it.
+    response.body?.cancel().catch(() => {
+      /* ignore cancellation failures on discarded bodies */
+    });
+    return;
+  }
   const nodeHeaders: Record<string, string | string[]> = {};
   response.headers.forEach((value, key) => {
     if (key === "set-cookie") return;
@@ -8578,13 +8589,23 @@ async function writeWebResponseToNodeRes(
   }
 
   if (response.body) {
-    const { Readable } = await import("node:stream");
+    const { Readable, pipeline } = await import("node:stream");
     const nodeStream = Readable.fromWeb(response.body as import("stream/web").ReadableStream);
+    // pipeline() destroys (and so cancels) the body when the client disconnects
+    // and reports that as ERR_STREAM_PREMATURE_CLOSE. A body that ends early
+    // reports the same code, so record whether the client closed first.
+    let clientDisconnected = false;
+    res.once("close", () => {
+      clientDisconnected = !res.writableFinished && !nodeStream.errored;
+    });
     await new Promise<void>((resolve, reject) => {
-      nodeStream.on("error", reject);
-      res.on("error", reject);
-      nodeStream.pipe(res);
-      nodeStream.on("end", resolve);
+      pipeline(nodeStream, res, (error) => {
+        if (error && !(clientDisconnected && error.code === "ERR_STREAM_PREMATURE_CLOSE")) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      });
     });
   } else {
     res.end();
