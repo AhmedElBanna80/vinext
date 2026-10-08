@@ -34,7 +34,8 @@ function decodePublicFileRoute(route: string): string {
 
 /**
  * The `public/` files, as the decoded pathnames Nitro's static handler looks
- * them up by, whose pathname the middleware matcher can match. `has`/`missing`
+ * them up by, whose pathname (or, for an `index.html`, its directory's) the
+ * middleware matcher can match. `has`/`missing`
  * conditions are ignored (they depend on the request), and a matcher that
  * cannot be read statically (`undefined`) covers every file, so the list never
  * misses a file middleware could run for. Middleware evaluates the full matcher
@@ -50,7 +51,13 @@ export function collectMiddlewareCoveredPublicFiles(options: {
   const matcher = options.matcher as MatcherConfig | undefined;
   const covered = new Set<string>();
   for (const route of scanPublicFileRoutes(options.root, options.publicDir)) {
-    if (!matchesMiddlewarePathname(route, matcher, options.i18n)) continue;
+    // Nitro's static handler also serves `dir/index.html` at `/dir`.
+    const pathnames = route.endsWith("/index.html")
+      ? [route, route.slice(0, -"/index.html".length) || "/"]
+      : [route];
+    if (!pathnames.some((pathname) => matchesMiddlewarePathname(pathname, matcher, options.i18n))) {
+      continue;
+    }
     covered.add(decodePublicFileRoute(route));
   }
   return [...covered].sort();

@@ -232,6 +232,13 @@ describe("collectMiddlewareCoveredPublicFiles", () => {
     ).toEqual(["/b copy.txt", "/docs/c.txt", "/docs/index.html"]);
   });
 
+  it("covers a directory index.html the static handler would serve at the matched directory", async () => {
+    const root = await publicRoot();
+    expect(
+      collectMiddlewareCoveredPublicFiles({ root, publicDir: "public", matcher: ["/docs"] }),
+    ).toEqual(["/docs/index.html"]);
+  });
+
   it("covers every file when the matcher cannot be read statically", async () => {
     const root = await publicRoot();
     expect(
