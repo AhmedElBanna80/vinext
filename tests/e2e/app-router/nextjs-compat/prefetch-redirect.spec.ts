@@ -5,7 +5,8 @@
  * A page's redirect() streams inside its Flight payload. A layout's redirect()
  * is answered early with the `X-Vinext-Rsc-Redirect` side channel, which a
  * replayed prefetch must keep. An auto prefetch of such a redirect must not
- * outlive `staleTimes.dynamic` when the layout read a dynamic API.
+ * outlive `staleTimes.dynamic` when the layout read a dynamic API, nor the
+ * `cacheLife` stale time of a cached value the layout read.
  *
  * Next.js parity: `next start` (16.2.7) follows each redirect as a client
  * navigation with the per-variant request counts below. Upstream has no Link +
@@ -42,9 +43,19 @@ const VARIANTS = [
   { name: "layout-redirect", refetchesOnClick: false },
   { name: "layout-guard-full", refetchesOnClick: false },
   { name: "layout-guard", refetchesOnClick: true },
+  // A layout that redirects after a `"use cache"` read with `stale: 45`
+  // carries that bound. Once the layout also reads cookies(), only
+  // `staleTimes.dynamic` bounds it. With `experimental.useCache`, Next.js
+  // sends `x-nextjs-stale-time: 45` on the prerendered redirect and refetches
+  // it on click once 45s have passed; the cookies() variant gets no header.
+  { name: "layout-cache-life", refetchesOnClick: false, serverStaleTime: "45" },
+  { name: "layout-guard-cache-life", refetchesOnClick: true, serverStaleTime: null },
 ] as const;
 
-for (const { name: variant, refetchesOnClick } of VARIANTS) {
+for (const variantCase of VARIANTS) {
+  const { name: variant, refetchesOnClick } = variantCase;
+  const serverStaleTime =
+    "serverStaleTime" in variantCase ? variantCase.serverStaleTime : undefined;
   test(`follows a prefetched ${variant} server redirect on the client`, async ({ page }) => {
     const redirectingPath = `${ROOT}/${variant}`;
     const consoleErrors: string[] = [];
@@ -61,7 +72,10 @@ for (const { name: variant, refetchesOnClick } of VARIANTS) {
     );
     await page.goto(ROOT);
     await waitForAppRouterHydration(page);
-    await prefetched;
+    const prefetchResponse = await prefetched;
+    if (serverStaleTime !== undefined) {
+      expect(await prefetchResponse.headerValue("x-nextjs-stale-time")).toBe(serverStaleTime);
+    }
     await page.waitForLoadState("networkidle");
 
     await page.evaluate((marker) => Reflect.set(window, marker, true), MARKER);
