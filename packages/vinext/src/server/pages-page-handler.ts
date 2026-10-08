@@ -1053,7 +1053,7 @@ export function createPagesPageHandler(
           } else if (pageDataResult.cacheState) {
             notFoundResponse = withPagesCacheState(notFoundResponse, pageDataResult.cacheState);
           }
-          if (options?.markNotFound && !isDataReq) {
+          if (options?.markNotFound) {
             notFoundResponse = withPagesNotFoundMarker(notFoundResponse);
           }
           return finalizePagesPreviewResponse(withBrowserPolicy(notFoundResponse), preview);

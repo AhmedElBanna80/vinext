@@ -193,8 +193,10 @@ describe("renderPagesFallback", () => {
 
     const pageRequest = new Request("http://localhost/page");
     const renderPage = vi.fn<NonNullable<PagesEntry["renderPage"]>>(
-      (_request, _url, _query, _parsedUrl, _middlewareHeaders, _options, headers) => {
+      (_request, _url, _query, _parsedUrl, _middlewareHeaders, options, headers) => {
         expect(headers).toEqual(initialResponseHeaders);
+        // The staged-headers call still asks for the notFound marker.
+        expect(options).toEqual({ markNotFound: true });
         return new Response("page");
       },
     );

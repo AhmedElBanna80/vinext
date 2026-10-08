@@ -895,7 +895,6 @@ function withPagesNotFoundCacheControl(
 ): Response {
   const cacheControl = pagesNotFoundResponse.headers.get("Cache-Control");
   const headers = new Headers(appNotFoundResponse.headers);
-  headers.delete(VINEXT_PAGES_NOT_FOUND_HEADER);
   if (cacheControl !== null) headers.set("Cache-Control", cacheControl);
   return preserveFullyBufferedBodyMetadata(
     appNotFoundResponse,
