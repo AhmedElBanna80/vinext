@@ -2,6 +2,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import { createHash } from "node:crypto";
 import { createBuilder } from "vite";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
@@ -10,7 +11,12 @@ import {
   getPagesClientAssets,
   setPagesClientAssets,
 } from "../packages/vinext/src/server/pages-client-assets.js";
-import { APP_FIXTURE_DIR, createIsolatedFixture, testCacheDir } from "./helpers.js";
+import {
+  APP_FIXTURE_DIR,
+  createIsolatedFixture,
+  expectRepeatedSlashRedirects,
+  testCacheDir,
+} from "./helpers.js";
 
 const ROOT_LAYOUT_NOT_FOUND_REDIRECT_FIXTURE_DIR = path.resolve(
   import.meta.dirname,
@@ -90,6 +96,56 @@ async function rawHttpRequest(
           body: Buffer.concat(chunks),
         });
       });
+    });
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+// Reads a gzip response through a streaming decoder, recording when each
+// marker first appears in the decoded text.
+async function readGzipStreamTimeline(
+  url: URL,
+  headers: Record<string, string>,
+  markers: string[],
+): Promise<{
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  text: string;
+  markerTimes: Map<string, number>;
+}> {
+  return new Promise((resolve, reject) => {
+    const request = http.request(url, { headers }, (response) => {
+      const markerTimes = new Map<string, number>();
+      let text = "";
+      const recordMarkers = () => {
+        const now = performance.now();
+        for (const marker of markers) {
+          if (!markerTimes.has(marker) && text.includes(marker)) markerTimes.set(marker, now);
+        }
+      };
+      const done = () =>
+        resolve({ status: response.statusCode ?? 0, headers: response.headers, text, markerTimes });
+      if (response.headers["content-encoding"] !== "gzip") {
+        response.setEncoding("utf8");
+        response.on("data", (chunk: string) => {
+          text += chunk;
+          recordMarkers();
+        });
+        response.on("end", done);
+        response.on("error", reject);
+        return;
+      }
+      const gunzip = zlib.createGunzip();
+      gunzip.setEncoding("utf8");
+      gunzip.on("data", (chunk: string) => {
+        text += chunk;
+        recordMarkers();
+      });
+      gunzip.on("end", done);
+      gunzip.on("error", reject);
+      response.on("error", reject);
+      response.pipe(gunzip);
     });
     request.on("error", reject);
     request.end();
@@ -342,6 +398,20 @@ describe("App Router Production server (startProdServer)", () => {
     delete process.env.TEST_APP_STATIC_REVALIDATE_TARGET;
     delete process.env.TEST_REVALIDATE_PATH_REWRITES_TARGET;
     fs.rmSync(outDir, { recursive: true, force: true });
+  });
+
+  // Next.js 308s any raw path containing a backslash or a repeated slash to
+  // the collapsed path (base-server.ts / resolve-routes.ts).
+  it("redirects repeated slashes and backslashes like Next.js", async () => {
+    await expectRepeatedSlashRedirects(baseUrl);
+  });
+
+  it("never turns a same-origin double-slash middleware redirect protocol-relative", async () => {
+    const res = await fetch(`${baseUrl}/middleware-redirect-double-slash`, { redirect: "manual" });
+    expect(res.status).toBe(307);
+    // The App Router's trailingSlash: false rule strips the redirect target
+    // to the root; it is never relativized to a protocol-relative `//`.
+    expect(res.headers.get("location")).toBe("/");
   });
 
   it("serves the home page with SSR HTML", async () => {
@@ -1385,6 +1455,85 @@ describe("App Router Production server (startProdServer)", () => {
     expect(res.status).toBe(404);
   });
 
+  // Next.js skips the compression middleware entirely for `compress: false`
+  // (server/lib/router-server.ts).
+  it("does not compress responses when next.config sets compress: false", async () => {
+    const fixtureRoot = await createIsolatedFixture(
+      ROOT_LAYOUT_NOT_FOUND_REDIRECT_FIXTURE_DIR,
+      "vinext-compress-false-",
+    );
+    fs.writeFileSync(
+      path.join(fixtureRoot, "next.config.mjs"),
+      "export default { compress: false };\n",
+    );
+    let compressServer: http.Server | undefined;
+    const previousPagesClientAssets = getPagesClientAssets();
+    const prodGlobalKeys = [
+      "__vite_rsc_client_require__",
+      "__vite_rsc_require__",
+      "__vite_rsc_server_require__",
+      "__webpack_chunk_load__",
+      "__webpack_require__",
+    ];
+    const previousGlobals = new Map(
+      prodGlobalKeys.map((key) => [
+        key,
+        { exists: Reflect.has(globalThis, key), value: Reflect.get(globalThis, key) },
+      ]),
+    );
+
+    try {
+      const builder = await createBuilder({
+        root: fixtureRoot,
+        configFile: false,
+        plugins: [vinext({ appDir: fixtureRoot })],
+        logLevel: "silent",
+      });
+      await builder.buildApp();
+      const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+      ({ server: compressServer } = await startProdServer({
+        port: 0,
+        outDir: path.join(fixtureRoot, "dist"),
+        noCompression: false,
+      }));
+      const address = compressServer.address();
+      if (!address || typeof address === "string") {
+        throw new Error("compress: false fixture did not bind to a TCP port");
+      }
+      const compressBaseUrl = `http://127.0.0.1:${address.port}`;
+
+      for (const [pathname, headers] of [
+        ["/", {}],
+        ["/.rsc", { Accept: "text/x-component", RSC: "1" }],
+      ] as const) {
+        const res = await rawHttpRequest(new URL(`${compressBaseUrl}${pathname}`), {
+          headers: { ...headers, "Accept-Encoding": "gzip, br" },
+        });
+        expect(res.status).toBe(200);
+        expect(res.headers["content-encoding"]).toBeUndefined();
+        expect(res.headers.vary ?? "").not.toContain("Accept-Encoding");
+        expect(res.body.byteLength).toBeGreaterThan(0);
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        if (!compressServer) {
+          resolve();
+          return;
+        }
+        compressServer.close((error) => (error ? reject(error) : resolve()));
+      });
+      setPagesClientAssets(previousPagesClientAssets);
+      for (const [key, previous] of previousGlobals) {
+        if (previous.exists) {
+          Reflect.set(globalThis, key, previous.value);
+        } else {
+          Reflect.deleteProperty(globalThis, key);
+        }
+      }
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
   // Faithfully combines two Next.js contracts:
   // - route misses render the root not-found page inside the root layout:
   //   https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/not-found/basic/index.test.ts
@@ -1472,14 +1621,10 @@ describe("App Router Production server (startProdServer)", () => {
       expect(rscBody).toContain("NEXT_REDIRECT");
       expect(rscBody).toContain("/result");
 
-      // The RSC drain applies to matched-route HTTP-access fallbacks too, not
-      // only route misses. `/gated` is a matched route that calls notFound();
-      // its route-level not-found boundary (app/gated/not-found.tsx) redirects
-      // on its own header, so it renders during the fallback (not the layout
-      // probe) and its async redirect is caught by the boundary drain. With the
-      // trigger → 200 flight redirect; without it → a normal 404 flight
-      // (proving the buffering does not drop or corrupt the matched-route
-      // payload).
+      // `/gated` is a matched route whose page calls notFound(). As in Next.js,
+      // an RSC request renders the page, so the notFound() digest and the
+      // route's not-found boundary travel in the Flight payload, including a
+      // redirect() in that boundary.
       const matchedRedirectRes = await fetch(`${redirectBaseUrl}/gated.rsc`, {
         redirect: "manual",
         headers: {
@@ -1488,16 +1633,18 @@ describe("App Router Production server (startProdServer)", () => {
         },
       });
       expect(matchedRedirectRes.status).toBe(200);
-      expect(matchedRedirectRes.headers.get("x-vinext-rsc-redirect")).toBe("/result");
-      expect(await matchedRedirectRes.text()).toContain("NEXT_REDIRECT");
+      const matchedRedirectBody = await matchedRedirectRes.text();
+      expect(matchedRedirectBody).toContain("NEXT_HTTP_ERROR_FALLBACK;404");
+      expect(matchedRedirectBody).toContain("NEXT_REDIRECT");
 
       const matchedNotFoundRes = await fetch(`${redirectBaseUrl}/gated.rsc`, {
         redirect: "manual",
         headers: { Accept: "text/x-component" },
       });
-      expect(matchedNotFoundRes.status).toBe(404);
-      expect(matchedNotFoundRes.headers.get("x-vinext-rsc-redirect")).toBeNull();
-      expect(await matchedNotFoundRes.text()).toContain("Gated Not Found");
+      expect(matchedNotFoundRes.status).toBe(200);
+      const matchedNotFoundBody = await matchedNotFoundRes.text();
+      expect(matchedNotFoundBody).toContain("NEXT_HTTP_ERROR_FALLBACK;404");
+      expect(matchedNotFoundBody).toContain("Gated Not Found");
     } finally {
       await new Promise<void>((resolve, reject) => {
         if (!redirectServer) {
@@ -1660,6 +1807,57 @@ describe("App Router Production server (startProdServer)", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-encoding")).toBe("br");
   });
+
+  // Next.js compresses every response through the `compression` middleware in
+  // server/lib/router-server.ts, including RSC payloads (text/x-component).
+  it("compresses RSC responses (text/x-component)", async () => {
+    const res = await rawHttpRequest(new URL(`${baseUrl}/metadata-streaming-timing.rsc`), {
+      headers: { Accept: "text/x-component", RSC: "1", "Accept-Encoding": "gzip" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/x-component");
+    expect(res.headers["content-encoding"]).toBe("gzip");
+    expect(res.headers["content-length"]).toBeUndefined();
+    expect(res.headers.vary).toContain("Accept-Encoding");
+    expect(zlib.gunzipSync(res.body).toString("utf8")).toContain("metadata-streaming-shell");
+  });
+
+  it("does not compress RSC responses for HEAD requests", async () => {
+    const res = await rawHttpRequest(new URL(`${baseUrl}/metadata-streaming-timing.rsc`), {
+      method: "HEAD",
+      headers: { Accept: "text/x-component", RSC: "1", "Accept-Encoding": "gzip" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers["content-encoding"]).toBeUndefined();
+    expect(res.headers.vary).toContain("Accept-Encoding");
+    expect(res.body.byteLength).toBe(0);
+  });
+
+  for (const { label, pathname, headers } of [
+    { label: "HTML", pathname: "/metadata-streaming-timing", headers: {} },
+    {
+      label: "RSC",
+      pathname: "/metadata-streaming-timing.rsc",
+      headers: { Accept: "text/x-component", RSC: "1" },
+    },
+  ]) {
+    it(`streams compressed ${label} incrementally`, async () => {
+      // The shell flushes before generateMetadata's 1.2s delay resolves; the
+      // compressor must flush it rather than buffer until the stream ends.
+      const result = await readGzipStreamTimeline(
+        new URL(`${baseUrl}${pathname}`),
+        { ...headers, "Accept-Encoding": "gzip", "user-agent": "HeadlessChrome" },
+        ["metadata-streaming-shell", "Delayed streaming metadata"],
+      );
+      expect(result.status).toBe(200);
+      expect(result.headers["content-encoding"]).toBe("gzip");
+      const shellTime = result.markerTimes.get("metadata-streaming-shell");
+      const metadataTime = result.markerTimes.get("Delayed streaming metadata");
+      expect(shellTime).toBeDefined();
+      expect(metadataTime).toBeDefined();
+      expect(metadataTime! - shellTime!).toBeGreaterThan(600);
+    });
+  }
 
   it("streams HTML (response is a ReadableStream)", async () => {
     const res = await fetch(`${baseUrl}/`);
