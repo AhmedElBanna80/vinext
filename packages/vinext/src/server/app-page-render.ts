@@ -30,6 +30,7 @@ import {
 import { probeAppPageBeforeRender } from "./app-page-probe.js";
 import { createAppPageRscRenderStatusResolver } from "./app-page-rsc-render-status.js";
 import {
+  applyClientStaleTimeHeader,
   applyEdgeRuntimeHeader,
   buildAppPageHtmlResponse,
   buildAppPageRscResponse,
@@ -104,7 +105,11 @@ import {
   preserveFullyBufferedBodyMetadata,
 } from "vinext/shims/unified-request-context";
 import { setCacheStateHeaders } from "./cache-headers.js";
-import { VINEXT_RSC_COMPLETION_METADATA_HEADER } from "./headers.js";
+import {
+  VINEXT_DYNAMIC_STALE_TIME_HEADER,
+  VINEXT_RSC_COMPLETION_METADATA_HEADER,
+  VINEXT_RSC_REDIRECT_HEADER,
+} from "./headers.js";
 import {
   applyPrerenderCacheLifeHeader,
   applyPrerenderCacheTagsHeader,
@@ -378,6 +383,7 @@ export function applyIneligibleRouteCachePolicy(
   response: Response,
   options: Pick<
     RenderAppPageLifecycleOptions,
+    | "dynamicStaleTimeSeconds"
     | "isDraftMode"
     | "isDynamicError"
     | "isForceDynamic"
@@ -391,23 +397,52 @@ export function applyIneligibleRouteCachePolicy(
     | "revalidateSeconds"
     | "scriptNonce"
   >,
+  probeCacheLife: AppPageRequestCacheLife | null = null,
 ): Response {
   const cacheControl = resolveEarlyResponseCacheControl(options);
-  if (!cacheControl) return response;
+  const isRscRedirect = options.isRscRequest && response.headers.has(VINEXT_RSC_REDIRECT_HEADER);
+  if (!cacheControl) {
+    // A probe has completed by the time it answers, so a static RSC redirect
+    // carries the probe's cacheLife stale bound like a prerender. As in
+    // Next.js, a known-dynamic redirect carries only `staleTimes.dynamic`.
+    const staleTimeSeconds = isRscRedirect
+      ? resolveClientStaleTimeSeconds(probeCacheLife)
+      : undefined;
+    if (staleTimeSeconds === undefined) return response;
+    const stamped = cloneForStamping(response);
+    applyClientStaleTimeHeader(stamped.headers, staleTimeSeconds);
+    return stamped;
+  }
+  // A streamed RSC redirect from a known-dynamic render carries the
+  // `staleTimes.dynamic` bound, so a prefetched redirect is not replayed past it.
+  const dynamicStaleTimeSeconds = isRscRedirect
+    ? (options.dynamicStaleTimeSeconds ?? resolveConfiguredDynamicStaleTimeSeconds())
+    : undefined;
   // Middleware's own cache policy wins, as in the normal response builders.
   // Only keep what this response already carries from it.
   const middlewarePolicy = [...(options.middlewareContext.headers ?? [])].filter(
     ([name, value]) => isCdnResponsePolicyHeader(name) && response.headers.get(name) === value,
   );
-  if (middlewarePolicy.some(([name]) => name === "cache-control")) return response;
-  // Some early responses have immutable headers, so stamp a copy.
+  const keepsMiddlewareCacheControl = middlewarePolicy.some(([name]) => name === "cache-control");
+  if (keepsMiddlewareCacheControl && dynamicStaleTimeSeconds === undefined) return response;
+  const stamped = cloneForStamping(response);
+  if (!keepsMiddlewareCacheControl) {
+    applyCdnResponseHeaders(stamped.headers, { cacheControl });
+    for (const [name, value] of middlewarePolicy) stamped.headers.set(name, value);
+  }
+  if (dynamicStaleTimeSeconds !== undefined) {
+    stamped.headers.set(VINEXT_DYNAMIC_STALE_TIME_HEADER, String(dynamicStaleTimeSeconds));
+  }
+  return stamped;
+}
+
+/** Some early responses have immutable headers, so stamp a copy. */
+function cloneForStamping(response: Response): Response {
   const stamped = preserveFullyBufferedBodyMetadata(
     response,
     new Response(response.body, response as ResponseInit),
   );
   copyLinkHeaderProvenance(response.headers, stamped.headers);
-  applyCdnResponseHeaders(stamped.headers, { cacheControl });
-  for (const [name, value] of middlewarePolicy) stamped.headers.set(name, value);
   return stamped;
 }
 
@@ -918,7 +953,11 @@ async function renderAppPageLifecycleImpl(
   if (preRenderResult.response) {
     // This response replaces the render, so the probe's usage classifies it.
     if (probeOutcome.dynamicDetected) markDynamicUsage();
-    return applyIneligibleRouteCachePolicy(preRenderResult.response, options);
+    return applyIneligibleRouteCachePolicy(
+      preRenderResult.response,
+      options,
+      probeOutcome.cacheLife,
+    );
   }
 
   const layoutFlags = preRenderResult.layoutFlags;
