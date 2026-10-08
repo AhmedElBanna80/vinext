@@ -599,7 +599,9 @@ async function handleRequestImpl(
       serveFilesystemRoute: async (requestPathname, _stagedHeaders, phase, resolvedUrl) => {
         if (!assets) {
           // A host whose static handler runs ahead of vinext (Nitro) serves
-          // direct public-file requests itself; only a rewritten one gets here.
+          // public files itself. One gets here through a rewrite, or directly
+          // when the middleware matcher covers it and middleware let the
+          // request continue; the file is then fetched back through the host.
           const publicFileFetcher = platformCtx?.publicFileFetcher;
           if (!publicFileFetcher || isImageOptimizationPath(requestPathname)) return false;
           return fetchWorkerFilesystemRoute(
@@ -610,6 +612,7 @@ async function handleRequestImpl(
             publicFiles,
             basePath,
             assetPathPrefix,
+            true,
           );
         }
         if (isImageOptimizationPath(requestPathname)) {

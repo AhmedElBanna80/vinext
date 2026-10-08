@@ -1604,6 +1604,8 @@ type NitroSetupContext = {
     exportConditions?: string[];
     routeRules?: Record<string, NitroRouteRuleConfig>;
     traceDeps?: string[];
+    plugins?: string[];
+    virtual?: Record<string, string | (() => string | Promise<string>)>;
   };
   logger?: {
     warn?: (message: string) => void;
@@ -1680,6 +1682,8 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let warnedInlineNextConfigOverride = false;
   let hasNitroPlugin = false;
   let nitroHostRuntime: "node" | "worker" = "node";
+  // Vite's resolved publicDir, for the Nitro middleware/public-file plugin.
+  let nitroPublicDir: string | false = "public";
   let resolvedServerExternalPackages: string[] = [];
   let registerNodeOpenTelemetryLoader = false;
   let pagesTsconfigAliases: Record<string, string> = {};
@@ -7957,6 +7961,9 @@ export const loadServerActionClient = ${
     },
     {
       name: "vinext:nitro-route-rules",
+      configResolved(config) {
+        nitroPublicDir = config.publicDir === "" ? false : config.publicDir;
+      },
       nitro: {
         setup: async (nitro: NitroSetupContext) => {
           nitroBuildDir = nitro.options.buildDir
@@ -7975,6 +7982,32 @@ export const loadServerActionClient = ${
           }
 
           if (nitro.options.dev) return;
+
+          // Nitro's static handler answers public/ files before the vinext
+          // service, so middleware would never run for them. Send the ones the
+          // matcher can cover to vinext first.
+          if (middlewarePath && nitroHostRuntime === "node") {
+            const middlewareFile = middlewarePath;
+            const {
+              NITRO_MIDDLEWARE_PUBLIC_FILES_PLUGIN_ID,
+              collectMiddlewareCoveredPublicFiles,
+              generateNitroMiddlewarePublicFilesPlugin,
+            } = await import("./build/nitro-middleware-public-files.js");
+            nitro.options.virtual ??= {};
+            nitro.options.virtual[NITRO_MIDDLEWARE_PUBLIC_FILES_PLUGIN_ID] = () =>
+              generateNitroMiddlewarePublicFilesPlugin(
+                collectMiddlewareCoveredPublicFiles({
+                  root,
+                  publicDir: nitroPublicDir,
+                  matcher: extractMiddlewareMatcherConfigValue(middlewareFile),
+                  i18n: nextConfig?.i18n,
+                }),
+              );
+            nitro.options.plugins ??= [];
+            if (!nitro.options.plugins.includes(NITRO_MIDDLEWARE_PUBLIC_FILES_PLUGIN_ID)) {
+              nitro.options.plugins.push(NITRO_MIDDLEWARE_PUBLIC_FILES_PLUGIN_ID);
+            }
+          }
 
           const { collectNitroRouteRules, mergeNitroRouteRules } =
             await import("./build/nitro-route-rules.js");
