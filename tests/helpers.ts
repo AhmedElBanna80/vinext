@@ -16,6 +16,7 @@ import { createServer, build, type ViteDevServer } from "vite";
 import vinext from "../packages/vinext/src/index.js";
 import path from "node:path";
 import type { NextConfigInput } from "../packages/vinext/src/config/next-config.js";
+import type { VinextCacheConfig } from "../packages/vinext/src/cache/cache-adapters-virtual.js";
 import { afterAll, expect } from "vite-plus/test";
 
 // ── Fixture paths ─────────────────────────────────────────────
@@ -81,6 +82,7 @@ export type TestServerResult = {
  * detected, so callers do NOT need to inject rsc() manually.
  *
  * @param fixtureDir - Path to the fixture directory
+ * @param opts.cache - The vinext() `cache` option, for declarative cache adapters
  * @param opts.listen - If false, creates server without listening (default: true)
  */
 export async function startFixtureServer(
@@ -88,6 +90,8 @@ export async function startFixtureServer(
   opts?: {
     appDir?: string | null;
     appRouter?: boolean;
+    /** The vinext() `cache` option (declarative cache adapters). */
+    cache?: VinextCacheConfig;
     listen?: boolean;
     publicDir?: string | false;
     resolve?: { preserveSymlinks?: boolean };
@@ -108,12 +112,12 @@ export async function startFixtureServer(
     const previousCwd = process.cwd();
     try {
       process.chdir(fixtureDir);
-      plugin = vinext();
+      plugin = vinext({ cache: opts?.cache });
     } finally {
       process.chdir(previousCwd);
     }
   } else {
-    plugin = vinext({ appDir: opts?.appDir ?? fixtureDir });
+    plugin = vinext({ appDir: opts?.appDir ?? fixtureDir, cache: opts?.cache });
   }
   const plugins = [plugin];
 
