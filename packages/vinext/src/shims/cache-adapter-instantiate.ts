@@ -91,6 +91,23 @@ function describeValue(value: unknown): string {
   return typeof value === "undefined" ? "undefined" : `a ${typeof value}`;
 }
 
+/**
+ * Whether `value` is a genuine Promise, judged by its internal slot rather
+ * than by a `then` member: adapter contracts are structural and do not
+ * reserve `then`, so an adapter's own `then` method is never read or invoked.
+ * `Promise.prototype.then` throws on a non-Promise before touching it, and on
+ * a Promise (from any realm) attaches a no-op rejection handler, so the
+ * discarded result cannot become an unhandled rejection.
+ */
+function markHandledIfPromise(value: unknown): boolean {
+  try {
+    void Promise.prototype.then.call(value, undefined, () => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function instantiateCacheAdapter<T>(
   exported: unknown,
   args: CacheAdapterFactoryArgs,
@@ -122,9 +139,7 @@ export function instantiateCacheAdapter<T>(
   const isObjectLike =
     (adapter !== null && typeof adapter === "object") || typeof adapter === "function";
 
-  if (isObjectLike && typeof (adapter as { then?: unknown }).then === "function") {
-    // The result is discarded; keep a rejection from becoming unhandled.
-    (adapter as PromiseLike<unknown>).then(undefined, () => {});
+  if (isObjectLike && markHandledIfPromise(adapter)) {
     throw new TypeError(
       `${label}: the default export returned a Promise. Adapter factories must return the adapter synchronously; defer async setup to the adapter's methods.`,
     );

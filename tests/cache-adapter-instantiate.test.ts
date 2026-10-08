@@ -292,13 +292,41 @@ describe("instantiateCacheAdapter", () => {
     );
   });
 
-  it("does not leave a rejected Promise result unhandled", () => {
-    const rejected = Promise.reject(new Error("async setup failed"));
-    const then = vi.spyOn(rejected, "then");
-    expect(() => instantiateCacheAdapter(() => rejected, args, "data")).toThrow(
-      /returned a Promise/,
-    );
-    expect(then).toHaveBeenCalledWith(undefined, expect.any(Function));
+  it("does not leave a rejected Promise result unhandled", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      expect(() =>
+        instantiateCacheAdapter(
+          () => Promise.reject(new Error("async setup failed")),
+          args,
+          "data",
+        ),
+      ).toThrow(/returned a Promise/);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+  });
+
+  it("accepts a synchronous adapter that has its own then method", () => {
+    // Adapter contracts do not reserve `then`, so these thenables are the point.
+    const then = vi.fn(() => {
+      throw new Error("then must not be invoked");
+    });
+    // oxlint-disable-next-line unicorn/no-thenable
+    const adapter = { ...dataMethods(), then };
+    expect(instantiateCacheAdapter(() => adapter, args, "data")).toBe(adapter);
+    expect(then).not.toHaveBeenCalled();
+
+    class ThenableAdapter extends DataAdapter {
+      // oxlint-disable-next-line unicorn/no-thenable
+      then() {
+        throw new Error("then must not be invoked");
+      }
+    }
+    expect(instantiateCacheAdapter(ThenableAdapter, args, "data")).toBeInstanceOf(ThenableAdapter);
   });
 
   it("rejects results that are not an adapter object", () => {
