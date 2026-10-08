@@ -602,9 +602,9 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
         }
       : undefined;
 
-  // Next.js treats data:/blob: sources as unoptimized, so even a custom loader
-  // never sees them.
-  const unoptimized = unoptimizedProp || (!!loader && isInlineSrc(src));
+  // Next.js (getImgProps and next/legacy/image) treats empty, data: and blob:
+  // sources as unoptimized, so neither a custom loader nor /_next/image sees them.
+  const unoptimized = unoptimizedProp || isInlineSrc(src);
   if (unoptimized || loader) {
     // Unoptimized images are fetched directly by the browser, so intentionally
     // skip remote URL validation: there is no server-side optimizer fetch and
@@ -874,7 +874,7 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
   } = resolveImageSource({ src: srcProp, width, height, blurDataURL: blurDataURLProp });
   const shouldPreload = _preload === true || priority === true;
 
-  if (_unoptimized === true || __globallyUnoptimized || (loader && isInlineSrc(src))) {
+  if (_unoptimized === true || __globallyUnoptimized || isInlineSrc(src)) {
     // As in the component path, unoptimized images never reach the server-side
     // optimizer, so remote URL validation is intentionally unnecessary.
     const renderedSrc = overrideSrc || src;

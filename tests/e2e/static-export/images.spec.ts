@@ -24,17 +24,26 @@ async function imageAttrs(page: Page, alt: string) {
 }
 
 test.describe("Static Export — next/image", () => {
+  let pageErrors: string[];
+
   test.beforeEach(async ({ page }) => {
-    const hydrationErrors: string[] = [];
+    // Every console error counts (production React reports a hydration
+    // mismatch as minified error #418), except the fixture's image URLs
+    // failing to load: the static host has no image files or optimizer.
+    pageErrors = [];
     page.on("console", (msg) => {
-      if (msg.type() === "error" && /hydrat/i.test(msg.text())) {
-        hydrationErrors.push(msg.text());
+      if (msg.type() === "error" && !msg.text().startsWith("Failed to load resource")) {
+        pageErrors.push(msg.text());
       }
     });
+    page.on("pageerror", (error) => pageErrors.push(error.message));
     const response = await page.goto(`${BASE}/images/`);
     expect(response?.status()).toBe(200);
     await waitForAppRouterHydration(page);
-    expect(hydrationErrors).toEqual([]);
+  });
+
+  test.afterEach(() => {
+    expect(pageErrors).toEqual([]);
   });
 
   test("images without a loader prop use images.loaderFile", async ({ page }) => {

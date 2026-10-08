@@ -187,6 +187,22 @@ describe("images.loader config validation", () => {
       vi.doUnmock("vinext/shims/image-loader-file");
     }
   });
+
+  // Next.js's legacy image marks data: and blob: sources unoptimized before
+  // it builds a URL, so its "custom" loader neither throws nor runs for them.
+  it("renders inline next/legacy/image sources as-is when images.loader is custom", async () => {
+    process.env.__VINEXT_IMAGE_CUSTOM_LOADER = "true";
+    vi.resetModules();
+    const { default: LegacyImage } = await import("../packages/vinext/src/shims/legacy-image.js");
+
+    for (const src of ["data:image/png;base64,iVBORw0KGgo=", "blob:https://example.com/id"]) {
+      const html = ReactDOMServer.renderToString(
+        React.createElement(LegacyImage, { alt: "a", src, width: 100, height: 100 }),
+      );
+      expect(html).toContain(`src="${src}"`);
+      expect(html).not.toContain("/_next/image");
+    }
+  });
 });
 
 // ─── SSR rendering ──────────────────────────────────────────────────────
@@ -395,19 +411,23 @@ describe("Image SSR rendering", () => {
   });
 
   // Next.js marks data:/blob: sources unoptimized before generateImgAttrs.
-  it("never passes data:, blob: or empty sources to a custom loader", () => {
+  it("never passes data:, blob: or empty sources to a custom loader or /_next/image", () => {
     const loader = vi.fn(({ src, width }: { src: string; width: number }) => `${src}?w=${width}`);
     for (const src of ["data:image/png;base64,iVBORw0KGgo=", "blob:https://example.com/uuid", ""]) {
-      const imageProps = { alt: "inline", src, width: 100, height: 100, loader };
+      for (const imageProps of [
+        { alt: "inline", src, width: 100, height: 100, loader },
+        { alt: "inline", src, width: 100, height: 100 },
+      ]) {
+        const html = ReactDOMServer.renderToString(React.createElement(Image, imageProps));
+        // React omits an empty src attribute entirely.
+        if (src) expect(html).toContain(`src="${src}"`);
+        expect(html).not.toContain("srcSet");
+        expect(html).not.toContain("/_next/image");
 
-      const html = ReactDOMServer.renderToString(React.createElement(Image, imageProps));
-      // React omits an empty src attribute entirely.
-      if (src) expect(html).toContain(`src="${src}"`);
-      expect(html).not.toContain("srcSet");
-
-      const { props } = getImageProps(imageProps);
-      expect(props.src).toBe(src);
-      expect(props.srcSet).toBeUndefined();
+        const { props } = getImageProps(imageProps);
+        expect(props.src).toBe(src);
+        expect(props.srcSet).toBeUndefined();
+      }
     }
     expect(loader).not.toHaveBeenCalled();
   });
