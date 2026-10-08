@@ -81,7 +81,6 @@ const appPageRouteWiringPath = resolveEntryPath(
   "../server/app-page-route-wiring.js",
   import.meta.url,
 );
-const appPageProbePath = resolveEntryPath("../server/app-page-probe.js", import.meta.url);
 const appPageDispatchPath = resolveEntryPath("../server/app-page-dispatch.js", import.meta.url);
 const appPagePprRuntimePath = resolveEntryPath(
   "../server/app-page-ppr-runtime.js",
@@ -828,7 +827,6 @@ import {
   resolveAppPageChildSegments as __resolveAppPageChildSegments,
 } from ${JSON.stringify(appPageRouteWiringPath)};
 import { buildPageElements as __buildPageElements } from ${JSON.stringify(appPageElementBuilderPath)};
-import { buildAppPageProbes as __buildAppPageProbes } from ${JSON.stringify(appPageProbePath)};
 import {
   dispatchAppPage as __dispatchAppPage,
 } from ${JSON.stringify(appPageDispatchPath)};
@@ -889,7 +887,7 @@ import { suppressHookWarningAls } from ${JSON.stringify(appHookWarningSuppressio
 import { clearAppRequestContext as __clearRequestContext, setAppNavigationContext as setNavigationContext } from ${JSON.stringify(appRequestContextPath)};
 __configureMemoryCacheHandler({ cacheMaxMemorySize: ${JSON.stringify(cacheMaxMemorySize)} });
 import { createAppPrerenderStaticParamsResolver as __createAppPrerenderStaticParamsResolver } from ${JSON.stringify(appPrerenderStaticParamsPath)};
-import { ensureAppRouteModulesLoaded as __ensureRouteLoaded, loadAppInterceptPage as __loadAppInterceptPage } from ${JSON.stringify(appRouteModuleLoaderPath)};
+import { ensureAppRouteModulesLoaded as __ensureRouteLoaded } from ${JSON.stringify(appRouteModuleLoaderPath)};
 import {
   getRenderedConcreteUrlPathsForRoute as __getRenderedConcreteUrlPathsForRoute,
   initPregeneratedPathsFromGlobals as __initPregeneratedPathsFromGlobals,
@@ -1346,6 +1344,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
     scriptNonce,
     searchParams,
     renderMode,
+    renderWholeDocument,
   }) {
     const PageComponent = route.page?.default;
     const __segmentConfigBranches = __resolveRouteSegmentConfigBranches(route);
@@ -1367,7 +1366,6 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       routePatternParts: route.patternParts,
       routeSegments: route.routeSegments,
     });
-    const _asyncRouteParams = makeThenableParams(params);
     return __dispatchAppPage({
       basePath: __basePath,
       bypassInterceptionContextCache,
@@ -1386,6 +1384,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
           observePageSearchParamsAccess: buildOptions?.observePageSearchParamsAccess === true,
           isForceStatic: buildOptions?.isForceStatic === true,
           serveStreamingMetadata: buildOptions?.serveStreamingMetadata,
+          placeStreamedMetadataInHead: buildOptions?.placeStreamedMetadataInHead === true,
           isProduction: process.env.NODE_ENV === "production",
         }, layoutParamAccess, displayPathname, scriptNonce);
       },
@@ -1473,31 +1472,6 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
           route,
         });
       },
-      async probePage(probeSearchParams = searchParams) {
-        const __probeIntercept = findIntercept(
-          interceptionPathname,
-          interceptionContext,
-          interceptionId,
-        );
-        // The intercepting-route page module is lazy (page: null + __pageLoader).
-        // Resolve it before probing so buildAppPageProbes inspects the real page
-        // component for dynamic bailout — matching the render path, which also
-        // hydrates it (resolveAppPageInterceptState). Without this the intercept
-        // probe branch silently inspects an undefined component and never
-        // observes the page's searchParams/headers access. Shared loader, so
-        // the import is isolated from the request context here too.
-        if (__probeIntercept) await __loadAppInterceptPage(__probeIntercept);
-        return Promise.all(__buildAppPageProbes({
-          route,
-          pageComponent: PageComponent,
-          asyncRouteParams: _asyncRouteParams,
-          searchParams: probeSearchParams,
-          intercept: __probeIntercept,
-          isRscRequest,
-          matchedParams: params,
-          makeThenableParams,
-        }));
-      },
       renderErrorBoundaryPage(renderErr, errorOrigin) {
         const __activeIntercept = findIntercept(
           interceptionPathname,
@@ -1556,6 +1530,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       searchParams,
       setNavigationContext,
       renderMode,
+      renderWholeDocument,
     });
   },
   async dispatchMatchedRouteHandler({

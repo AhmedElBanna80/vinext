@@ -17,8 +17,8 @@
  * as-is (no transformation) with security headers applied.
  */
 
-import { NEXTJS_CACHE_HEADER } from "./headers.js";
 import { assetPrefixPathname, ASSET_PREFIX_URL_DIR } from "../utils/asset-prefix.js";
+import { setCacheStateHeaders } from "./cache-headers.js";
 import { badRequestResponse } from "./http-error-responses.js";
 
 /** The pathname that triggers image optimization (matches Next.js). */
@@ -271,7 +271,8 @@ function setImageSecurityHeaders(headers: Headers, config?: ImageConfig): void {
 }
 
 /**
- * `X-Nextjs-Cache` value for a successful image response.
+ * Cache state for a successful image response, sent as both `X-Nextjs-Cache`
+ * and `X-Vinext-Cache`.
  *
  * Next.js keeps optimized images in an image cache and labels each 200 with
  * where the bytes came from: `MISS` when the optimizer ran for this request,
@@ -282,7 +283,7 @@ function setImageSecurityHeaders(headers: Headers, config?: ImageConfig): void {
  * 200 is a `MISS`. `HIT` and `STALE` need a cache of optimized images.
  *
  * Next.js sets the header after its ETag check, so a 304 and error responses
- * go out without it. Only full image responses carry it here too.
+ * go out without it. Only full image responses carry either header here too.
  */
 export const IMAGE_RESPONSE_CACHE_STATE = "MISS";
 
@@ -291,7 +292,7 @@ function setImageResponseHeaders(headers: Headers, config?: ImageConfig): void {
   headers.set("Cache-Control", IMAGE_CACHE_CONTROL);
   headers.set("Vary", "Accept");
   setImageSecurityHeaders(headers, config);
-  headers.set(NEXTJS_CACHE_HEADER, IMAGE_RESPONSE_CACHE_STATE);
+  setCacheStateHeaders(headers, IMAGE_RESPONSE_CACHE_STATE);
 }
 
 function createPassthroughImageResponse(source: Response, config?: ImageConfig): Response {
