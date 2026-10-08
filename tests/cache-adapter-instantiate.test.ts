@@ -310,6 +310,30 @@ describe("instantiateCacheAdapter", () => {
     }
   });
 
+  it("rejects a Promise subclass whose species lookup throws", () => {
+    let armed = true;
+    class HostilePromise<T> extends Promise<T> {
+      static get [Symbol.species]() {
+        if (armed) throw new Error("species lookup");
+        return Promise;
+      }
+    }
+    // Shaped like an adapter, so only the Promise check stands between it and
+    // being returned as one.
+    const result = Object.assign(
+      HostilePromise.reject(new Error("async setup failed")),
+      dataMethods(),
+    );
+    try {
+      expect(() => instantiateCacheAdapter(() => result, args, "data")).toThrow(
+        /returned a Promise/,
+      );
+    } finally {
+      armed = false;
+      result.catch(() => {});
+    }
+  });
+
   it("accepts a synchronous adapter that has its own then method", () => {
     // Adapter contracts do not reserve `then`, so these thenables are the point.
     const then = vi.fn(() => {

@@ -92,19 +92,30 @@ function describeValue(value: unknown): string {
 }
 
 /**
- * Whether `value` is a genuine Promise, judged by its internal slot rather
- * than by a `then` member: adapter contracts are structural and do not
- * reserve `then`, so an adapter's own `then` method is never read or invoked.
+ * Whether `value` is a Promise, judged by its internal slot or prototype
+ * chain rather than by a `then` member: adapter contracts are structural and
+ * do not reserve `then`, so an adapter's own `then` method is never read or
+ * invoked.
+ *
  * `Promise.prototype.then` throws on a non-Promise before touching it, and on
  * a Promise (from any realm) attaches a no-op rejection handler, so the
- * discarded result cannot become an unhandled rejection.
+ * discarded result cannot become an unhandled rejection. It can also throw
+ * after the brand check, when a Promise subclass's `constructor` or
+ * `Symbol.species` lookup throws while deriving the returned promise; that
+ * Promise is still recognised by its prototype chain and rejected. No handler
+ * can be attached to it: every way of observing a Promise goes through that
+ * same species lookup or its `then`.
  */
 function markHandledIfPromise(value: unknown): boolean {
   try {
     void Promise.prototype.then.call(value, undefined, () => {});
     return true;
   } catch {
-    return false;
+    try {
+      return value instanceof Promise;
+    } catch {
+      return false;
+    }
   }
 }
 
