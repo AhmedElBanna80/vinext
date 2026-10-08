@@ -189,7 +189,7 @@ runLocalImageUrlParitySuite("pages");
 // The Pages Router production server answers `/_next/image` itself. vinext
 // keeps no image cache, so it matches Next.js with the image cache disabled
 // (`images.maximumDiskCacheSize: 0`): every 200 is a MISS.
-describe("Pages Router production /_next/image x-nextjs-cache", () => {
+describe("Pages Router production /_next/image cache-state headers", () => {
   let server: Server | undefined;
   let baseUrl: string;
   let fixtureDir: string;
@@ -256,15 +256,17 @@ describe("Pages Router production /_next/image x-nextjs-cache", () => {
     const first = await fetch(imageUrl, { headers: { Accept: "image/webp" } });
     expect(first.status).toBe(200);
     expect(first.headers.get("x-nextjs-cache")).toBe("MISS");
+    expect(first.headers.get("x-vinext-cache")).toBe("MISS");
     await first.arrayBuffer();
 
     const repeat = await fetch(imageUrl, { headers: { Accept: "image/webp" } });
     expect(repeat.status).toBe(200);
     expect(repeat.headers.get("x-nextjs-cache")).toBe("MISS");
+    expect(repeat.headers.get("x-vinext-cache")).toBe("MISS");
     await repeat.arrayBuffer();
   });
 
-  it("sends no x-nextjs-cache on a 304 or an error", async () => {
+  it("sends no x-nextjs-cache or x-vinext-cache on a 304 or an error", async () => {
     const imagePath = "/_next/image?url=%2Fhello%20world.png&w=64&q=75";
     const first = await fetch(`${baseUrl}${imagePath}`);
     const etag = first.headers.get("etag");
@@ -281,6 +283,7 @@ describe("Pages Router production /_next/image x-nextjs-cache", () => {
     );
     expect(notModified.status).toBe(304);
     expect(notModified.headers["x-nextjs-cache"]).toBeUndefined();
+    expect(notModified.headers["x-vinext-cache"]).toBeUndefined();
 
     for (const [query, status] of [
       ["url=%2Fhello%20world.png&w=65&q=75", 400],
@@ -290,6 +293,7 @@ describe("Pages Router production /_next/image x-nextjs-cache", () => {
       const res = await fetch(`${baseUrl}/_next/image?${query}`);
       expect(res.status, query).toBe(status);
       expect(res.headers.get("x-nextjs-cache"), query).toBeNull();
+      expect(res.headers.get("x-vinext-cache"), query).toBeNull();
       await res.arrayBuffer();
     }
   });

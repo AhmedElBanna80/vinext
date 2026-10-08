@@ -27490,8 +27490,8 @@ describe("handleImageOptimization", () => {
   // https://github.com/vercel/next.js/blob/v16.2.6/test/integration/image-optimizer/test/util.ts
   // vinext keeps no image cache, so it matches Next.js with the image cache
   // disabled (`images.maximumDiskCacheSize: 0`): every 200 is a MISS, and
-  // errors carry no x-nextjs-cache.
-  it("labels every successful image response x-nextjs-cache: MISS", async () => {
+  // errors carry no x-nextjs-cache or x-vinext-cache.
+  it("labels every successful image response x-nextjs-cache and x-vinext-cache: MISS", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
     const source = (contentType: string) => async () =>
@@ -27504,17 +27504,19 @@ describe("handleImageOptimization", () => {
       const response = await handleImageOptimization(imageRequest(), passthrough);
       expect(response.status, attempt).toBe(200);
       expect(response.headers.get("x-nextjs-cache"), attempt).toBe("MISS");
+      expect(response.headers.get("x-vinext-cache"), attempt).toBe("MISS");
     }
 
     const transformed = await handleImageOptimization(imageRequest(), {
       fetchAsset: source("image/jpeg"),
       transformImage: async (_body, { format }) =>
         new Response("transformed", {
-          headers: { "Content-Type": format, "x-nextjs-cache": "HIT" },
+          headers: { "Content-Type": format, "x-nextjs-cache": "HIT", "x-vinext-cache": "HIT" },
         }),
     });
     expect(transformed.status).toBe(200);
     expect(transformed.headers.get("x-nextjs-cache")).toBe("MISS");
+    expect(transformed.headers.get("x-vinext-cache")).toBe("MISS");
 
     const svg = await handleImageOptimization(
       imageRequest("%2Fimg.svg"),
@@ -27524,6 +27526,7 @@ describe("handleImageOptimization", () => {
     );
     expect(svg.status).toBe(200);
     expect(svg.headers.get("x-nextjs-cache")).toBe("MISS");
+    expect(svg.headers.get("x-vinext-cache")).toBe("MISS");
 
     const errors = [
       await handleImageOptimization(new Request("http://localhost/_next/image"), passthrough),
@@ -27537,6 +27540,7 @@ describe("handleImageOptimization", () => {
     expect(errors.map((response) => response.status)).toEqual([400, 404, 400]);
     for (const response of errors) {
       expect(response.headers.get("x-nextjs-cache")).toBeNull();
+      expect(response.headers.get("x-vinext-cache")).toBeNull();
     }
   });
 
