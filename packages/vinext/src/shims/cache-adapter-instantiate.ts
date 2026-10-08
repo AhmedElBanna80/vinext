@@ -92,19 +92,20 @@ function describeValue(value: unknown): string {
 }
 
 /**
- * Whether `value` is a Promise, judged by its internal slot or prototype
- * chain rather than by a `then` member: adapter contracts are structural and
- * do not reserve `then`, so an adapter's own `then` method is never read or
- * invoked.
+ * Whether `value` is a Promise, judged by its internal slot, prototype chain
+ * or `Promise` tag rather than by a `then` member: adapter contracts are
+ * structural and do not reserve `then`, so an adapter's own `then` method is
+ * never read or invoked.
  *
  * `Promise.prototype.then` throws on a non-Promise before touching it, and on
  * a Promise (from any realm) attaches a no-op rejection handler, so the
  * discarded result cannot become an unhandled rejection. It can also throw
  * after the brand check, when a Promise subclass's `constructor` or
- * `Symbol.species` lookup throws while deriving the returned promise; that
- * Promise is still recognised by its prototype chain and rejected. No handler
- * can be attached to it: every way of observing a Promise goes through that
- * same species lookup or its `then`.
+ * `Symbol.species` lookup throws while deriving the returned promise. That
+ * Promise is still recognised and rejected, by its prototype chain (this
+ * realm) or by the `Symbol.toStringTag` every realm's `Promise.prototype`
+ * carries. No handler can be attached to it: every way of observing a
+ * Promise goes through that same species lookup or its `then`.
  */
 function markHandledIfPromise(value: unknown): boolean {
   try {
@@ -112,7 +113,9 @@ function markHandledIfPromise(value: unknown): boolean {
     return true;
   } catch {
     try {
-      return value instanceof Promise;
+      return (
+        value instanceof Promise || Object.prototype.toString.call(value) === "[object Promise]"
+      );
     } catch {
       return false;
     }

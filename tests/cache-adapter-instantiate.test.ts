@@ -4,6 +4,7 @@
  * The end-to-end proof (a class adapter configured on a real fixture app) lives
  * in tests/app-router-dev-server.test.ts ("class-based cache.data adapter").
  */
+import vm from "node:vm";
 import { describe, expect, it, vi } from "vite-plus/test";
 import {
   instantiateCacheAdapter,
@@ -330,6 +331,29 @@ describe("instantiateCacheAdapter", () => {
       );
     } finally {
       armed = false;
+      result.catch(() => {});
+    }
+  });
+
+  it("rejects another realm's Promise subclass whose species lookup throws", () => {
+    const foreign = vm.runInNewContext(`
+      const state = { armed: true };
+      class HostilePromise extends Promise {
+        static get [Symbol.species]() {
+          if (state.armed) throw new Error("species lookup");
+          return Promise;
+        }
+      }
+      ({ state, promise: HostilePromise.reject(new Error("async setup failed")) });
+    `) as { state: { armed: boolean }; promise: Promise<unknown> };
+    const result = Object.assign(foreign.promise, dataMethods());
+    expect(result instanceof Promise).toBe(false);
+    try {
+      expect(() => instantiateCacheAdapter(() => result, args, "data")).toThrow(
+        /returned a Promise/,
+      );
+    } finally {
+      foreign.state.armed = false;
       result.catch(() => {});
     }
   });
