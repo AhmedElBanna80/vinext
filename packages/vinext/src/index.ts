@@ -98,7 +98,10 @@ import {
 } from "./build/report.js";
 import { planRouteClassificationInjection } from "./build/route-classification-injector.js";
 import { createActionOwnerManifestPlugin } from "./plugins/action-owner-manifest.js";
-import { normalizePathnameForRouteMatchStrict } from "./routing/utils.js";
+import {
+  normalizePathnameForRouteMatch,
+  normalizePathnameForRouteMatchStrict,
+} from "./routing/utils.js";
 import { hasBasePath, stripBasePath } from "./utils/base-path.js";
 import {
   createRscCompatibilityId,
@@ -343,7 +346,7 @@ import {
 } from "./plugins/typeof-window.js";
 import { hasMdxFiles, loadMdxEsmReader, pageExtensionsIncludeMdx } from "./utils/mdx-scan.js";
 import { scanPublicFileRoutes } from "./utils/public-routes.js";
-import { publicFilePathVariants } from "./utils/public-file-path.js";
+import { publicFileRouteKey } from "./utils/public-file-path.js";
 import {
   methodNotAllowedResponse,
   notFoundStaticAssetResponse,
@@ -5938,7 +5941,7 @@ export const loadServerActionClient = ${
           ) {
             return null;
           }
-          return publicFilePathVariants(`/${relativePath}`);
+          return [publicFileRouteKey(`/${relativePath}`)];
         };
         const updatePublicFileRoute = (filePath: string, present: boolean): void => {
           const routes = publicRoutesForFile(filePath);
@@ -6964,7 +6967,8 @@ export const loadServerActionClient = ${
                     return false;
                   }
                   if (!isRetrievalMethod) {
-                    return isExistingDevPublicFile(requestPathname)
+                    // The pipeline pathname is still URL-encoded.
+                    return isExistingDevPublicFile(normalizePathnameForRouteMatch(requestPathname))
                       ? methodNotAllowedResponse("GET, HEAD")
                       : false;
                   }

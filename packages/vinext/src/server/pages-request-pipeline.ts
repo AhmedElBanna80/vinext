@@ -43,6 +43,7 @@ import {
 import { mergeRewriteQuery } from "../utils/query.js";
 import { addBasePathToPathname, hasBasePath } from "../utils/base-path.js";
 import { patternToNextFormat } from "../routing/route-validation.js";
+import { normalizePathnameForRouteMatchStrict } from "../routing/utils.js";
 import {
   isOnDemandRevalidateRequest,
   PRERENDER_REVALIDATE_HEADER,
@@ -120,16 +121,16 @@ export async function fetchWorkerFilesystemRoute(
   assetUrl.pathname = requestPathname;
   assetUrl.search = "";
   const decodedAssetUrl = new URL(assetUrl);
+  let publicFileKey: string;
   try {
     decodedAssetUrl.pathname = decodeURIComponent(assetUrl.pathname);
+    publicFileKey = normalizePathnameForRouteMatchStrict(assetUrl.pathname);
   } catch {
     return false;
   }
   // Next.js serves public files under basePath, so a direct request outside it
   // never matches one; only a rewrite can bring it into the public filesystem.
-  const isPublicFile =
-    (phase !== "direct" || hadBasePath) &&
-    (publicFiles.has(assetUrl.pathname) || publicFiles.has(decodedAssetUrl.pathname));
+  const isPublicFile = (phase !== "direct" || hadBasePath) && publicFiles.has(publicFileKey);
   // Public files precede API routes in the filesystem order, so a file such as
   // public/api/schema.json is served rather than handed to API routing.
   if (!isPublicFile && (requestPathname === "/api" || requestPathname.startsWith("/api/"))) {
