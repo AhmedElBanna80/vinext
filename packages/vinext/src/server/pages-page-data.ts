@@ -25,6 +25,7 @@ import {
   buildPagesNextDataScript,
   generatePagesETag,
   isPagesStreamingBot,
+  rendersPagesNotModified,
   requestsNoCache,
   type PagesGsspResponse,
   type PagesI18nRenderContext,
@@ -992,7 +993,15 @@ export function matchesPagesStaticPath(
       if (optional && value.length === 0 && actual === undefined) {
         return true;
       }
-      return Array.isArray(actual) && value.join("/") === actual.join("/");
+      // Compare element-wise: Next.js escapes each element's `/` when building
+      // the prerendered pathname, so `["a", "b"]` (`/a/b`) and `["a/b"]`
+      // (`/a%2Fb`) are distinct paths and must not admit each other. Iterate
+      // the dense request array so holes in a sparse entry never match.
+      return (
+        Array.isArray(actual) &&
+        value.length === actual.length &&
+        actual.every((part, index) => part === value[index])
+      );
     }
     return String(value) === String(actual);
   });
@@ -1070,7 +1079,12 @@ function finalizeCachedPagesResponse(
     const etag = generatePagesETag(html);
     response.headers.set("ETag", etag);
     const noCacheRequested = requestsNoCache(options.requestCacheControl);
-    if (!noCacheRequested && options.ifNoneMatch && matchesIfNoneMatch(options.ifNoneMatch, etag)) {
+    if (
+      !noCacheRequested &&
+      options.ifNoneMatch &&
+      matchesIfNoneMatch(options.ifNoneMatch, etag) &&
+      rendersPagesNotModified(response.status)
+    ) {
       response = new Response(null, { status: 304, headers: response.headers });
     }
   }

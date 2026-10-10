@@ -35,7 +35,11 @@ import { applyConfigHeadersToHeaderRecord } from "./config-headers.js";
 import type { HeaderRecord } from "./request-pipeline.js";
 import { finalizeMissingStaticAssetResponse, mergeHeaders } from "./worker-utils.js";
 import { assetPrefixPathname, isNextStaticPath } from "../utils/asset-prefix.js";
-import { normalizeDefaultLocalePathname, stripI18nLocaleForApiRoute } from "./pages-i18n.js";
+import {
+  detectPathnameLocale,
+  normalizeDefaultLocalePathname,
+  stripI18nLocaleForApiRoute,
+} from "./pages-i18n.js";
 import { mergeRewriteQuery } from "../utils/query.js";
 import { addBasePathToPathname, hasBasePath } from "../utils/base-path.js";
 import { patternToNextFormat } from "../routing/route-validation.js";
@@ -109,15 +113,9 @@ export async function fetchWorkerFilesystemRoute(
   publicFiles: ReadonlySet<string>,
   basePath = "",
   assetPathPrefix = "",
+  hadBasePath = true,
 ): Promise<Response | false> {
   const isRetrievalMethod = request.method === "GET" || request.method === "HEAD";
-  if (
-    (phase === "direct" && isRetrievalMethod) ||
-    requestPathname === "/api" ||
-    requestPathname.startsWith("/api/")
-  ) {
-    return false;
-  }
   const assetUrl = new URL(request.url);
   assetUrl.pathname = requestPathname;
   assetUrl.search = "";
@@ -127,14 +125,26 @@ export async function fetchWorkerFilesystemRoute(
   } catch {
     return false;
   }
+  // Next.js serves public files under basePath, so a direct request outside it
+  // never matches one; only a rewrite can bring it into the public filesystem.
+  const isPublicFile =
+    (phase !== "direct" || hadBasePath) &&
+    (publicFiles.has(assetUrl.pathname) || publicFiles.has(decodedAssetUrl.pathname));
+  // Public files precede API routes in the filesystem order, so a file such as
+  // public/api/schema.json is served rather than handed to API routing.
+  if (!isPublicFile && (requestPathname === "/api" || requestPathname.startsWith("/api/"))) {
+    return false;
+  }
+  // A direct GET/HEAD for a public file reaches the Worker when run_worker_first
+  // routes it here, so serve it after middleware. A direct build-asset request
+  // reaches the Worker only after Workers Static Assets found no such file.
+  if (phase === "direct" && isRetrievalMethod && !isPublicFile) {
+    return false;
+  }
   // Every rewrite phase must stay inside the public filesystem boundary. The
   // binding also contains private cache artifacts. Authorize the normalized
   // destination, never the original request's build-asset classification.
-  if (
-    !publicFiles.has(assetUrl.pathname) &&
-    !publicFiles.has(decodedAssetUrl.pathname) &&
-    !isNextStaticPath(decodedAssetUrl.pathname, basePath, assetPathPrefix)
-  ) {
+  if (!isPublicFile && !isNextStaticPath(decodedAssetUrl.pathname, basePath, assetPathPrefix)) {
     return false;
   }
   // Never forward a mutating method or body to the asset binding. A HEAD probe
@@ -261,6 +271,7 @@ export type PagesPipelineDeps = {
    * Optional filesystem/static-asset probe supplied by each runtime adapter.
    * Called post-middleware (so middleware can intercept/redirect public files) with the
    * resolved basePath-stripped pathname and URL plus the staged middleware response headers.
+   * `request` carries the request headers middleware overrode.
    * Node may write directly to `res` and return true; dev/Workers return a Response.
    * Resolves false to continue through rewrites, API routes, and page rendering.
    */
@@ -270,6 +281,7 @@ export type PagesPipelineDeps = {
         stagedHeaders: HeaderRecord,
         phase: FilesystemRoutePhase,
         resolvedUrl: string,
+        request: Request,
       ) => Promise<boolean | Response>)
     | null;
 };
@@ -432,7 +444,11 @@ export async function runPagesRequest(
       );
       // Use the raw query (when the adapter supplies it) so the redirect Location
       // isn't re-encoded by URL parsing; fall back to the parsed search otherwise.
-      const location = preserveRedirectDestinationQuery(dest, deps.rawSearch ?? search);
+      const location = preserveRedirectDestinationQuery(
+        dest,
+        deps.rawSearch ?? search,
+        redirect.destinationQuery,
+      );
       return {
         type: "response",
         response: new Response(null, {
@@ -471,14 +487,19 @@ export async function runPagesRequest(
       middlewareHeaders,
       phase,
       resolvedUrl,
+      request,
     );
     if (served instanceof Response) {
       const isStaticMethodNotAllowed =
         served.status === 405 && served.headers.get("allow") === "GET, HEAD";
+      // As for App Router public files, keep a partial or conditional asset
+      // status (206, 304) rather than masking it while keeping its headers.
       const response = mergeHeaders(
         served,
         middlewareHeaders,
-        isStaticMethodNotAllowed ? undefined : middlewareStatus,
+        isStaticMethodNotAllowed || !served.ok || served.status === 206
+          ? undefined
+          : middlewareStatus,
       );
       if (isStaticMethodNotAllowed) {
         sanitizeMethodNotAllowedHeaders(response.headers, "GET, HEAD");
@@ -615,8 +636,8 @@ export async function runPagesRequest(
   const matchedPathnameForRoute = (routePattern: string | undefined): string => {
     const matchedPathname = routePattern ? patternToNextFormat(routePattern) : resolvedPathname;
     if (!i18nConfig) return matchedPathname;
-    const resolvedLocale = resolvedPathname.split("/", 3)[1];
-    if (resolvedLocale && i18nConfig.locales.includes(resolvedLocale)) {
+    const resolvedLocale = detectPathnameLocale(resolvedPathname, i18nConfig.locales);
+    if (resolvedLocale) {
       return matchedPathname === "/"
         ? `/${resolvedLocale}`
         : `/${resolvedLocale}${matchedPathname}`;

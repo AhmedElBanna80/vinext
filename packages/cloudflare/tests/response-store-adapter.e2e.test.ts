@@ -983,6 +983,38 @@ describe("Cloudflare Workers Response Store adapter", () => {
     }
   });
 
+  // A crawler revalidating with a matching If-None-Match gets a 304. Next.js
+  // stores the page before it evaluates the ETag, so the 304 never replaces
+  // the page later visitors receive, and it evaluates the ETag on a HIT too.
+  test("stores a Pages page whole when a crawler's conditional request fills it", async () => {
+    const crawler = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+    const conditionalRequest = {
+      headers: {
+        // Fetch adds Cache-Control: no-cache to a conditional request without
+        // one, and no-cache skips the 304.
+        "Cache-Control": "max-age=0",
+        "If-None-Match": "*",
+        "User-Agent": crawler,
+      },
+    };
+    const conditional = await request("/pages-prewarm", conditionalRequest);
+    assert.equal(conditional.status, 304);
+    assert.equal(conditional.headers.get("x-vinext-cache"), "MISS");
+    assert.equal(await conditional.text(), "");
+    await waitForResponseEntries("/pages-prewarm", 1);
+
+    const visitor = await request("/pages-prewarm");
+    assert.equal(visitor.status, 200);
+    assert.equal(visitor.headers.get("x-vinext-cache"), "HIT");
+    // A 304 updates the client's stored headers, so it carries the page's
+    // browser policy rather than the pending policy of an unadmitted render.
+    assert.equal(conditional.headers.get("cache-control"), visitor.headers.get("cache-control"));
+    assert.doesNotMatch(conditional.headers.get("cache-control") ?? "", /no-store/);
+    // The stored page carries the validator the crawler revalidated against.
+    assert.equal(visitor.headers.get("etag"), conditional.headers.get("etag"));
+    assert.match(await visitor.text(), /Pages prewarm target/);
+  });
+
   test("caches HEAD independently without storing a body", async () => {
     const first = await request("/pages-prewarm?head=1", { method: "HEAD" });
     const second = await request("/pages-prewarm?head=1", { method: "HEAD" });
@@ -1203,26 +1235,26 @@ describe("Cloudflare Workers Response Store adapter", () => {
     assert.match(objects.objects[0].key, /\/r2-v2\/shards-4\/[0-9a-f]{64}\/active$/);
   });
 
-  test("recomputes expired use-cache values that only a page replay could regenerate", async () => {
-    const pathname = "/use-cache-unreplayable";
+  test("recomputes expired use-cache values whose getter arguments Flight replays", async () => {
+    const pathname = "/use-cache-getter-args";
     const read = async () => {
-      // Regenerating one value replays the page, which reads the other. A read that
-      // waited for that replay would replay the page for each value in turn, without end.
       const body = await Promise.race([
         cacheStatus(pathname).then((result) => result.body),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error(`${pathname} did not respond within 4s`)), 4_000),
         ),
       ]);
-      return [htmlValue(body, "unreplayable-first"), htmlValue(body, "unreplayable-second")];
+      return [htmlValue(body, "getter-args-first"), htmlValue(body, "getter-args-second")];
     };
     const first = await read();
 
-    // Both values must be stored for a page replay, not a cache function call.
+    // Flight encodes the getter's value, so both values are stored for a cache function
+    // call, not a page replay.
     const replayEntries = async () =>
       ((await metadataEntries()).flat() as StoredResponseEntry[]).filter(
         (entry) =>
-          entry.revalidator?.id === "vinext:data" && JSON.stringify(entry).includes(pathname),
+          entry.revalidator?.id === "vinext:cache-function" &&
+          JSON.stringify(entry).includes(`app${pathname}/page.tsx`),
       );
     for (let attempt = 0; attempt < 50 && (await replayEntries()).length < 2; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1235,27 +1267,28 @@ describe("Cloudflare Workers Response Store adapter", () => {
     const recomputed = await read();
     assert.notEqual(recomputed[0], first[0]);
     assert.notEqual(recomputed[1], first[1]);
-    assert.match(recomputed[0], /^first:unreplayable:/);
-    assert.match(recomputed[1], /^second:unreplayable:/);
+    assert.match(recomputed[0], /^first:getter-args:/);
+    assert.match(recomputed[1], /^second:getter-args:/);
   }, 15_000);
 
-  test("revalidating a tag replays the page on the value's next read", async () => {
-    const pathname = "/use-cache-unreplayable-tagged";
-    const value = async () => htmlValue((await cacheStatus(pathname)).body, "unreplayable-tagged");
+  test("revalidating a tag regenerates a getter-argument value on its next read", async () => {
+    const pathname = "/use-cache-getter-args-tagged";
+    const value = async () => htmlValue((await cacheStatus(pathname)).body, "getter-args-tagged");
     const before = await value();
     await waitForStoredEntries(
       async () =>
         ((await metadataEntries()).flat() as StoredResponseEntry[]).filter(
           (entry) =>
-            entry.revalidator?.id === "vinext:data" && JSON.stringify(entry).includes(pathname),
+            entry.revalidator?.id === "vinext:cache-function" &&
+            JSON.stringify(entry).includes(`app${pathname}/page.tsx`),
         ),
       1,
     );
 
     // Like Next.js, revalidating the tag only marks the value stale: its next read still
-    // serves it, and the Store replays the page in the background to regenerate it.
+    // serves it, and the Store calls the cache function in the background to regenerate it.
     const revalidate = await request("/api/revalidate-tag", {
-      body: JSON.stringify({ tag: "unreplayable-tagged" }),
+      body: JSON.stringify({ tag: "getter-args-tagged" }),
       headers: { "content-type": "application/json" },
       method: "POST",
     });
@@ -1267,7 +1300,7 @@ describe("Cloudflare Workers Response Store adapter", () => {
       regenerated = await value();
     }
     assert.notEqual(regenerated, before);
-    assert.match(regenerated, /^unreplayable-tagged:/);
+    assert.match(regenerated, /^getter-args-tagged:/);
   }, 15_000);
 
   test("never serves a hard-expired use-cache value", async () => {

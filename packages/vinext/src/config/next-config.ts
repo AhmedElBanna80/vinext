@@ -280,6 +280,11 @@ export type NextConfig = {
   crossOrigin?: "anonymous" | "use-credentials";
   /** Whether to add trailing slashes */
   trailingSlash?: boolean;
+  /**
+   * Compress responses from the Node production server. Defaults to true.
+   * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/compress
+   */
+  compress?: boolean;
   /** Keep the original request URL visible to middleware/proxy. */
   skipProxyUrlNormalize?: boolean;
   /** @deprecated Use `skipProxyUrlNormalize` instead. */
@@ -506,6 +511,8 @@ export type ResolvedNextConfig = {
    */
   assetPrefix: string;
   trailingSlash: boolean;
+  /** Whether the Node production server compresses responses (`compress`, default true). */
+  compress: boolean;
   skipProxyUrlNormalize: boolean;
   typescript: { tsconfigPath?: string };
   output: "" | "export" | "standalone";
@@ -791,7 +798,7 @@ function warnConfigLoadFailure(filename: string, err: Error): void {
  * config that mutates it cannot leak into later loads.
  */
 function createFunctionConfigDefaults(): NextConfig {
-  return { pageExtensions: [...DEFAULT_PAGE_EXTENSIONS] };
+  return { pageExtensions: [...DEFAULT_PAGE_EXTENSIONS], compress: true };
 }
 
 /**
@@ -1705,6 +1712,7 @@ export async function resolveNextConfig(
       basePath: "",
       assetPrefix: "",
       trailingSlash: false,
+      compress: true,
       skipProxyUrlNormalize: false,
       typescript: {},
       output: "",
@@ -2064,6 +2072,8 @@ export async function resolveNextConfig(
     basePath: config.basePath ?? "",
     assetPrefix: normalizeAssetPrefix(config.assetPrefix),
     trailingSlash: config.trailingSlash ?? false,
+    // Next.js disables compression only for an explicit `compress: false`.
+    compress: config.compress !== false,
     skipProxyUrlNormalize:
       config.skipProxyUrlNormalize ?? config.skipMiddlewareUrlNormalize ?? false,
     typescript:

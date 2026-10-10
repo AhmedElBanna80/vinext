@@ -2,7 +2,7 @@
  * Next.js config for the app-basic test fixture.
  *
  * This config serves both Vitest integration tests (app-router.test.ts)
- * and Playwright E2E tests (ON-12, ON-13, ON-15).
+ * and Playwright E2E tests (config-redirect.spec.ts, routing-misc.spec.ts).
  *
  * IMPORTANT: The Vitest test previously wrote a temporary next.config.mjs.
  * Since next.config.ts takes priority over .mjs, this file must include
@@ -25,6 +25,11 @@ const nextConfig: NextConfig = {
   experimental: {
     gestureTransition: true,
   },
+
+  // Used by Vitest: app-router-production-server.test.ts — a next/dynamic()
+  // call site inside this package only gets preload metadata when the package
+  // is transpiled, matching Turbopack's foreign-code rule.
+  transpilePackages: ["fake-css-module-lib"],
 
   // Default is false — trailing slashes are stripped (redirects /about/ → /about)
   // trailingSlash: false,
@@ -90,6 +95,13 @@ const nextConfig: NextConfig = {
         destination: "/about",
         permanent: false,
       },
+      // Used by E2E: config-redirect.spec.ts — source params substituted into
+      // a redirect destination query.
+      {
+        source: "/query-param-redirect/:next",
+        destination: "/about?next=/:next&safe=1",
+        permanent: false,
+      },
       // Ported from Next.js v16.2.6:
       // test/e2e/app-dir/rsc-query-routing/next.config.js
       {
@@ -103,6 +115,12 @@ const nextConfig: NextConfig = {
   async rewrites() {
     return {
       beforeFiles: [
+        // Used by E2E: config-redirect.spec.ts — a source param substituted
+        // into a destination query value must stay one value.
+        {
+          source: "/query-param-rewrite/:term",
+          destination: "/nextjs-compat/search-params-key?q=:term&fixed=1",
+        },
         {
           source: "/route-cache-choice",
           destination: "/route-cache-identity/about",
@@ -308,7 +326,7 @@ const nextConfig: NextConfig = {
         source: "/(.*)",
         headers: [{ key: "X-E2E-Header", value: "vinext-e2e" }],
       },
-      // Used by E2E: config-redirect.spec.ts — middleware header override test (ON-8 #2)
+      // Used by E2E: config-redirect.spec.ts — middleware header override test
       // Middleware sets e2e-headers=middleware; this config rule sets e2e-headers=next.config.js.
       // Middleware always wins (matching Next.js behavior), so middleware's value takes precedence.
       {
