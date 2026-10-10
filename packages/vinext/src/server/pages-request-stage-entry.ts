@@ -23,7 +23,7 @@ import {
   cloneRequestWithHeaders,
   cloneRequestWithUrl,
   filterInternalHeaders,
-  isOpenRedirectShaped,
+  guardProtocolRelativeUrl,
 } from "./request-pipeline.js";
 import { notFoundStaticAssetResponse } from "./http-error-responses.js";
 import { assetPrefixPathname, isNextStaticPath } from "../utils/asset-prefix.js";
@@ -375,15 +375,11 @@ async function handleRequestImpl(
       );
     }
 
-    // Block protocol-relative URL open redirects in all shapes:
-    //   literal  //evil.com, /\\evil.com
-    //   encoded  /%5Cevil.com, /%2F/evil.com
-    // Browsers normalize backslash to forward slash, and percent-decode
-    // Location headers, so encoded variants must be rejected before any
-    // downstream redirect can echo them.
-    if (isOpenRedirectShaped(pathname)) {
-      return new Response("This page could not be found", { status: 404 });
-    }
+    // Redirect repeated slashes / backslashes like Next.js (//evil.com →
+    // /evil.com) and block encoded protocol-relative shapes (/%5Cevil.com,
+    // /%2F/evil.com) before any downstream redirect can echo them.
+    const protocolRelativeGuard = guardProtocolRelativeUrl(pathname, url.search);
+    if (protocolRelativeGuard) return protocolRelativeGuard;
     try {
       normalizePathnameForRouteMatchStrict(pathname);
     } catch {
@@ -596,7 +592,13 @@ async function handleRequestImpl(
             })
           : dispatched;
       },
-      serveFilesystemRoute: async (requestPathname, _stagedHeaders, phase, resolvedUrl) => {
+      serveFilesystemRoute: async (
+        requestPathname,
+        _stagedHeaders,
+        phase,
+        resolvedUrl,
+        filesystemRequest,
+      ) => {
         if (!assets) {
           // A host whose static handler runs ahead of vinext (Nitro) serves
           // public files itself. One gets here through a rewrite, or directly
@@ -605,14 +607,14 @@ async function handleRequestImpl(
           const publicFileFetcher = platformCtx?.publicFileFetcher;
           if (!publicFileFetcher || isImageOptimizationPath(requestPathname)) return false;
           return fetchWorkerFilesystemRoute(
-            request,
+            filesystemRequest,
             requestPathname,
             phase,
             (assetRequest) => Promise.resolve(publicFileFetcher.fetch(assetRequest)),
             publicFiles,
             basePath,
             assetPathPrefix,
-            true,
+            hadBasePath,
           );
         }
         if (isImageOptimizationPath(requestPathname)) {
@@ -631,13 +633,14 @@ async function handleRequestImpl(
           );
         }
         return fetchWorkerFilesystemRoute(
-          request,
+          filesystemRequest,
           requestPathname,
           phase,
           (assetRequest) => Promise.resolve(assets.fetch(assetRequest)),
           publicFiles,
           basePath,
           assetPathPrefix,
+          hadBasePath,
         );
       },
     };

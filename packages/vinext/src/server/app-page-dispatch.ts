@@ -1155,6 +1155,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
         options.middlewareContext,
       );
       const cachePolicy = {
+        dynamicStaleTimeSeconds: options.dynamicStaleTimeSeconds,
         isDraftMode,
         isDynamicError,
         isForceDynamic,

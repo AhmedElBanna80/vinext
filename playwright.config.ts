@@ -48,6 +48,7 @@ const projectServers = {
     testIgnore: [
       appRouterBrowserSpecificTests,
       "**/app-router/nextjs-compat/client-cache.spec.ts",
+      "**/app-router/nextjs-compat/prefetch-redirect.spec.ts",
       "**/app-router/nextjs-compat/route-handler-draft-cache.spec.ts",
       "**/app-router/nextjs-compat/segment-cache-client-params.spec.ts",
       "**/app-router/isr.spec.ts",
@@ -78,6 +79,7 @@ const projectServers = {
     testDir: "./tests/e2e/app-router/nextjs-compat",
     testMatch: [
       "client-cache.spec.ts",
+      "prefetch-redirect.spec.ts",
       "route-handler-draft-cache.spec.ts",
       "segment-cache-client-params.spec.ts",
     ],
@@ -600,6 +602,28 @@ const projectServers = {
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
     },
+  },
+  "module-federation": {
+    testDir: "./tests/e2e/module-federation",
+    use: { baseURL: "http://localhost:4220" },
+    server: {
+      command: "npx vp run vinext#build && npx vp build && npx vp preview --port 4220 --strictPort",
+      cwd: "./tests/fixtures/module-federation-host",
+      port: 4220,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    // Playwright starts web servers in order, so vinext is built before the
+    // remote imports vinext/client.
+    additionalServers: [
+      {
+        command: "npx vp build && npx vp preview --port 4221 --strictPort",
+        cwd: "./tests/fixtures/module-federation-remote",
+        port: 4221,
+        reuseExistingServer: !process.env.CI,
+        timeout: 60_000,
+      },
+    ],
   },
   "nextjs-worker-cloudflare": {
     testDir: "./tests/e2e/nextjs-worker",

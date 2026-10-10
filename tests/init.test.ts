@@ -739,8 +739,8 @@ describe("init — basic functionality", () => {
     expect(readFile(tmpDir, "vite.config.ts")).toContain("data: kvDataAdapter()");
     expect(readFile(tmpDir, "vite.config.ts")).toContain("cdn: workersCacheCdnAdapter()");
     expect(fs.existsSync(path.join(tmpDir, "worker", "index.ts"))).toBe(false);
+    expect(JSON.parse(readFile(tmpDir, "wrangler.jsonc")).cache).toBeUndefined();
     expect(JSON.parse(readFile(tmpDir, "wrangler.jsonc"))).toMatchObject({
-      cache: { enabled: true },
       main: "vinext/server/fetch-handler",
       version_metadata: { binding: "CF_VERSION_METADATA" },
     });
@@ -808,14 +808,61 @@ describe("init — basic functionality", () => {
     expect(output).toContain("run deploy:response-store");
   });
 
-  it("uses an existing Response Store config without rewriting its resource names", async () => {
+  // Earlier releases enabled the Worker-wide cache; init now generates it disabled.
+  it.each([{ cache: { enabled: true } }, { cache: { enabled: false } }, {}])(
+    "uses an existing Response Store config without rewriting its resource names (%j)",
+    async (cacheConfig) => {
+      setupProject(tmpDir, { router: "app" });
+      const responseStoreConfig = `${JSON.stringify(
+        {
+          name: "shared-response-store",
+          main: "./node_modules/@cloudflare/workers-response-store/dist/service.js",
+          compatibility_date: "2026-09-14",
+          ...cacheConfig,
+          exports: {
+            ResponseStoreBinding: { cache: { enabled: true } },
+            CacheMetadata: { type: "durable-object", storage: "sqlite" },
+          },
+          r2_buckets: [{ binding: "CACHE_BODIES", bucket_name: "shared-cache-bodies" }],
+          durable_objects: {
+            bindings: [{ name: "CACHE_METADATA", class_name: "CacheMetadata" }],
+          },
+        },
+        null,
+        2,
+      )}\n`;
+      writeFile(tmpDir, "wrangler.response-store.jsonc", responseStoreConfig);
+
+      await runInit(tmpDir, {
+        install: false,
+        cloudflare: {
+          legacyWrangler: true,
+          dataCache: "none",
+          cdnCache: "response-store",
+          imageOptimization: "none",
+          responseStoreMode: "service-binding",
+        },
+      });
+
+      expect(readFile(tmpDir, "wrangler.response-store.jsonc")).toBe(responseStoreConfig);
+      expect(JSON.parse(readFile(tmpDir, "wrangler.jsonc")).services).toContainEqual({
+        binding: "RESPONSE_STORE",
+        service: "shared-response-store",
+        entrypoint: "ResponseStoreService",
+      });
+    },
+  );
+
+  it("rejects a Response Store config with an invalid cache block before mutating the project", async () => {
     setupProject(tmpDir, { router: "app" });
-    const responseStoreConfig = `${JSON.stringify(
-      {
+    writeFile(
+      tmpDir,
+      "wrangler.response-store.jsonc",
+      JSON.stringify({
         name: "shared-response-store",
         main: "./node_modules/@cloudflare/workers-response-store/dist/service.js",
         compatibility_date: "2026-09-14",
-        cache: { enabled: true },
+        cache: { enabled: "yes" },
         exports: {
           ResponseStoreBinding: { cache: { enabled: true } },
           CacheMetadata: { type: "durable-object", storage: "sqlite" },
@@ -824,29 +871,23 @@ describe("init — basic functionality", () => {
         durable_objects: {
           bindings: [{ name: "CACHE_METADATA", class_name: "CacheMetadata" }],
         },
-      },
-      null,
-      2,
-    )}\n`;
-    writeFile(tmpDir, "wrangler.response-store.jsonc", responseStoreConfig);
+      }),
+    );
+    const before = snapshotProject(tmpDir);
 
-    await runInit(tmpDir, {
-      install: false,
-      cloudflare: {
-        legacyWrangler: true,
-        dataCache: "none",
-        cdnCache: "response-store",
-        imageOptimization: "none",
-        responseStoreMode: "service-binding",
-      },
-    });
-
-    expect(readFile(tmpDir, "wrangler.response-store.jsonc")).toBe(responseStoreConfig);
-    expect(JSON.parse(readFile(tmpDir, "wrangler.jsonc")).services).toContainEqual({
-      binding: "RESPONSE_STORE",
-      service: "shared-response-store",
-      entrypoint: "ResponseStoreService",
-    });
+    await expect(
+      runInit(tmpDir, {
+        install: false,
+        cloudflare: {
+          legacyWrangler: true,
+          dataCache: "none",
+          cdnCache: "response-store",
+          imageOptimization: "none",
+          responseStoreMode: "service-binding",
+        },
+      }),
+    ).rejects.toThrow("is missing required Response Store bindings");
+    expect(snapshotProject(tmpDir)).toBe(before);
   });
 
   it("rejects a Response Store config without ctx.exports before mutating the project", async () => {
@@ -951,7 +992,13 @@ describe("init — basic functionality", () => {
     expect(vite).not.toContain("clientOutDir:");
     const config = readFile(tmpDir, "cloudflare.config.ts");
     expect(config).toContain(
-      'assets: { notFoundHandling: "none", runWorkerFirst: ["/_vinext/static-cache/*"] }',
+      [
+        "    assets: {",
+        '      htmlHandling: "none",',
+        '      notFoundHandling: "none",',
+        '      runWorkerFirst: ["/*", "!/_next/static/*", "!/*/_next/static/*"],',
+        "    },",
+      ].join("\n"),
     );
     expect(config).toContain("ASSETS: bindings.assets()");
     expect(fs.existsSync(path.join(tmpDir, "wrangler.jsonc"))).toBe(false);
@@ -1079,13 +1126,15 @@ export default { plugins: [vinext({ cache: { cdn: customCdn() } })] };
           assets: {
             directory: "dist/client",
             binding: "ASSETS",
-            run_worker_first: ["/_vinext/static-cache/*"],
+            run_worker_first: ["/*", "!/_next/static/*", "!/*/_next/static/*"],
           },
         });
       } else {
         const config = readFile(tmpDir, "cloudflare.config.ts");
         expect(config).toContain("ASSETS: bindings.assets()");
-        expect(config).toContain('runWorkerFirst: ["/_vinext/static-cache/*"]');
+        expect(config).toContain(
+          'runWorkerFirst: ["/*", "!/_next/static/*", "!/*/_next/static/*"]',
+        );
       }
     },
   );
@@ -1287,6 +1336,153 @@ export default { plugins: [vinext({ cache: { cdn: customCdn() } })] };
       expect(pkg.scripts["build:vinext"]).toBe("vite build");
       expect(pkg.scripts["deploy:vinext"]).toBe("vinext-cloudflare deploy");
     }
+  });
+
+  it.each([false, true])(
+    "keeps asset-first serving for a static export (legacy Wrangler: %s)",
+    async (legacyWrangler) => {
+      setupProject(tmpDir, { router: "app" });
+      writeFile(
+        tmpDir,
+        "next.config.mjs",
+        'export default { output: "export", trailingSlash: true };\n',
+      );
+      await runInit(tmpDir, {
+        install: false,
+        cloudflare: {
+          dataCache: "none",
+          cdnCache: "none",
+          imageOptimization: "none",
+          legacyWrangler,
+        },
+      });
+      if (legacyWrangler) {
+        expect(JSON.parse(readFile(tmpDir, "wrangler.jsonc")).assets).toEqual({
+          directory: "dist/client",
+          not_found_handling: "none",
+          binding: "ASSETS",
+        });
+      } else {
+        const config = readFile(tmpDir, "cloudflare.config.ts");
+        expect(config).toContain('    assets: {\n      notFoundHandling: "none",\n    },\n');
+      }
+    },
+  );
+
+  it.each([
+    {
+      name: "a shorthand output property",
+      files: { "next.config.mjs": 'const output = "export";\nexport default { output };\n' },
+      isStaticExport: true,
+    },
+    {
+      name: "an inline Vite nextConfig",
+      files: {
+        "vite.config.ts":
+          'export default { plugins: [{ name: "vinext", __vinextNextConfig: { output: "export" } }] };\n',
+      },
+      isStaticExport: true,
+    },
+    {
+      name: "an output set from .env.production",
+      files: {
+        ".env.production": "STATIC_EXPORT=1\n",
+        "next.config.mjs":
+          'export default process.env.STATIC_EXPORT ? { output: "export" } : {};\n',
+      },
+      isStaticExport: true,
+    },
+    {
+      name: "an output set for production builds",
+      files: {
+        "next.config.mjs":
+          'export default process.env.NODE_ENV === "production" ? { output: "export" } : {};\n',
+      },
+      isStaticExport: true,
+    },
+    {
+      name: "an inline Vite nextConfig reading the root .env.production",
+      files: {
+        ".env.production": "STATIC_EXPORT=1\n",
+        "vite.config.ts":
+          'export default { plugins: [{ name: "vinext", __vinextNextConfig: { output: process.env.STATIC_EXPORT ? "export" : undefined } }] };\n',
+      },
+      isStaticExport: true,
+    },
+    {
+      name: "an output set from the dotenv of the Vite config's mode",
+      files: {
+        ".env.staging": "STATIC_EXPORT=1\n",
+        "vite.config.ts": 'export default { mode: "staging" };\n',
+        "next.config.mjs":
+          'export default process.env.STATIC_EXPORT ? { output: "export" } : {};\n',
+      },
+      isStaticExport: true,
+    },
+    {
+      name: "an output set from .env.production in the Vite envDir",
+      files: {
+        "config/.env.production": "STATIC_EXPORT=1\n",
+        "vite.config.ts": 'export default { envDir: "config" };\n',
+        "next.config.mjs":
+          'export default process.env.STATIC_EXPORT ? { output: "export" } : {};\n',
+      },
+      isStaticExport: true,
+    },
+    {
+      name: "a next.config under the Vite config's root",
+      files: {
+        "vite.config.ts": 'export default { root: "web" };\n',
+        "web/next.config.mjs": 'export default { output: "export" };\n',
+      },
+      isStaticExport: true,
+    },
+    {
+      name: "an output set from .env.production under the Vite config's root",
+      files: {
+        "web/.env.production": "STATIC_EXPORT=1\n",
+        "vite.config.ts": 'export default { root: "web" };\n',
+        "web/next.config.mjs":
+          'export default process.env.STATIC_EXPORT ? { output: "export" } : {};\n',
+      },
+      isStaticExport: true,
+    },
+    {
+      name: "an output set for production builds by a Vite config changing NODE_ENV",
+      files: {
+        "vite.config.ts": 'process.env.NODE_ENV = "development";\nexport default {};\n',
+        "next.config.mjs":
+          'export default process.env.NODE_ENV === "production" ? { output: "export" } : {};\n',
+      },
+      isStaticExport: true,
+    },
+    {
+      name: "a Vite envDir dotenv expanding the NODE_ENV a Vite config set",
+      files: {
+        "config/.env.production": "STATIC_EXPORT=$NODE_ENV\n",
+        "vite.config.ts":
+          'process.env.NODE_ENV = "development";\nexport default { envDir: "config" };\n',
+        "next.config.mjs":
+          'export default process.env.STATIC_EXPORT === "development" ? { output: "export" } : {};\n',
+      },
+      isStaticExport: true,
+    },
+    {
+      name: "a commented-out output",
+      files: { "next.config.mjs": '// output: "export",\nexport default {};\n' },
+      isStaticExport: false,
+    },
+  ])("reads the effective config for $name", async ({ files, isStaticExport }) => {
+    setupProject(tmpDir, { router: "app", typeModule: true });
+    for (const [file, content] of Object.entries(files)) writeFile(tmpDir, file, content);
+    await runInit(tmpDir, {
+      install: false,
+      cloudflare: { dataCache: "none", cdnCache: "none", imageOptimization: "none" },
+    });
+    expect(readFile(tmpDir, "cloudflare.config.ts").includes('runWorkerFirst: ["/*"')).toBe(
+      !isStaticExport,
+    );
+    expect(process.env.STATIC_EXPORT).toBeUndefined();
   });
 
   it.each(["service-binding", "self-contained", "workers-cache", "none"] as const)(

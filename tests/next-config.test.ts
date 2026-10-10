@@ -431,6 +431,20 @@ describe("loadNextConfig function-form defaultConfig argument", () => {
     const config = await loadNextConfig(tmpDir, PHASE_PRODUCTION_BUILD);
     expect(config?.pageExtensions).toEqual(["tsx", "ts", "jsx", "js", "page.ts"]);
   });
+
+  it("passes the real compress default to a function-form config", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.js"),
+      `module.exports = (phase, { defaultConfig }) => ({\n` +
+        `  compress: defaultConfig.compress && false,\n` +
+        `});\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir, PHASE_PRODUCTION_BUILD);
+    expect(config?.compress).toBe(false);
+    expect((await resolveNextConfig(config)).compress).toBe(false);
+  });
 });
 
 describe("loadNextConfig with CJS globals in next.config.ts", () => {
@@ -2124,6 +2138,17 @@ describe("resolveNextConfig serverActionsBodySizeLimit", () => {
   });
 });
 
+describe("resolveNextConfig compress", () => {
+  // Next.js installs its compression middleware unless `compress` is exactly
+  // false (packages/next/src/server/lib/router-server.ts).
+  it("defaults to true and is disabled only by compress: false", async () => {
+    expect((await resolveNextConfig(null)).compress).toBe(true);
+    expect((await resolveNextConfig({})).compress).toBe(true);
+    expect((await resolveNextConfig({ compress: true })).compress).toBe(true);
+    expect((await resolveNextConfig({ compress: false })).compress).toBe(false);
+  });
+});
+
 describe("resolveNextConfig disableOptimizedLoading", () => {
   // Regression for #1519: `experimental.disableOptimizedLoading` defaults to
   // `false` and is read into the resolved config. The default drives the
@@ -2600,6 +2625,7 @@ describe("detectNextIntlConfig", () => {
       assetPrefix: "",
       basePath: "",
       trailingSlash: false,
+      compress: true,
       skipProxyUrlNormalize: false,
       typescript: {},
       output: "",

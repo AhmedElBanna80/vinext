@@ -49,6 +49,7 @@ import {
 } from "./routing/file-matcher.js";
 import { createSSRHandler } from "./server/dev-server.js";
 import { handleApiRoute } from "./server/api-handler.js";
+import { signalFromNodeResponse } from "./server/node-response-signal.js";
 import {
   DEFAULT_DEVICE_SIZES,
   DEFAULT_IMAGE_SIZES,
@@ -144,6 +145,7 @@ import {
   INTERNAL_HEADERS,
   isOpenRedirectShaped,
   normalizeTrailingSlash,
+  sendRepeatedSlashRedirect,
   VINEXT_INTERNAL_HEADERS,
 } from "./server/request-pipeline.js";
 import {
@@ -235,6 +237,7 @@ import { createDynamicPreloadMetadataPlugin } from "./plugins/dynamic-preload-me
 import { createOgInlineFetchAssetsPlugin, createOgAssetsPlugin } from "./plugins/og-assets.js";
 import { createOgHarfbuzzPlugin } from "./plugins/og-harfbuzz.js";
 import { createUseCacheCallablePlugin } from "./plugins/use-cache-callable.js";
+import { cacheFlightCodecPlugin } from "./plugins/cache-flight-codec.js";
 import { generateRouteTypes } from "./typegen.js";
 import {
   mergeOptimizeDepsExclude,
@@ -315,6 +318,11 @@ import {
   type EmittedModuleFileNameResolver,
 } from "./plugins/import-meta-url.js";
 import { createWorkerImageImportsPlugin } from "./plugins/worker-image-imports.js";
+import {
+  createWorkerServerOnlyImportsPlugin,
+  SERVER_ONLY_SPECIFIER_RE,
+} from "./plugins/worker-server-only-imports.js";
+import { createWorkerUseServerPlugins } from "./plugins/worker-use-server.js";
 import { createRequireContextPlugin } from "./plugins/require-context.js";
 import {
   commonJsEsmFacadeOptimizeDepsPlugin,
@@ -333,7 +341,7 @@ import {
   mayFoldChangeScannedImports,
   replaceConsumerEnvironmentConditions,
 } from "./plugins/typeof-window.js";
-import { hasMdxFiles } from "./utils/mdx-scan.js";
+import { hasMdxFiles, loadMdxEsmReader, pageExtensionsIncludeMdx } from "./utils/mdx-scan.js";
 import { scanPublicFileRoutes } from "./utils/public-routes.js";
 import { publicFilePathVariants } from "./utils/public-file-path.js";
 import {
@@ -452,6 +460,18 @@ if (earlyViteCliInvocation) {
 installSocketErrorBackstop();
 
 type ASTNode = ReturnType<typeof parseAst>["body"][number]["parent"];
+
+// In dev, `server-only` imports that only Vite's dependency scan reaches
+// resolve to this virtual module, which fails when loaded. The importer path
+// follows the prefix.
+const INVALID_SERVER_ONLY_ID_PREFIX = "\0vinext:invalid-server-only:";
+const INVALID_SERVER_ONLY_ID_RE = /^\0vinext:invalid-server-only:/;
+
+function createServerOnlyClientImportError(importer: string | undefined): Error {
+  return new Error(
+    `You're importing a module that depends on "server-only". This API is only available in Server Components in the App Router, but ${importer || "this module"} is reachable from a client bundle.`,
+  );
+}
 
 function hasServerOnlyMarkerImport(code: string): boolean {
   if (!code.includes("server-only")) return false;
@@ -1547,7 +1567,10 @@ export type VinextOptions = {
    * Configure cache handlers declaratively, so you don't need a custom worker
    * entry that calls `setDataCacheHandler()` / `setCdnCacheAdapter()`. Each slot
    * is a `{ adapter, options }` descriptor pointing at an adapter module whose
-   * default export is a factory; the plugin registers them automatically on the
+   * default export is a factory function or a class; either receives one
+   * `{ env, options }` argument (classes are invoked with `new`, other
+   * functions are called; see `CacheAdapterDescriptor.adapter` for how
+   * classes are recognised). The plugin registers them automatically on the
    * first request, passing the host `env` (Worker bindings) so adapters that
    * need a binding — e.g. a KV namespace — can read it.
    *
@@ -1949,7 +1972,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         if (useServerIndex === -1) {
           throw new Error("vinext: Failed to locate @vitejs/plugin-rsc use-server plugin.");
         }
-        plugins.splice(useServerIndex, 0, useCachePlugin);
+        plugins.splice(useServerIndex, 0, cacheFlightCodecPlugin(), useCachePlugin);
         return plugins.map(scopeRscPlugin);
       })
       .catch((cause) => {
@@ -3460,6 +3483,15 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             // plugin here rather than copying user plugins and duplicating them.
             plugins: () => [
               createWorkerImageImportsPlugin({ deploymentId: nextConfig.deploymentId }),
+              createWorkerServerOnlyImportsPlugin(),
+              ...(rscPluginModulePromise && resolvedRscPath
+                ? [
+                    createWorkerUseServerPlugins({
+                      rscPluginModule: rscPluginModulePromise,
+                      rscPluginPath: resolvedRscPath,
+                    }),
+                  ]
+                : []),
             ],
           },
           // Let OPTIONS requests pass through Vite's CORS middleware to our
@@ -4948,6 +4980,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 inlineCss: nextConfig?.inlineCss,
                 globalNotFound: nextConfig?.globalNotFound,
                 cacheComponents: nextConfig?.cacheComponents,
+                readMdxEsm:
+                  !nextConfig?.cacheComponents &&
+                  pageExtensionsIncludeMdx(nextConfig?.pageExtensions ?? [])
+                    ? await loadMdxEsmReader(root)
+                    : null,
                 prefetchInlining: nextConfig?.prefetchInlining,
                 hasServerActions,
                 actionOwners: this.environment.config.command === "build" ? undefined : null,
@@ -5632,24 +5669,6 @@ export const loadServerActionClient = ${
           next();
         });
 
-        // Match Next.js dev behavior: allow the server to start, then reject
-        // /_next requests while public/_next exists. This runs before Vite's
-        // public-file middleware and re-checks the filesystem on every request,
-        // so creating the directory after startup cannot bypass the guard.
-        server.middlewares.use((req, _res, next) => {
-          try {
-            assertNoPublicNextRequestConflict({
-              root: server.config.root,
-              publicDir: server.config.publicDir === "" ? null : server.config.publicDir,
-              basePath: nextConfig.basePath ?? "",
-              requestUrl: req.url ?? "/",
-            });
-            next();
-          } catch (error) {
-            next(error);
-          }
-        });
-
         // Watch route files for additions/removals to invalidate route cache.
         const pageExtensions = fileMatcher.extensionRegex;
 
@@ -6118,6 +6137,34 @@ export const loadServerActionClient = ${
             return;
           }
           next();
+        });
+
+        // Like Next.js, redirect any path containing a backslash or a repeated
+        // slash once the origin check has passed (router-server.ts runs
+        // blockCrossSiteDEV before resolveRoutes) and before anything below
+        // parses it: `new URL("//", base)` throws, and `//host/x` parses as a
+        // different origin.
+        server.middlewares.use((req, res, next) => {
+          if (!sendRepeatedSlashRedirect(req.url ?? "/", res)) next();
+        });
+
+        // Match Next.js dev behavior: allow the server to start, then reject
+        // /_next requests while public/_next exists. Like next-dev-server.ts,
+        // this runs after the repeated-slash redirect but before Vite's
+        // public-file middleware, and re-checks the filesystem on every request,
+        // so creating the directory after startup cannot bypass the guard.
+        server.middlewares.use((req, _res, next) => {
+          try {
+            assertNoPublicNextRequestConflict({
+              root: server.config.root,
+              publicDir: server.config.publicDir === "" ? null : server.config.publicDir,
+              basePath: nextConfig.basePath ?? "",
+              requestUrl: req.url ?? "/",
+            });
+            next();
+          } catch (error) {
+            next(error);
+          }
         });
 
         // Vite serves public files for every method. Intercept only mutations
@@ -6729,6 +6776,7 @@ export const loadServerActionClient = ${
               const webRequest = new Request(new URL(routeUrl, requestOrigin), {
                 method,
                 headers: nodeRequestHeaders,
+                signal: signalFromNodeResponse(res),
               });
 
               const applyRequestHeadersToNodeRequest = (nextRequestHeaders: Headers) => {
@@ -6762,6 +6810,7 @@ export const loadServerActionClient = ${
                       const middlewareRequest = new Request(new URL(middlewareUrl, mwOrigin), {
                         method: req.method,
                         headers: nodeRequestHeaders,
+                        signal: webRequest.signal,
                       });
                       const result = await runMiddleware(
                         getPagesRunner(),
@@ -6890,6 +6939,7 @@ export const loadServerActionClient = ${
                     method: externalMethod,
                     // Use the pipeline's current request headers (post-middleware)
                     headers: currentRequest.headers,
+                    signal: currentRequest.signal,
                   };
                   if (hasBody) {
                     const { Readable } = await import("node:stream");
@@ -7324,6 +7374,39 @@ export const loadServerActionClient = ${
     // packages/next/src/build/webpack-config.ts (server-only/client-only layers)
     {
       name: "vinext:validate-server-only-client-imports",
+      // Pages-only client graphs are guarded at resolution, as in Next.js, so
+      // every specifier form (static, dynamic, re-export, require) and file
+      // type is caught before the no-op `server-only` alias applies, and the
+      // importing module itself fails. Pages data exports are stripped before
+      // their imports resolve.
+      resolveId: {
+        order: "pre",
+        filter: { id: SERVER_ONLY_SPECIFIER_RE },
+        handler(_source, importer) {
+          const environment = this.environment;
+          if (environment?.name !== "client" || hasAppDir) return null;
+          // Vite's dev dependency scan also resolves imports of untransformed
+          // sources, including stripped data exports, whose importers never
+          // enter the client module graph. Those resolve to a virtual module
+          // that fails only if it is ever loaded; the scan never loads it.
+          if (
+            environment.mode === "dev" &&
+            !(importer && environment.moduleGraph.getModuleById(importer))
+          ) {
+            return {
+              id: INVALID_SERVER_ONLY_ID_PREFIX + (importer ?? ""),
+              moduleSideEffects: true,
+            };
+          }
+          throw createServerOnlyClientImportError(importer);
+        },
+      },
+      load: {
+        filter: { id: INVALID_SERVER_ONLY_ID_RE },
+        handler(id) {
+          throw createServerOnlyClientImportError(id.slice(INVALID_SERVER_ONLY_ID_PREFIX.length));
+        },
+      },
       transform: {
         filter: {
           id: {
@@ -7333,7 +7416,11 @@ export const loadServerActionClient = ${
           code: "server-only",
         },
         handler(code) {
-          if (this.environment?.name !== "client") return null;
+          if (this.environment?.name !== "client" || !hasAppDir) return null;
+          // @vitejs/plugin-rsc replaces a "use server" module in the client
+          // graph with server reference proxies, so its server-only imports
+          // never reach the browser. Pages-only builds have no such transform,
+          // which is why they are guarded at resolution above instead.
           if (getLeadingReactDirective(code) === "use server") return null;
           if (!hasServerOnlyMarkerImport(code)) return null;
 
@@ -7812,7 +7899,7 @@ export const loadServerActionClient = ${
     // module IDs belong to each dynamic() boundary. The runtime resolves those
     // IDs through Vite's build manifest so it can emit boundary-scoped preload
     // hints with the request CSP nonce.
-    createDynamicPreloadMetadataPlugin(),
+    createDynamicPreloadMetadataPlugin(() => nextConfig?.turbopackTranspilePackages ?? []),
     importMetaUrlCapability.vitePlugin,
     createExtensionlessDynamicImportPlugin(),
     // Expand Webpack's build-time `require.context(...)` into a static module
@@ -7941,6 +8028,9 @@ export const loadServerActionClient = ${
           }
           const manifest = {
             prerenderSecret,
+            // next.config `compress`, read by the Node production server for
+            // every entry shape (including Worker-style facades).
+            compress: nextConfig?.compress !== false,
             ...(serverRuntimeOutputDirs.size === 0
               ? {}
               : {
@@ -8530,7 +8620,7 @@ export const loadServerActionClient = ${
     plugins.push(createRscReferenceValidationNormalizerPlugin());
     plugins.push(createRscClientReferenceLoadersPlugin());
   } else if (manualUseCachePluginPromise) {
-    plugins.push(manualUseCachePluginPromise);
+    plugins.push(cacheFlightCodecPlugin(), manualUseCachePluginPromise);
   }
   plugins.push({
     name: "vinext:plain-pages-build-config",
@@ -8597,6 +8687,13 @@ async function writeWebResponseToNodeRes(
   res: import("node:http").ServerResponse,
   response: Response,
 ): Promise<void> {
+  if (res.destroyed) {
+    // The client left while the response was produced; nobody will read it.
+    response.body?.cancel().catch(() => {
+      /* ignore cancellation failures on discarded bodies */
+    });
+    return;
+  }
   const nodeHeaders: Record<string, string | string[]> = {};
   response.headers.forEach((value, key) => {
     if (key === "set-cookie") return;
@@ -8617,13 +8714,23 @@ async function writeWebResponseToNodeRes(
   }
 
   if (response.body) {
-    const { Readable } = await import("node:stream");
+    const { Readable, pipeline } = await import("node:stream");
     const nodeStream = Readable.fromWeb(response.body as import("stream/web").ReadableStream);
+    // pipeline() destroys (and so cancels) the body when the client disconnects
+    // and reports that as ERR_STREAM_PREMATURE_CLOSE. A body that ends early
+    // reports the same code, so record whether the client closed first.
+    let clientDisconnected = false;
+    res.once("close", () => {
+      clientDisconnected = !res.writableFinished && !nodeStream.errored;
+    });
     await new Promise<void>((resolve, reject) => {
-      nodeStream.on("error", reject);
-      res.on("error", reject);
-      nodeStream.pipe(res);
-      nodeStream.on("end", resolve);
+      pipeline(nodeStream, res, (error) => {
+        if (error && !(clientDisconnected && error.code === "ERR_STREAM_PREMATURE_CLOSE")) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      });
     });
   } else {
     res.end();
