@@ -97,7 +97,6 @@ function createCommonOptions() {
     async () =>
       '<!DOCTYPE html><html><head></head><body><div id="__next">__NEXT_MAIN__</div><!-- __NEXT_SCRIPTS__ --></body></html>',
   );
-  const renderIsrPassToStringAsync = vi.fn(async () => "<div>cached-body</div>");
   const renderToReadableStream = vi.fn(async () => createStream(["<div>live-body</div>"]));
 
   return {
@@ -105,7 +104,6 @@ function createCommonOptions() {
     createPageElement,
     isrSet,
     renderDocumentToString,
-    renderIsrPassToStringAsync,
     renderToReadableStream,
     options: {
       assetTags: '<script type="module" src="/entry.js" crossorigin></script>',
@@ -313,7 +311,6 @@ describe("pages page response", () => {
     await settleMicrotasks();
 
     expect(common.createPageElement).toHaveBeenCalledTimes(1);
-    expect(common.renderIsrPassToStringAsync).not.toHaveBeenCalled();
     expect(common.isrSet).toHaveBeenCalledTimes(1);
     expect(common.isrSet).toHaveBeenCalledWith(
       "pages:/posts/post",
@@ -324,6 +321,32 @@ describe("pages page response", () => {
       }),
       { cacheControl: { revalidate: 60, expire: 300 } },
     );
+  });
+
+  it("finishes the ISR write before returning for a stale regeneration", async () => {
+    // Stale regeneration has no response whose lifetime the write can extend.
+    const common = createCommonOptions();
+    let written = false;
+    common.isrSet.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      written = true;
+    });
+
+    const response = await renderPagesPageResponse({
+      ...common.options,
+      isStaleRegeneration: true,
+      DocumentComponent: null,
+      getSSRHeadHTML: undefined,
+      isrRevalidateSeconds: 60,
+    });
+
+    expect(written).toBe(true);
+    expect(common.isrSet).toHaveBeenCalledWith(
+      "pages:/posts/post",
+      expect.objectContaining({ html: expect.stringContaining("<div>live-body</div>") }),
+      { cacheControl: { revalidate: 60 } },
+    );
+    await response.body?.cancel();
   });
 
   it("reports the resolved Pages tag after an on-demand regeneration", async () => {
@@ -408,7 +431,6 @@ describe("pages page response", () => {
       await expect(response.text()).rejects.toThrow("stream failed");
       await settleMicrotasks();
 
-      expect(common.renderIsrPassToStringAsync).not.toHaveBeenCalled();
       expect(common.isrSet).not.toHaveBeenCalled();
       expect(consoleError).toHaveBeenCalledWith(
         "[vinext] Pages ISR cache write failed for pages:/posts/post:",
@@ -791,7 +813,6 @@ describe("pages page response", () => {
 
     expect(response.headers.get("cache-control")).toBe("no-store, must-revalidate");
     expect(response.headers.get("x-vinext-cache")).toBeNull();
-    expect(common.renderIsrPassToStringAsync).not.toHaveBeenCalled();
     expect(common.isrSet).not.toHaveBeenCalled();
   });
 
@@ -1339,7 +1360,6 @@ describe("pages page response", () => {
 
     const result = await resolvePagesPageData({
       applyRequestContexts: vi.fn(),
-      buildId: "build-123",
       isDataReq: false,
       createGsspReqRes: vi.fn() as never,
       createPageElement: vi.fn(),
@@ -1362,7 +1382,7 @@ describe("pages page response", () => {
       safeJsonStringify: JSON.stringify,
       sanitizeDestination: (d) => d,
       triggerBackgroundRegeneration: vi.fn(),
-      renderIsrPassToStringAsync: vi.fn(async () => "<p>cached</p>"),
+      renderIsrDocument: vi.fn(async () => {}),
       userAgent: "Googlebot",
     });
 
@@ -1395,7 +1415,6 @@ describe("pages page response", () => {
 
     const result = await resolvePagesPageData({
       applyRequestContexts: vi.fn(),
-      buildId: "build-123",
       isDataReq: false,
       createGsspReqRes: vi.fn() as never,
       createPageElement: vi.fn(),
@@ -1417,7 +1436,7 @@ describe("pages page response", () => {
       safeJsonStringify: JSON.stringify,
       sanitizeDestination: (d) => d,
       triggerBackgroundRegeneration: vi.fn(),
-      renderIsrPassToStringAsync: vi.fn(async () => "<p>cached</p>"),
+      renderIsrDocument: vi.fn(async () => {}),
       userAgent: "Googlebot",
       ifNoneMatch: expectedEtag,
     });
@@ -1453,7 +1472,6 @@ describe("pages page response", () => {
 
     const result = await resolvePagesPageData({
       applyRequestContexts: vi.fn(),
-      buildId: "build-123",
       isDataReq: false,
       createGsspReqRes: vi.fn() as never,
       createPageElement: vi.fn(),
@@ -1475,7 +1493,7 @@ describe("pages page response", () => {
       safeJsonStringify: JSON.stringify,
       sanitizeDestination: (d) => d,
       triggerBackgroundRegeneration: vi.fn(),
-      renderIsrPassToStringAsync: vi.fn(async () => "<p>cached</p>"),
+      renderIsrDocument: vi.fn(async () => {}),
       userAgent: "Googlebot",
       ifNoneMatch: expectedEtag,
       // Next.js gives a page no Last-Modified, so fresh() sends it in full.
@@ -1515,7 +1533,6 @@ describe("pages page response", () => {
     );
     const result = await resolvePagesPageData({
       applyRequestContexts: vi.fn(),
-      buildId: "build-123",
       isDataReq: false,
       createGsspReqRes: vi.fn() as never,
       createPageElement: vi.fn(),
@@ -1537,7 +1554,7 @@ describe("pages page response", () => {
       safeJsonStringify: JSON.stringify,
       sanitizeDestination: (d) => d,
       triggerBackgroundRegeneration: vi.fn(),
-      renderIsrPassToStringAsync: vi.fn(async () => "<p>cached</p>"),
+      renderIsrDocument: vi.fn(async () => {}),
       userAgent: "Googlebot",
       ifNoneMatch: expectedEtag,
     }).finally(() => setCdnCacheAdapter(new DefaultCdnCacheAdapter()));
@@ -1575,7 +1592,6 @@ describe("pages page response", () => {
 
     const result = await resolvePagesPageData({
       applyRequestContexts: vi.fn(),
-      buildId: "build-123",
       isDataReq: false,
       createGsspReqRes: vi.fn() as never,
       createPageElement: vi.fn(),
@@ -1597,7 +1613,7 @@ describe("pages page response", () => {
       safeJsonStringify: JSON.stringify,
       sanitizeDestination: (d) => d,
       triggerBackgroundRegeneration: vi.fn(),
-      renderIsrPassToStringAsync: vi.fn(async () => "<p>stale</p>"),
+      renderIsrDocument: vi.fn(async () => {}),
       userAgent: "Googlebot",
     });
 
@@ -1631,7 +1647,6 @@ describe("pages page response", () => {
 
     const result = await resolvePagesPageData({
       applyRequestContexts: vi.fn(),
-      buildId: "build-123",
       isDataReq: false,
       createGsspReqRes: vi.fn() as never,
       createPageElement: vi.fn(),
@@ -1653,7 +1668,7 @@ describe("pages page response", () => {
       safeJsonStringify: JSON.stringify,
       sanitizeDestination: (d) => d,
       triggerBackgroundRegeneration: vi.fn(),
-      renderIsrPassToStringAsync: vi.fn(async () => "<p>stale</p>"),
+      renderIsrDocument: vi.fn(async () => {}),
       userAgent: "Googlebot",
       ifNoneMatch: expectedEtag,
     });
@@ -1689,7 +1704,6 @@ describe("pages page response", () => {
 
     const result = await resolvePagesPageData({
       applyRequestContexts: vi.fn(),
-      buildId: "build-123",
       isDataReq: false,
       createGsspReqRes: vi.fn() as never,
       createPageElement: vi.fn(),
@@ -1711,7 +1725,7 @@ describe("pages page response", () => {
       safeJsonStringify: JSON.stringify,
       sanitizeDestination: (d) => d,
       triggerBackgroundRegeneration: vi.fn(),
-      renderIsrPassToStringAsync: vi.fn(async () => "<p>stale</p>"),
+      renderIsrDocument: vi.fn(async () => {}),
       userAgent: "Mozilla/5.0 Chrome/120",
       ifNoneMatch: etag,
     });
@@ -1773,7 +1787,6 @@ describe("pages page response", () => {
 
     const result = await resolvePagesPageData({
       applyRequestContexts: vi.fn(),
-      buildId: "build-123",
       isDataReq: false,
       createGsspReqRes: vi.fn() as never,
       createPageElement: vi.fn(),
@@ -1795,7 +1808,7 @@ describe("pages page response", () => {
       safeJsonStringify: JSON.stringify,
       sanitizeDestination: (d) => d,
       triggerBackgroundRegeneration: vi.fn(),
-      renderIsrPassToStringAsync: vi.fn(async () => "<p>cached</p>"),
+      renderIsrDocument: vi.fn(async () => {}),
       userAgent: "Googlebot",
       ifNoneMatch: expectedEtag,
       requestCacheControl: "no-cache",
@@ -1831,7 +1844,6 @@ describe("pages page response", () => {
 
     const result = await resolvePagesPageData({
       applyRequestContexts: vi.fn(),
-      buildId: "build-123",
       isDataReq: false,
       createGsspReqRes: vi.fn() as never,
       createPageElement: vi.fn(),
@@ -1853,7 +1865,7 @@ describe("pages page response", () => {
       safeJsonStringify: JSON.stringify,
       sanitizeDestination: (d) => d,
       triggerBackgroundRegeneration: vi.fn(),
-      renderIsrPassToStringAsync: vi.fn(async () => "<p>stale</p>"),
+      renderIsrDocument: vi.fn(async () => {}),
       userAgent: "Googlebot",
       ifNoneMatch: expectedEtag,
       requestCacheControl: "no-cache",
