@@ -28,6 +28,7 @@ import { fnv1a64, sha256Hex } from "../utils/hash.js";
 import { isInsideUnifiedScope, getRequestContext } from "./unified-request-context.js";
 import { workUnitAsyncStorage } from "./internal/work-unit-async-storage.js";
 import { makeHangingPromise } from "./internal/make-hanging-promise.js";
+import { isInsideWorkStoreScope } from "./internal/work-store-scope.js";
 import { encodeCacheTag, encodeCacheTags } from "../utils/encode-cache-tag.js";
 import { getCdnCacheAdapter } from "./cdn-cache.js";
 import { getDataCacheHandler, type CachedFetchValue } from "./cache-handler.js";
@@ -492,6 +493,11 @@ const UNSTABLE_CACHE_KEY_PREFIX = "unstable_cache:v2";
 const _unstableCacheAls = getOrCreateAls<boolean>("vinext.unstableCache.als");
 // The "use cache" scope registered by cache-runtime.ts, read without importing it.
 const _useCacheContextAls = getOrCreateAls<unknown>("vinext.cacheRuntime.contextAls");
+// The "use cache" scope an unstable_cache callback started in, so a call made
+// from it can tell that no "use cache" function sits between the two.
+const _unstableCacheCallbackAls = getOrCreateAls<{ useCacheContext: unknown }>(
+  "vinext.unstableCache.callbackAls",
+);
 
 /**
  * Wrapper used to serialize `unstable_cache` results so that `undefined` can
@@ -527,6 +533,23 @@ function tryDeserializeUnstableCacheResult(body: string): UnstableCacheReadResul
  */
 export function isInsideUnstableCacheScope(): boolean {
   return _unstableCacheAls.getStore() === true;
+}
+
+/**
+ * Whether an unstable_cache call is nested in another one's callback, as
+ * Next.js's `isNestedUnstableCache` decides: only where Next.js has a work
+ * store (not in Pages Router or outside a render), and only when the
+ * innermost cache scope is that callback rather than a "use cache" function
+ * it called.
+ * Source: https://github.com/vercel/next.js/blob/canary/packages/next/src/server/web/spec-extension/unstable-cache.ts
+ */
+function isNestedUnstableCacheCall(): boolean {
+  const callback = _unstableCacheCallbackAls.getStore();
+  return (
+    callback !== undefined &&
+    callback.useCacheContext === _useCacheContextAls.getStore() &&
+    isInsideWorkStoreScope()
+  );
 }
 
 type UnstableCacheOptions = {
@@ -586,7 +609,11 @@ async function refreshUnstableCacheResult<Args extends unknown[], Result>(
   tags: string[],
   revalidateSeconds: number | false | undefined,
 ): Promise<Result> {
-  const result = await _unstableCacheAls.run(true, () => fn(...args));
+  const result = await _unstableCacheAls.run(true, () =>
+    _unstableCacheCallbackAls.run({ useCacheContext: _useCacheContextAls.getStore() }, () =>
+      fn(...args),
+    ),
+  );
 
   const cacheValue: CachedFetchValue = {
     kind: "FETCH",
@@ -666,7 +693,10 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
     const cacheKey = `${UNSTABLE_CACHE_KEY_PREFIX}:${await sha256Hex(invocationKey)}`;
 
     const isDraftMode = isDraftModeEnabled();
-    if (!isDraftMode) {
+    // Like Next.js, an unstable_cache nested in another's callback skips the
+    // read and reruns, so regenerating the outer entry also refreshes what it
+    // calls. The fresh result is still stored.
+    if (!isDraftMode && !isNestedUnstableCacheCall()) {
       // Try to get from cache. Stale entries are usable in normal App Router
       // requests, but foreground-refresh inside revalidation scopes so the
       // regenerated page/route stores fresh data.

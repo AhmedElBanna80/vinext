@@ -5898,6 +5898,83 @@ describe("next/cache shim", () => {
     setCacheHandler(new MemoryCacheHandler());
   });
 
+  // Next.js bypasses the read for an unstable_cache nested in another's
+  // callback in an App Router render, so revalidating the outer entry reruns
+  // the inner one too. Pages Router and an intervening "use cache" keep the read.
+  // Source: https://github.com/vercel/next.js/blob/canary/packages/next/src/server/web/spec-extension/unstable-cache.ts
+  async function runNestedUnstableCacheRevalidation(options: {
+    appRouter: boolean;
+    useCacheBetween?: boolean;
+  }) {
+    const { unstable_cache, revalidateTag, setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+    const { runInWorkStoreScope } =
+      await import("../packages/vinext/src/shims/internal/work-store-scope.js");
+
+    setCacheHandler(new MemoryCacheHandler());
+    const id = `${options.appRouter ? "app" : "pages"}-${options.useCacheBetween ? "use-cache" : "direct"}`;
+    // No soft tags are set, as in a Server Action before its rerender.
+    const request = <T>(fn: () => Promise<T>) =>
+      runWithRequestContext(createRequestContext(), () =>
+        options.appRouter ? runInWorkStoreScope(fn) : fn(),
+      );
+
+    try {
+      let innerCalls = 0;
+      const inner = unstable_cache(async () => `inner-${++innerCalls}`, [id, "inner"], {
+        revalidate: 360,
+      });
+      // The "use cache" entry is revalidated together with the outer one.
+      const between = registerCachedFunction(async () => {
+        const { cacheTag } = await import("../packages/vinext/src/shims/cache.js");
+        cacheTag(`${id}-outer`);
+        return inner();
+      }, `test:nested-unstable-cache-${id}`);
+      const outer = unstable_cache(
+        () => (options.useCacheBetween ? between() : inner()),
+        [id, "outer"],
+        { revalidate: 1000, tags: [`${id}-outer`] },
+      );
+
+      const first = await request(() => outer());
+      expect(await request(() => outer())).toBe(first);
+      // A direct call still reads the entry the nested call stored.
+      expect(await request(() => inner())).toBe(first);
+
+      await request(async () => revalidateTag(`${id}-outer`));
+
+      return { first, afterRevalidate: await request(() => outer()), innerCalls };
+    } finally {
+      setCacheHandler(new MemoryCacheHandler());
+    }
+  }
+
+  it("unstable_cache reruns a nested unstable_cache when the outer entry revalidates", async () => {
+    expect(await runNestedUnstableCacheRevalidation({ appRouter: true })).toEqual({
+      first: "inner-1",
+      afterRevalidate: "inner-2",
+      innerCalls: 2,
+    });
+  });
+
+  it("unstable_cache reads a nested unstable_cache outside an App Router render", async () => {
+    expect(await runNestedUnstableCacheRevalidation({ appRouter: false })).toEqual({
+      first: "inner-1",
+      afterRevalidate: "inner-1",
+      innerCalls: 1,
+    });
+  });
+
+  it("unstable_cache reads an unstable_cache called through a use cache function", async () => {
+    expect(
+      await runNestedUnstableCacheRevalidation({ appRouter: true, useCacheBetween: true }),
+    ).toEqual({ first: "inner-1", afterRevalidate: "inner-1", innerCalls: 1 });
+  });
+
   it("revalidateTag accepts optional cacheLife profile (Next.js 16)", async () => {
     const { revalidateTag, setCacheHandler, MemoryCacheHandler } =
       await import("../packages/vinext/src/shims/cache.js");
