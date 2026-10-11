@@ -69,6 +69,7 @@ import {
   resolvePagesRedirect,
   resolvePagesRedirectLocation,
   resolvePagesRevalidateSeconds,
+  resolvePagesStatusPageRenderPath,
   type PagesRedirectResult,
   type PagesStaticPathsEntry,
 } from "./pages-page-data.js";
@@ -784,6 +785,8 @@ export function createSSRHandler(
       locales: i18nConfig?.locales,
       defaultLocale: currentDefaultLocale,
       crossOrigin,
+      trailingSlash,
+      requestPathname: new URL(originalUrl, "http://vinext.local").pathname,
     };
 
     const match = matchRoute(localeStrippedUrl, routes);
@@ -919,7 +922,15 @@ export function createSSRHandler(
           // Match Next.js's Pages handler: getStaticProps renders receive only
           // route params and a resolved asPath without request search state.
           query = mergeRouteParamsIntoQuery({}, params);
-          requestAsPath = localeStrippedUrl.split("?")[0];
+          const routePattern = patternToNextFormat(route.pattern);
+          requestAsPath =
+            routePattern === "/404" || routePattern === "/500"
+              ? resolvePagesStatusPageRenderPath(
+                  routePattern,
+                  trailingSlash,
+                  errorPageContext.requestPathname,
+                )
+              : localeStrippedUrl.split("?")[0];
         }
         const supportsPreview =
           typeof pageModule.getStaticProps === "function" ||
@@ -1867,6 +1878,9 @@ async function renderErrorPage(
     locales?: string[];
     defaultLocale?: string;
     crossOrigin?: string;
+    trailingSlash?: boolean;
+    /** Pathname of the request before rewrites and locale stripping. */
+    requestPathname?: string;
     /** Original Pages route that produced this development-only notFound render. */
     notFoundSrcPage?: string;
   } = { basePath: "" },
@@ -1908,10 +1922,18 @@ async function renderErrorPage(
 
       const createElement = React.createElement;
       res.statusCode = statusCode;
+      const renderUrl =
+        errorPage !== "/_error" && typeof errorModule.getStaticProps === "function"
+          ? resolvePagesStatusPageRenderPath(
+              errorPage,
+              context.trailingSlash === true,
+              context.requestPathname ?? url.split("?")[0],
+            )
+          : url;
       const errorRouter = {
         pathname: errorPage,
-        query: parseQuery(url),
-        asPath: url,
+        query: parseQuery(renderUrl),
+        asPath: renderUrl,
       };
       try {
         errorRouterShim = await importModule(runner, "next/router");
@@ -1932,7 +1954,7 @@ async function renderErrorPage(
         err,
         pathname: errorPage,
         query: errorRouter.query,
-        asPath: url,
+        asPath: renderUrl,
       });
       if (res.headersSent || res.writableEnded) return;
       let errorProps: Record<string, unknown> = { ...initialErrorProps, statusCode };
@@ -1963,7 +1985,7 @@ async function renderErrorPage(
             {
               basePath: context.basePath,
               method: "getStaticProps",
-              routeUrl: url,
+              routeUrl: renderUrl,
             },
           );
           return;
@@ -1995,7 +2017,7 @@ async function renderErrorPage(
             err,
             pathname: errorPage,
             query: errorRouter.query,
-            asPath: url,
+            asPath: renderUrl,
           },
         });
         if (res.headersSent || res.writableEnded) return;
@@ -2058,7 +2080,7 @@ async function renderErrorPage(
         {
           props: renderProps,
           page: errorPage,
-          query: parseQuery(url),
+          query: parseQuery(renderUrl),
           buildId: context.buildId ?? process.env.__VINEXT_BUILD_ID ?? "development",
           isFallback: false,
           locale: context.locale,
@@ -2098,8 +2120,8 @@ async function renderErrorPage(
           documentContext: {
             err,
             pathname: errorPage,
-            query: parseQuery(url),
-            asPath: url,
+            query: parseQuery(renderUrl),
+            asPath: renderUrl,
             req,
             res,
           },
