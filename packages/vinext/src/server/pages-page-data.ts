@@ -1117,14 +1117,42 @@ const SSR_HEAD_TAG_PATTERN =
   /<(title|meta|link|style|script|base|noscript)\b[^>]*?\sdata-next-head=""[^>]*?(?:\/>|>[\s\S]*?<\/\1>)/g;
 
 /**
- * Matches a whole head element whose body may contain markup-looking text.
- * Script/style are raw-text elements, title is RCDATA, and noscript is raw
- * text while scripting is enabled. In all four, a literal `</head>` does not
- * close the document head. `headChildToHTML()` only escapes the element's own
- * closing sequence for script/style, while `dangerouslySetInnerHTML` may leave
- * `</head>` intact in any of them.
+ * Matches, in the order the HTML tokenizer reaches them, an HTML comment, a
+ * text-only element, or any other start tag. Script and style are raw text:
+ * React escapes only the element's own closing sequence in their children, so
+ * page data rendered into one can spell out markup such as `</div>` or a
+ * `__NEXT_DATA__`-shaped script tag without it being markup. The other
+ * RAWTEXT/RCDATA elements (and noscript, raw text while scripting is enabled)
+ * only carry such text through `dangerouslySetInnerHTML`, as do comments and a
+ * `<` inside an attribute value; `plaintext` turns everything after it into
+ * text. Consuming each start tag whole keeps a scan from starting inside its
+ * quoted attributes.
+ *
+ * Tag names end at whitespace, `/` or `>` as in the tokenizer, so a
+ * `<script-x>` custom element (whose text React escapes) is just a start tag.
  */
-const HEAD_TEXT_ELEMENT_PATTERN = /<(script|style|title|noscript)\b[^>]*>[\s\S]*?<\/\1>/gi;
+const SHELL_TEXT_REGION_PATTERN =
+  /<!--(?:-?>|[\s\S]*?--!?>)|(<(script|style|title|textarea|noscript|iframe|xmp|noembed|noframes)(?=[\s/>])(?:[^>"']|"[^"]*"|'[^']*')*>)([\s\S]*?)(<\/\2(?=[\s/>])[^>]*>)|<plaintext(?=[\s/>])[\s\S]*|<[a-z][^\s/>]*(?:[^>"']|"[^"]*"|'[^']*')*>/gi;
+
+/**
+ * Blank every comment, the body of every text-only element, and any `<` inside
+ * a start tag, so string searches over the shell only see real markup.
+ * Length-preserving, so indexes still map onto `html`.
+ */
+function maskShellText(html: string): string {
+  return html.replace(
+    SHELL_TEXT_REGION_PATTERN,
+    (region: string, open?: string, _tag?: string, content?: string, close?: string) => {
+      if (region.startsWith("<!--") || /^<plaintext/i.test(region)) {
+        return " ".repeat(region.length);
+      }
+      if (open === undefined || content === undefined || close === undefined) {
+        return "<" + region.slice(1).replaceAll("<", " ");
+      }
+      return "<" + open.slice(1).replaceAll("<", " ") + " ".repeat(content.length) + close;
+    },
+  );
+}
 
 /**
  * Replace the `next/head` region of a cached shell with a freshly collected
@@ -1151,17 +1179,16 @@ function refreshCachedHeadTags(cachedHtml: string, freshHead: string): string {
   // cached head alone rather than deleting the tags we do have.
   if (!freshHead) return cachedHtml;
 
-  // Blank out raw-text/RCDATA elements before locating the boundary so a
-  // `</head>` string inside one is not mistaken for the closing tag — that
-  // would truncate the scan and leave stale tags behind the fresh head. The
-  // replacement is length-preserving, so the index still maps onto
-  // `cachedHtml`.
-  const headEnd = cachedHtml
-    .replace(HEAD_TEXT_ELEMENT_PATTERN, (element) => " ".repeat(element.length))
-    .indexOf("</head>");
+  // Locate the boundary and the collector's run on a masked copy. A `</head>`
+  // in text would truncate the scan and leave stale tags behind the fresh
+  // head; a `data-next-head` tag spelled out inside a `_document`-owned
+  // `<style>`/`<script>` would widen the splice and turn the rest of that
+  // element's text into markup.
+  const scanHtml = maskShellText(cachedHtml);
+  const headEnd = scanHtml.indexOf("</head>");
   if (headEnd < 0) return cachedHtml;
 
-  const matches = [...cachedHtml.slice(0, headEnd).matchAll(SSR_HEAD_TAG_PATTERN)];
+  const matches = [...scanHtml.slice(0, headEnd).matchAll(SSR_HEAD_TAG_PATTERN)];
   const first = matches[0];
   const last = matches[matches.length - 1];
   if (!first || !last || first.index === undefined || last.index === undefined) {
@@ -1178,20 +1205,33 @@ function rewritePagesCachedHtml(
   freshBody: string,
   nextDataScript: string,
 ): string {
+  // Locate the shell boundaries on a masked copy: the cached body is page
+  // output, and a fake data script or `</div>` inside its `<style>` text would
+  // otherwise move the splice and lift the bytes between into live markup.
+  const scanHtml = maskShellText(cachedHtml);
   const bodyMarker = '<div id="__next">';
-  const bodyStart = cachedHtml.indexOf(bodyMarker);
+  const bodyStart = scanHtml.indexOf(bodyMarker);
   const contentStart = bodyStart >= 0 ? bodyStart + bodyMarker.length : -1;
-  const canonicalNextDataStart = cachedHtml.search(
+  const canonicalNextDataStart = scanHtml.search(
     /<script\b(?=[^>]*\bid=["']__NEXT_DATA__["'])(?=[^>]*\btype=["']application\/json["'])[^>]*>/,
   );
-  const legacyNextDataStart = cachedHtml.indexOf("<script>window.__NEXT_DATA__");
+  // The legacy inline data script is identified by its body, which the mask
+  // blanks, so check each real `<script>` tag's body in the original HTML.
+  let legacyNextDataStart = scanHtml.indexOf("<script>");
+  while (
+    legacyNextDataStart >= 0 &&
+    !cachedHtml.startsWith("window.__NEXT_DATA__", legacyNextDataStart + "<script>".length)
+  ) {
+    legacyNextDataStart = scanHtml.indexOf("<script>", legacyNextDataStart + 1);
+  }
   const nextDataStart = canonicalNextDataStart >= 0 ? canonicalNextDataStart : legacyNextDataStart;
 
   if (contentStart >= 0 && nextDataStart >= 0) {
-    const region = cachedHtml.slice(contentStart, nextDataStart);
+    const region = scanHtml.slice(contentStart, nextDataStart);
     const lastCloseDiv = region.lastIndexOf("</div>");
-    const gap = lastCloseDiv >= 0 ? region.slice(lastCloseDiv + 6) : "";
-    const nextDataEnd = cachedHtml.indexOf("</script>", nextDataStart) + 9;
+    const gap =
+      lastCloseDiv >= 0 ? cachedHtml.slice(contentStart + lastCloseDiv + 6, nextDataStart) : "";
+    const nextDataEnd = scanHtml.indexOf("</script>", nextDataStart) + 9;
     const tail = cachedHtml.slice(nextDataEnd);
 
     return cachedHtml.slice(0, contentStart) + freshBody + "</div>" + gap + nextDataScript + tail;

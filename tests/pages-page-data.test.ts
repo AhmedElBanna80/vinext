@@ -525,6 +525,264 @@ describe("pages page data", () => {
     expect(html.match(/<title data-next-head="">/g)).toHaveLength(1);
   });
 
+  it("keeps markup-looking style text out of the regenerated body splice", async () => {
+    // React escapes only `</style` inside style children, so page data can
+    // spell out a `</div>` and a `__NEXT_DATA__`-shaped script tag there.
+    // Taking those for the shell boundaries would move the `<img>` between
+    // them out of the style text and into live markup.
+    const styleText =
+      ":root{--slug:\"</div><img src=x onerror=alert(1)><script id='__NEXT_DATA__' type='application/json'>\"}";
+    const html = await renderPagesIsrHtml({
+      buildId: "build-123",
+      cachedHtml:
+        '<!DOCTYPE html><html><head></head><body><div id="__next">' +
+        `<style>${styleText}</style><p>stale-body</p></div>` +
+        '<script id="__NEXT_DATA__" type="application/json">{"old":1}</script>' +
+        '<script src="/tail.js"></script></body></html>',
+      createPageElement(_pageProps: Record<string, unknown>) {
+        return "page";
+      },
+      i18n: { locale: "en", locales: ["en"], defaultLocale: "en", domainLocales: [] },
+      pageProps: {},
+      params: {},
+      renderIsrPassToStringAsync: vi.fn(async () => `<style>${styleText}</style><p>fresh-body</p>`),
+      routePattern: "/posts/[slug]",
+      safeJsonStringify(value: unknown) {
+        return JSON.stringify(value);
+      },
+    });
+
+    expect(
+      html.startsWith(
+        '<!DOCTYPE html><html><head></head><body><div id="__next">' +
+          `<style>${styleText}</style><p>fresh-body</p></div>` +
+          '<script id="__NEXT_DATA__" type="application/json">',
+      ),
+    ).toBe(true);
+    expect(html.endsWith('</script><script src="/tail.js"></script></body></html>')).toBe(true);
+    // The only `<img` left is the inert one inside the fresh style text.
+    expect(html.match(/<img/g)).toHaveLength(1);
+    expect(html).not.toContain('{"old":1}');
+  });
+
+  it("does not take a script-named custom element for a raw-text open", async () => {
+    // `<script-x>` is an ordinary element whose text React escapes. Masking
+    // from it would run to the first `</script>` — here spelled out in style
+    // text — and leave the rest of that style text unmasked.
+    const styleText =
+      ":root{--slug:\"</script></div><img src=x onerror=alert(1)><script id='__NEXT_DATA__' type='application/json'>\"}";
+    const body = `<script-x>hi</script-x><style>${styleText}</style>`;
+    const html = await renderPagesIsrHtml({
+      buildId: "build-123",
+      cachedHtml:
+        `<!DOCTYPE html><html><head></head><body><div id="__next">${body}<p>stale-body</p></div>` +
+        '<script id="__NEXT_DATA__" type="application/json">{"old":1}</script></body></html>',
+      createPageElement(_pageProps: Record<string, unknown>) {
+        return "page";
+      },
+      i18n: { locale: "en", locales: ["en"], defaultLocale: "en", domainLocales: [] },
+      pageProps: {},
+      params: {},
+      renderIsrPassToStringAsync: vi.fn(async () => `${body}<p>fresh-body</p>`),
+      routePattern: "/posts/[slug]",
+      safeJsonStringify(value: unknown) {
+        return JSON.stringify(value);
+      },
+    });
+
+    expect(
+      html.startsWith(
+        `<!DOCTYPE html><html><head></head><body><div id="__next">${body}<p>fresh-body</p></div>` +
+          '<script id="__NEXT_DATA__" type="application/json">',
+      ),
+    ).toBe(true);
+    expect(html.match(/<img/g)).toHaveLength(1);
+  });
+
+  it("finds the legacy inline data script past a lookalike in style text", async () => {
+    const styleText = ':root{--slug:"</div><img src=x><script>window.__NEXT_DATA__"}';
+    const html = await renderPagesIsrHtml({
+      buildId: "build-123",
+      cachedHtml:
+        `<!DOCTYPE html><html><head></head><body><div id="__next"><style>${styleText}</style></div>` +
+        '<script>window.__NEXT_DATA__ = {"old":1}</script><script src="/tail.js"></script></body></html>',
+      createPageElement(_pageProps: Record<string, unknown>) {
+        return "page";
+      },
+      i18n: { locale: "en", locales: ["en"], defaultLocale: "en", domainLocales: [] },
+      pageProps: {},
+      params: {},
+      renderIsrPassToStringAsync: vi.fn(async () => "<p>fresh-body</p>"),
+      routePattern: "/posts/[slug]",
+      safeJsonStringify(value: unknown) {
+        return JSON.stringify(value);
+      },
+    });
+
+    expect(
+      html.startsWith(
+        '<!DOCTYPE html><html><head></head><body><div id="__next"><p>fresh-body</p></div>' +
+          '<script id="__NEXT_DATA__" type="application/json">',
+      ),
+    ).toBe(true);
+    expect(html.endsWith('</script><script src="/tail.js"></script></body></html>')).toBe(true);
+    expect(html).not.toContain("<img");
+  });
+
+  it("reads a script tag inside a document comment as comment text", async () => {
+    // A custom Document can emit comments through `dangerouslySetInnerHTML`.
+    // Masking from the `<script>` inside one would run to the data script's
+    // `</script>` and blank both splice anchors.
+    const head = '<head><!-- <script> --><link rel="preload" href="/doc.css" /></head>';
+    const html = await renderPagesIsrHtml({
+      buildId: "build-123",
+      cachedHtml:
+        `<!DOCTYPE html><html lang="en">${head}<body class="doc"><div id="__next"><p>stale-body</p></div>` +
+        '<script id="__NEXT_DATA__" type="application/json">{"old":1}</script>' +
+        '<script src="/tail.js"></script></body></html>',
+      createPageElement(_pageProps: Record<string, unknown>) {
+        return "page";
+      },
+      i18n: { locale: "en", locales: ["en"], defaultLocale: "en", domainLocales: [] },
+      pageProps: {},
+      params: {},
+      renderIsrPassToStringAsync: vi.fn(async () => "<p>fresh-body</p>"),
+      routePattern: "/posts/[slug]",
+      safeJsonStringify(value: unknown) {
+        return JSON.stringify(value);
+      },
+    });
+
+    expect(
+      html.startsWith(
+        `<!DOCTYPE html><html lang="en">${head}<body class="doc"><div id="__next"><p>fresh-body</p></div>` +
+          '<script id="__NEXT_DATA__" type="application/json">',
+      ),
+    ).toBe(true);
+    expect(html.endsWith('</script><script src="/tail.js"></script></body></html>')).toBe(true);
+  });
+
+  it("keeps markup-looking iframe text out of the regenerated body splice", async () => {
+    // `iframe` contents are RAWTEXT, and React leaves its
+    // `dangerouslySetInnerHTML` body verbatim.
+    const body =
+      '<iframe>X</div><img src=x><script id="__NEXT_DATA__" type="application/json">Y</iframe>';
+    const html = await renderPagesIsrHtml({
+      buildId: "build-123",
+      cachedHtml:
+        `<!DOCTYPE html><html><head></head><body><div id="__next">${body}</div>` +
+        '<script id="__NEXT_DATA__" type="application/json">{"old":1}</script></body></html>',
+      createPageElement(_pageProps: Record<string, unknown>) {
+        return "page";
+      },
+      i18n: { locale: "en", locales: ["en"], defaultLocale: "en", domainLocales: [] },
+      pageProps: {},
+      params: {},
+      renderIsrPassToStringAsync: vi.fn(async () => body),
+      routePattern: "/posts/[slug]",
+      safeJsonStringify(value: unknown) {
+        return JSON.stringify(value);
+      },
+    });
+
+    expect(
+      html.startsWith(
+        `<!DOCTYPE html><html><head></head><body><div id="__next">${body}</div>` +
+          '<script id="__NEXT_DATA__" type="application/json">',
+      ),
+    ).toBe(true);
+    expect(html.match(/<img/g)).toHaveLength(1);
+  });
+
+  it("reads a script tag inside a quoted attribute as attribute text", async () => {
+    const body = '<span title="<script>">x</span>';
+    const html = await renderPagesIsrHtml({
+      buildId: "build-123",
+      cachedHtml:
+        `<!DOCTYPE html><html><head></head><body>${body}<div id="__next"><p>stale-body</p></div>` +
+        '<script id="__NEXT_DATA__" type="application/json">{"old":1}</script>' +
+        '<script src="/tail.js"></script></body></html>',
+      createPageElement(_pageProps: Record<string, unknown>) {
+        return "page";
+      },
+      i18n: { locale: "en", locales: ["en"], defaultLocale: "en", domainLocales: [] },
+      pageProps: {},
+      params: {},
+      renderIsrPassToStringAsync: vi.fn(async () => "<p>fresh-body</p>"),
+      routePattern: "/posts/[slug]",
+      safeJsonStringify(value: unknown) {
+        return JSON.stringify(value);
+      },
+    });
+
+    expect(
+      html.startsWith(
+        `<!DOCTYPE html><html><head></head><body>${body}<div id="__next"><p>fresh-body</p></div>` +
+          '<script id="__NEXT_DATA__" type="application/json">',
+      ),
+    ).toBe(true);
+    expect(html.endsWith('</script><script src="/tail.js"></script></body></html>')).toBe(true);
+  });
+
+  it("refreshes next/head tags past a script tag inside a head comment", async () => {
+    const html = await renderPagesIsrHtml({
+      buildId: "build-123",
+      cachedHtml:
+        '<!DOCTYPE html><html><head><!-- <script> --><title data-next-head="">stale</title></head>' +
+        '<body><div id="__next"><div>stale-body</div></div>' +
+        '<script id="__NEXT_DATA__" type="application/json">{"old":1}</script></body></html>',
+      collectIsrHeadHTML: vi.fn(() => '<title data-next-head="">fresh</title>'),
+      createPageElement(_pageProps: Record<string, unknown>) {
+        return "page";
+      },
+      i18n: { locale: "en", locales: ["en"], defaultLocale: "en", domainLocales: [] },
+      pageProps: {},
+      params: {},
+      renderIsrPassToStringAsync: vi.fn(async (_element, onHeadReady) => {
+        await onHeadReady?.();
+        return "<div>fresh-body</div>";
+      }),
+      routePattern: "/posts/[slug]",
+      safeJsonStringify(value: unknown) {
+        return JSON.stringify(value);
+      },
+    });
+
+    expect(html).toContain('<head><!-- <script> --><title data-next-head="">fresh</title></head>');
+    expect(html).not.toContain("stale");
+  });
+
+  it("keeps a next/head-shaped tag in document style text out of the head splice", async () => {
+    // A `_document`-owned style after the collector's run is never
+    // regenerated; if its text could end the run, everything after that
+    // fake tag would land outside the style as live markup.
+    const documentStyle = `<style>.a{content:'<meta data-next-head="" /><img src=x>'}</style>`;
+    const html = await renderPagesIsrHtml({
+      buildId: "build-123",
+      cachedHtml:
+        `<!DOCTYPE html><html><head><title data-next-head="">stale</title>${documentStyle}</head>` +
+        '<body><div id="__next"><div>stale-body</div></div>' +
+        '<script id="__NEXT_DATA__" type="application/json">{"old":1}</script></body></html>',
+      collectIsrHeadHTML: vi.fn(() => '<title data-next-head="">fresh</title>'),
+      createPageElement(_pageProps: Record<string, unknown>) {
+        return "page";
+      },
+      i18n: { locale: "en", locales: ["en"], defaultLocale: "en", domainLocales: [] },
+      pageProps: {},
+      params: {},
+      renderIsrPassToStringAsync: vi.fn(async (_element, onHeadReady) => {
+        await onHeadReady?.();
+        return "<div>fresh-body</div>";
+      }),
+      routePattern: "/posts/[slug]",
+      safeJsonStringify(value: unknown) {
+        return JSON.stringify(value);
+      },
+    });
+
+    expect(html).toContain(`<head><title data-next-head="">fresh</title>${documentStyle}</head>`);
+  });
+
   it("preserves custom app props in fallback shells", async () => {
     const AppComponent = Object.assign(function App() {}, {
       getInitialProps() {
