@@ -85,6 +85,7 @@ import { createWorkerCacheabilityAdmissionContext } from "../packages/vinext/src
 import { registerFrameworkTracingIntegration } from "../packages/vinext/src/server/tracer.js";
 import type { ResolvedFrameworkSpanDescriptor } from "../packages/vinext/src/server/framework-tracer.js";
 import { workUnitAsyncStorage } from "../packages/vinext/src/shims/internal/work-unit-async-storage.js";
+import { getServerActionNotFoundMessage } from "../packages/vinext/src/server/server-action-not-found.js";
 
 const capturedFindPageComponentsSpans: ResolvedFrameworkSpanDescriptor[] = [];
 let captureFindPageComponentsSpans = false;
@@ -6843,7 +6844,7 @@ describe("createAppRscHandler", () => {
     );
   });
 
-  it("returns HTTP 500 for progressive action execution failures", async () => {
+  it("returns HTTP 500 for progressive actions that fail to find a Server Action", async () => {
     const dispatchMatchedPage = vi.fn(async ({ middlewareContext }) =>
       Promise.resolve(new Response("error page", { status: middlewareContext.status ?? 200 })),
     );
@@ -6854,7 +6855,7 @@ describe("createAppRscHandler", () => {
         return {
           kind: "form-state",
           formState: null,
-          actionError: new Error("boom"),
+          actionError: new Error(getServerActionNotFoundMessage(null)),
           actionFailed: true,
           pendingCookies: [],
           draftCookie: null,
