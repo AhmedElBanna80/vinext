@@ -236,6 +236,8 @@ type AppRouterConfig = {
   draftModeSecret?: string;
   /** Server-only token used to authorize build-time prerender endpoints. */
   prerenderSecret?: string;
+  /** next.config `skipTrailingSlashRedirect`. */
+  skipTrailingSlashRedirect?: boolean;
   /** Dev-only key authenticating the hybrid Pages handler's forwarded middleware context. */
   devForwardedMiddlewareContextKey?: string;
 };
@@ -580,6 +582,7 @@ const __requestHandler = createAppRscRequestHandler({
       middlewareRequest,
       module: middlewareModule,
       request,
+      skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
       trailingSlash: __trailingSlash,
       validateExternalRewriteRequest,
     });
@@ -618,6 +621,7 @@ const __requestHandler = createAppRscRequestHandler({
   }
   rootParamNamesByPattern: {},
   setNavigationContext,
+  skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
   staticParamsMap: {},
   trailingSlash: __trailingSlash,
   validateDevRequestOrigin: __validateDevRequestOrigin,
@@ -1624,6 +1628,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       draftModeSecret: __draftModeSecret,
       i18n: __i18nConfig,
       trailingSlash: __trailingSlash,
+      skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
       isrDebug: __isrDebug,
       isrGet: __isrGet,
       isrRouteKey(pathname) {
@@ -2009,6 +2014,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       middlewareRequest,
       module: middlewareModule,
       request,
+      skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
       trailingSlash: __trailingSlash,
       validateExternalRewriteRequest,
     });
@@ -2060,6 +2066,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   }
   rootParamNamesByPattern: rootParamNamesMap,
   setNavigationContext,
+  skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
   staticParamsMap: generateStaticParamsMap,
   trailingSlash: __trailingSlash,
   validateDevRequestOrigin: __validateDevRequestOrigin,

@@ -250,6 +250,7 @@ function createHandler(overrides: Partial<TestHandlerOptions> = {}) {
               i18nConfig: overrides.i18nConfig ?? null,
               isProxy: overrides.isMiddlewareProxy ?? false,
               module: overrides.middlewareModule!,
+              skipTrailingSlashRedirect: overrides.skipTrailingSlashRedirect,
               trailingSlash: overrides.trailingSlash ?? false,
             })
         : undefined),
@@ -260,6 +261,7 @@ function createHandler(overrides: Partial<TestHandlerOptions> = {}) {
     renderResponseStageLocally: overrides.renderResponseStageLocally,
     rootParamNamesByPattern: overrides.rootParamNamesByPattern,
     setNavigationContext: overrides.setNavigationContext ?? (() => {}),
+    skipTrailingSlashRedirect: overrides.skipTrailingSlashRedirect,
     staticParamsMap: overrides.staticParamsMap ?? {},
     trailingSlash: overrides.trailingSlash ?? false,
     validateDevRequestOrigin: overrides.validateDevRequestOrigin ?? (() => null),
@@ -4639,6 +4641,53 @@ describe("createAppRscHandler", () => {
     },
   );
 
+  it.each([
+    { source: "/feed/secret/", trailingSlash: false },
+    { source: "/feed/secret", trailingSlash: true },
+  ])(
+    "keeps the interception source $source as named under skipTrailingSlashRedirect (trailingSlash: $trailingSlash)",
+    async ({ source, trailingSlash }) => {
+      const targetRoute = createPageRoute({
+        pattern: "/photos/1",
+        routeSegments: ["photos", "1"],
+      });
+      const sourceRoute = createPageRoute({ pattern: "/feed/secret" });
+      const middlewarePaths: string[] = [];
+      const handler = createHandler({
+        configHeaders: [],
+        matchInterceptRoute: (_pathname, sourcePathname) =>
+          sourcePathname === source
+            ? { interceptionSourceIsConcrete: true, route: sourceRoute, params: {} }
+            : null,
+        matchRoute: (pathname: string) =>
+          pathname === "/photos/1" || pathname === "/photos/1/"
+            ? { params: {}, route: targetRoute }
+            : null,
+        middlewareModule: {
+          default(request: NextRequest) {
+            if (request.nextUrl.pathname.startsWith("/feed")) {
+              middlewarePaths.push(request.nextUrl.pathname);
+            }
+          },
+        },
+        skipTrailingSlashRedirect: true,
+        trailingSlash,
+      });
+
+      const headers = createRscRequestHeaders({ interceptionContext: source });
+      const rscUrl = await createRscRequestUrl("/docs/photos/1", headers);
+      const response = await handler(
+        new Request(`https://example.test${rscUrl}`, { headers }),
+        null,
+      );
+
+      // A direct request to the source is not redirected, so middleware
+      // authorizes the same spelling.
+      expect(response.status).toBe(200);
+      expect(middlewarePaths).toEqual([source]);
+    },
+  );
+
   it("does not intercept from a source that config redirects", async () => {
     const targetRoute = createPageRoute({ pattern: "/photos/1", routeSegments: ["photos", "1"] });
     const sourceRoute = createPageRoute({ pattern: "/feed/secret" });
@@ -7351,6 +7400,32 @@ describe("createAppRscHandler", () => {
     expect(response.status).toBe(308);
     expect(response.headers.get("location")).toBe("/outside/");
   });
+
+  // Ported from Next.js: test/e2e/skip-trailing-slash-redirect/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/skip-trailing-slash-redirect/index.test.ts
+  it.each([
+    { trailingSlash: false, pathname: "/docs/about/" },
+    { trailingSlash: true, pathname: "/docs/about" },
+  ])(
+    "serves $pathname without a redirect under skipTrailingSlashRedirect (trailingSlash: $trailingSlash)",
+    async ({ trailingSlash, pathname }) => {
+      const route = createPageRoute();
+      // The real route matcher tolerates either slash form.
+      const matchRoute = (pathname: string) =>
+        pathname.replace(/\/$/, "") === "/about" ? { params: {}, route } : null;
+      const handler = createHandler({
+        configHeaders: [],
+        matchRoute,
+        skipTrailingSlashRedirect: true,
+        trailingSlash,
+      });
+
+      const response = await handler(new Request(`https://example.test${pathname}`), null);
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("page");
+    },
+  );
 
   it("preserves raw encoded spelling when normalizing trailing slashes", async () => {
     const handler = createHandler({ configHeaders: [], trailingSlash: true });

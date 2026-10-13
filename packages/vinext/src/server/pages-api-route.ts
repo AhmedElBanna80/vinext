@@ -116,6 +116,7 @@ type HandlePagesApiRouteOptions = {
     allowedRevalidateHeaderKeys?: readonly string[];
     i18n?: NextI18nConfig | null;
     trailingSlash?: boolean;
+    skipTrailingSlashRedirect?: boolean;
   };
   trustedRevalidateOrigin?: string;
 };
@@ -175,6 +176,7 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
                 basePath: options.nextConfig.basePath,
                 i18n: options.nextConfig.i18n ?? undefined,
                 trailingSlash: options.nextConfig.trailingSlash,
+                skipTrailingSlashRedirect: options.nextConfig.skipTrailingSlashRedirect,
               },
             }
           : undefined,

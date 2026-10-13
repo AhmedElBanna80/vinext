@@ -99,6 +99,7 @@ type DispatchAppRouteHandlerOptions = {
   isrRouteKey: (pathname: string) => string;
   isrSet: RouteHandlerCacheSetter;
   trailingSlash?: boolean;
+  skipTrailingSlashRedirect?: boolean;
   middlewareContext: RouteHandlerMiddlewareContext;
   middlewareRequestHeaders?: Headers | null;
   /**
@@ -306,6 +307,7 @@ async function dispatchAppRouteHandlerImpl(
       handlerFn: resolvedHandlerFn,
       i18n: options.i18n,
       trailingSlash: options.trailingSlash,
+      skipTrailingSlashRedirect: options.skipTrailingSlashRedirect,
       isAutoHead,
       appendResponseLink,
       isrDebug: options.isrDebug,
@@ -374,6 +376,7 @@ async function dispatchAppRouteHandlerImpl(
       handlerFn: resolvedHandlerFn,
       i18n: options.i18n,
       trailingSlash: options.trailingSlash,
+      skipTrailingSlashRedirect: options.skipTrailingSlashRedirect,
       isAutoHead,
       initialDraftModeCookie,
       isDraftMode,

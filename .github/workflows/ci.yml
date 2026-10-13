@@ -486,6 +486,10 @@ jobs:
             label: app-router-encoded-basepath-i18n
             shardIndex: 1
             shardTotal: 1
+          - project: use-params-app-pages
+            label: use-params-app-pages
+            shardIndex: 1
+            shardTotal: 1
           - project: app-router
             label: app-router 3/3
             shardIndex: 3

@@ -687,6 +687,8 @@ export type CreateAppRscHandlerOptions<TRoute extends AppRscHandlerRoute> = {
   renderPagesFallback?: (options: RenderPagesFallbackOptions) => Promise<Response | null>;
   rootParamNamesByPattern?: RootParamNamesMap;
   setNavigationContext: (context: NavigationContextValue) => void;
+  /** next.config `skipTrailingSlashRedirect`: serve both slash forms without a 308. */
+  skipTrailingSlashRedirect?: boolean;
   staticParamsMap: StaticParamsMap;
   trailingSlash: boolean;
   validateDevRequestOrigin?: (request: Request) => Response | null;
@@ -1107,19 +1109,23 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     if (prerenderEndpointResponse) return prerenderEndpointResponse;
   }
 
-  const metadataBypassesTrailingSlash =
-    options.trailingSlash &&
-    options.isMetadataRoutePath &&
-    (await options.isMetadataRoutePath(cleanPathname));
-  const trailingSlashRedirect = metadataBypassesTrailingSlash
-    ? null
-    : normalizeTrailingSlash(
-        requestCleanPathname,
-        hadBasePath ? options.basePath : "",
-        options.trailingSlash,
-        url.search,
-      );
-  if (trailingSlashRedirect) return trailingSlashRedirect;
+  // `skipTrailingSlashRedirect` drops these redirects entirely, like Next.js
+  // omitting them from the routes manifest.
+  if (!options.skipTrailingSlashRedirect) {
+    const metadataBypassesTrailingSlash =
+      options.trailingSlash &&
+      options.isMetadataRoutePath &&
+      (await options.isMetadataRoutePath(cleanPathname));
+    const trailingSlashRedirect = metadataBypassesTrailingSlash
+      ? null
+      : normalizeTrailingSlash(
+          requestCleanPathname,
+          hadBasePath ? options.basePath : "",
+          options.trailingSlash,
+          url.search,
+        );
+    if (trailingSlashRedirect) return trailingSlashRedirect;
+  }
 
   // Default-locale path normalisation (issue #1336, item 4). Next.js
   // splices in the (domain-aware) default locale on every request that
@@ -1818,12 +1824,16 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     // A direct request to a non-canonical spelling redirects to the canonical
     // one first, so every later step sees that. The client can legitimately
     // send a matched route path, such as `/en` under `trailingSlash: true`.
-    const sourceRequestPathname =
-      normalizeTrailingSlashPathname(interceptionContextHeader, options.trailingSlash) ??
-      interceptionContextHeader;
-    const decodedSourceRequestPathname =
-      normalizeTrailingSlashPathname(interceptionSourcePathname, options.trailingSlash) ??
-      interceptionSourcePathname;
+    // With `skipTrailingSlashRedirect` a direct request keeps its spelling, so
+    // the authorization pass must see the source exactly as named.
+    const sourceRequestPathname = options.skipTrailingSlashRedirect
+      ? interceptionContextHeader
+      : (normalizeTrailingSlashPathname(interceptionContextHeader, options.trailingSlash) ??
+        interceptionContextHeader);
+    const decodedSourceRequestPathname = options.skipTrailingSlashRedirect
+      ? interceptionSourcePathname
+      : (normalizeTrailingSlashPathname(interceptionSourcePathname, options.trailingSlash) ??
+        interceptionSourcePathname);
     const adoptRewrittenInterceptionSource = (rewrittenPathname: string): boolean => {
       // The raw context was matched before this rewrite, so it can name another
       // route: with an unprefixed default locale, `/feed` rewrites to

@@ -2896,6 +2896,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         defines["process.env.__VINEXT_TRAILING_SLASH"] = JSON.stringify(
           nextConfig.trailingSlash ? "true" : "false",
         );
+        // Next.js defines __NEXT_MANUAL_TRAILING_SLASH from
+        // skipTrailingSlashRedirect so client hrefs keep the slash as written.
+        defines["process.env.__VINEXT_MANUAL_TRAILING_SLASH"] = JSON.stringify(
+          nextConfig.skipTrailingSlashRedirect ? "true" : "false",
+        );
         // Next.js uses this compile-time value to switch App Router navigation
         // from header-selected RSC responses to static `.txt` Flight assets.
         defines["process.env.__NEXT_CONFIG_OUTPUT"] = JSON.stringify(nextConfig.output ?? "");
@@ -4990,6 +4995,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 nodeOpenTelemetryLoader: registerNodeOpenTelemetryLoader,
                 assetPrefix: nextConfig?.assetPrefix,
                 crossOrigin: nextConfig?.crossOrigin,
+                skipTrailingSlashRedirect: nextConfig?.skipTrailingSlashRedirect,
                 expireTime: nextConfig?.expireTime,
                 reactMaxHeadersLength: nextConfig?.reactMaxHeadersLength,
                 cacheMaxMemorySize: nextConfig?.cacheMaxMemorySize,
@@ -6597,7 +6603,7 @@ export const loadServerActionClient = ${
               }
               let configMatchPathname = stripBasePath(middlewareUrl.split("?")[0], routingBasePath);
 
-              if (nextConfig) {
+              if (nextConfig && !nextConfig.skipTrailingSlashRedirect) {
                 const qs = url.includes("?") ? url.slice(url.indexOf("?")) : "";
                 const trailingSlashRedirect = normalizeTrailingSlash(
                   routeUrl.split("?")[0],
@@ -6839,6 +6845,7 @@ export const loadServerActionClient = ${
                         opts.isDataRequest,
                         pathname,
                         opts.isStaleDataRequest,
+                        nextConfig?.skipTrailingSlashRedirect,
                       );
 
                       // Forward middleware context to the RSC entry so it can
@@ -6899,6 +6906,7 @@ export const loadServerActionClient = ${
                 assetPrefix: nextConfig?.assetPrefix,
                 basePath: bp,
                 trailingSlash: nextConfig?.trailingSlash ?? false,
+                skipTrailingSlashRedirect: nextConfig?.skipTrailingSlashRedirect ?? false,
                 i18nConfig: nextConfig?.i18n ?? null,
                 configRedirects: nextConfig?.redirects ?? [],
                 configRewrites: nextConfig?.rewrites ?? {
@@ -7125,6 +7133,7 @@ export const loadServerActionClient = ${
                     trustedRevalidateOrigin: getTrustedDevRevalidateOrigin(),
                     allowedRevalidateHeaderKeys: nextConfig?.allowedRevalidateHeaderKeys,
                     trailingSlash: nextConfig?.trailingSlash,
+                    skipTrailingSlashRedirect: nextConfig?.skipTrailingSlashRedirect,
                   },
                 );
                 if (handled) return;
