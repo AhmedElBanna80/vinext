@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -155,6 +156,103 @@ describe("staticAssetsAdapter on the Cloudflare Workers runtime", () => {
     expect(rsc.headers.get("x-vinext-cache")).toBe("HIT");
     expect(await rsc.text()).toContain("served from prerender assets");
   });
+
+  it("keeps serving cache hits after a request is cancelled while loading the cache index", async () => {
+    const require = createRequire(
+      fs.realpathSync(path.join(CLOUDFLARE_NODE_MODULES, "wrangler/package.json")),
+    );
+    const { Miniflare } = (await import(pathToFileURL(require.resolve("miniflare")).href)) as {
+      Miniflare: new (options: Record<string, unknown>) => {
+        dispatchFetch(url: string): Promise<Response>;
+        dispose(): Promise<void>;
+      };
+    };
+    const dist = path.join(root, "dist/server");
+    const config = JSON.parse(fs.readFileSync(path.join(dist, "wrangler.json"), "utf8")) as {
+      compatibility_date: string;
+      compatibility_flags?: string[];
+    };
+    const modules = fs
+      .readdirSync(dist, { recursive: true, encoding: "utf8" })
+      .filter((file) => file.endsWith(".js") && file !== "index.js");
+
+    let indexRequested!: () => void;
+    const indexRequest = new Promise<void>((resolve) => (indexRequested = resolve));
+    let indexFetches = 0;
+    let releaseIndex!: () => void;
+    const indexReleased = new Promise<void>((resolve) => (releaseIndex = resolve));
+    // Production cancels a request when its client disconnects. Workerd does
+    // the same to a service-binding request whose caller has finished, so the
+    // front worker abandons the first app request while it awaits the index.
+    const miniflare = new Miniflare({
+      workers: [
+        {
+          name: "front",
+          modules: true,
+          compatibilityDate: config.compatibility_date,
+          serviceBindings: {
+            APP: "app",
+            INDEX_REQUESTED: () => indexRequest.then(() => new Response()),
+          },
+          script: `export default {
+  async fetch(request, env) {
+    if (new URL(request.url).pathname !== "/abandon") return env.APP.fetch("https://app.local/");
+    const app = env.APP.fetch("https://app.local/").then(
+      (response) => "app responded before loading the index: " + response.status,
+      (error) => "app failed before loading the index: " + error,
+    );
+    const indexRequested = env.INDEX_REQUESTED.fetch("https://signal.local/").then(() => "abandoned");
+    return new Response(await Promise.race([indexRequested, app]));
+  },
+};`,
+        },
+        {
+          name: "app",
+          compatibilityDate: config.compatibility_date,
+          compatibilityFlags: config.compatibility_flags ?? [],
+          modules: ["index.js", ...modules].map((file) => ({
+            path: file,
+            type: "ESModule",
+            contents: fs.readFileSync(path.join(dist, file), "utf8"),
+          })),
+          serviceBindings: {
+            async ASSETS(request: Request) {
+              const { pathname } = new URL(request.url);
+              if (pathname.endsWith("/static-cache/index.json")) {
+                indexFetches++;
+                indexRequested();
+                await indexReleased;
+              }
+              const file = path.join(root, "dist/client", decodeURIComponent(pathname));
+              return fs.existsSync(file) && fs.statSync(file).isFile()
+                ? new Response(fs.readFileSync(file))
+                : new Response(null, { status: 404 });
+            },
+          },
+        },
+      ],
+    });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const abandoned = await miniflare.dispatchFetch("https://front.local/abandon");
+      expect(await abandoned.text()).toBe("abandoned");
+      releaseIndex();
+
+      const response = await Promise.race([
+        miniflare.dispatchFetch("https://front.local/"),
+        new Promise<null>((resolve) => (timeout = setTimeout(() => resolve(null), 10_000))),
+      ]);
+      expect(response, "request after the cancelled one never settled").not.toBeNull();
+      expect(response!.status).toBe(200);
+      expect(response!.headers.get("x-vinext-cache")).toBe("HIT");
+      expect(await response!.text()).toContain("served from prerender assets");
+      // The cancelled request never stored the index, so the next one loaded it.
+      expect(indexFetches).toBe(2);
+    } finally {
+      clearTimeout(timeout);
+      await miniflare.dispose();
+    }
+  }, 30_000);
 
   it("does not expose the packaged cache through public asset URLs", async () => {
     const artifacts = fs.readdirSync(path.join(root, "dist/client/_vinext/static-cache"));

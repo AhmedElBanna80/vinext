@@ -363,6 +363,68 @@ describe("staticAssetsAdapter", () => {
     expect(await adapter.get(key)).toEqual(cached);
   });
 
+  it("retries a cache index fetch that failed", async () => {
+    const indexResponses: Array<() => Promise<Response>> = [
+      () => Promise.reject(new Error("network")),
+      async () => new Response(null, { status: 503 }),
+      async () => Response.json({}),
+    ];
+    const fetch = vi.fn(async (input: string) => {
+      expect(new URL(input).pathname).toBe("/_vinext/static-cache/index.json");
+      return indexResponses.shift()!();
+    });
+    const adapter = new StaticAssetsCacheAdapter({ fetch });
+    await expect(adapter.get("missing")).rejects.toThrow("network");
+    expect(await adapter.get("missing")).toBeNull();
+    expect(await adapter.get("missing")).toBeNull();
+    expect(await adapter.get("missing")).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not share a pending cache index fetch with later requests", async () => {
+    let indexFetchStarted!: () => void;
+    const started = new Promise<void>((resolve) => (indexFetchStarted = resolve));
+    const fetch = vi.fn((_input: string) => {
+      if (fetch.mock.calls.length > 1) return Promise.resolve(Response.json({}));
+      indexFetchStarted();
+      return new Promise<Response>(() => {});
+    });
+    const adapter = new StaticAssetsCacheAdapter({ fetch });
+    void adapter.get("cancelled");
+    await started;
+    expect(await adapter.get("missing")).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("remembers that the build packaged no cache index", async () => {
+    const fetch = vi.fn(async () => new Response(null, { status: 404 }));
+    const adapter = new StaticAssetsCacheAdapter({ fetch });
+    expect(await adapter.get("missing")).toBeNull();
+    expect(await adapter.get("missing")).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats an unavailable cache index as a miss when releasing its body fails", async () => {
+    const failingBody = (status: number) =>
+      new Response(
+        new ReadableStream({
+          cancel() {
+            throw new Error("cancel failed");
+          },
+        }),
+        { status },
+      );
+    const fetch = vi
+      .fn<(input: RequestInfo | URL) => Promise<Response>>()
+      .mockResolvedValueOnce(failingBody(503))
+      .mockResolvedValueOnce(failingBody(404));
+    const adapter = new StaticAssetsCacheAdapter({ fetch });
+    expect(await adapter.get("missing")).toBeNull();
+    expect(await adapter.get("missing")).toBeNull();
+    expect(await adapter.get("missing")).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
   it("fails clearly when the configured Assets binding is missing", () => {
     expect(() => createStaticAssetsCacheAdapter({ env: {} })).toThrow(/`ASSETS`/);
     expect(() =>
