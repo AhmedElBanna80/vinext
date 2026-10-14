@@ -1,7 +1,7 @@
 import MagicString from "magic-string";
 import { readFile } from "node:fs/promises";
 import path from "pathslash";
-import { createIdResolver, parseAst, type ESTree, type Plugin, type ResolvedConfig } from "vite";
+import { createIdResolver, parseAst, type ESTree, type Plugin } from "vite";
 import {
   collectBindingNames,
   forEachAstChild,
@@ -159,26 +159,6 @@ function collectLiteralRequires(code: string, id: string): LiteralRequire[] {
   return requires;
 }
 
-type BundlerExternal = NonNullable<ResolvedConfig["build"]["rolldownOptions"]>["external"];
-
-// Mirror Rolldown's check of an import against `external`. It searches RegExp
-// patterns without the stateful `g`/`y` flags, so match a copy rather than the
-// user's (possibly frozen) RegExp.
-function isBundlerExternal(
-  external: BundlerExternal,
-  id: string,
-  importer: string,
-  isResolved = false,
-): boolean {
-  if (typeof external === "function") return Boolean(external(id, importer, isResolved));
-  const patterns = Array.isArray(external) ? external : [external];
-  return patterns.some((pattern) => {
-    if (typeof pattern === "string") return pattern === id;
-    if (!(pattern instanceof RegExp)) return false;
-    return new RegExp(pattern.source, pattern.flags.replace(/[gy]/g, "")).test(id);
-  });
-}
-
 function isAbsoluteResolution(resolution: string | undefined): resolution is string {
   return resolution !== undefined && path.isAbsolute(stripViteModuleQuery(resolution));
 }
@@ -210,19 +190,10 @@ export function createRequireConditionResolutionPlugin(
   };
   let defaultResolvers: ResolverPair | undefined;
   let bundlingResolvers: ResolverPair | undefined;
-  // The bundler's final `external` option per build environment, including
-  // entries other plugins add from their own `options` hooks.
-  const bundlerExternals = new WeakMap<object, BundlerExternal>();
 
   return {
     name: "vinext:require-condition-resolution",
     enforce: "pre",
-    options: {
-      order: "post",
-      handler(options) {
-        if (this.environment) bundlerExternals.set(this.environment, options.external);
-      },
-    },
     configResolved(config) {
       defaultResolvers = {
         require: createResolver(config, { isRequire: true }),
@@ -291,13 +262,6 @@ export function createRequireConditionResolutionPlugin(
         // `resolve.external: true` asks for every dependency to stay external,
         // so don't pull require targets into the bundle there.
         const keepExternals = this.environment.config.resolve.external === true;
-        // Build-only: the dev module runner does not apply this option.
-        const bundlerExternal =
-          this.environment.config.command !== "build"
-            ? undefined
-            : bundlerExternals.has(this.environment)
-              ? bundlerExternals.get(this.environment)
-              : this.environment.config.build.rolldownOptions?.external;
 
         const output = new MagicString(code);
         let changed = false;
@@ -345,13 +309,18 @@ export function createRequireConditionResolutionPlugin(
           // its `require` target. A plugin resolving the same file unmarked
           // still wins.
           //
-          // A bundler external also wins when it matches the bare specifier,
-          // the only id it tests once Vite externalizes the package, or the
-          // synthetic id, which would become an import of a missing file.
-          // (Vite's dev resolver returns the package entry, so only builds get
-          // here.)
+          // A bundler external also wins. Rolldown applies its final
+          // `external` option (including later `options` hooks) inside
+          // `this.resolve`: a match on the bare specifier drops Vite's tag
+          // above, and a match on the synthetic id would make it an import of
+          // a missing file. Probe both as the import statement
+          // vite-plugin-commonjs will emit. (Vite's dev resolver returns the
+          // package entry, so only builds get here.)
           if (bundlesExternal) {
-            const resolved = await this.resolve(specifier, importer, { skipSelf: true });
+            const resolved = await this.resolve(specifier, importer, {
+              kind: "import-statement",
+              skipSelf: true,
+            });
             const packageName = packageNameFromSpecifier(specifier);
             const takesOver =
               packageName !== null && getServerExternalPackages().includes(packageName)
@@ -364,13 +333,12 @@ export function createRequireConditionResolutionPlugin(
                 : Boolean(resolved?.external) &&
                   resolved?.id === specifier &&
                   resolved.packageJsonPath !== undefined;
-            if (
-              !takesOver ||
-              (bundlerExternal !== undefined &&
-                (isBundlerExternal(bundlerExternal, specifier, id) ||
-                  isBundlerExternal(bundlerExternal, virtualId, id) ||
-                  isBundlerExternal(bundlerExternal, virtualId, id, true)))
-            ) {
+            if (!takesOver) continue;
+            const registered = virtualTargets.has(virtualId);
+            if (!registered) virtualTargets.set(virtualId, { file: requirePath, moduleType });
+            const synthetic = await this.resolve(virtualId, id, { kind: "import-statement" });
+            if (synthetic?.external) {
+              if (!registered) virtualTargets.delete(virtualId);
               continue;
             }
           }

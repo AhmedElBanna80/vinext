@@ -323,6 +323,30 @@ describe("vinext:require-condition-resolution", () => {
     },
   };
 
+  // vite-plugin-commonjs hoists the call to a static import, so these only
+  // act on import statements.
+  const importOnlyRedirectPlugin: Plugin = {
+    name: "redirect-lib-cjs-imports",
+    enforce: "pre",
+    resolveId(source, _importer, options) {
+      if (source === "lib-cjs" && options.kind === "import-statement") {
+        return "\0lib-cjs-redirect";
+      }
+    },
+    load(id) {
+      if (id === "\0lib-cjs-redirect") return "export default 'redirect';";
+    },
+  };
+  const importOnlyExternalPlugin: Plugin = {
+    name: "externalize-lib-cjs-imports",
+    enforce: "pre",
+    resolveId(source, _importer, options) {
+      if (source === "lib-cjs" && options.kind === "import-statement") {
+        return { id: source, external: true };
+      }
+    },
+  };
+
   async function withConditionalPackage<T>(run: (root: string) => Promise<T>): Promise<T> {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vinext-require-condition-")));
     try {
@@ -436,6 +460,34 @@ describe("vinext:require-condition-resolution", () => {
           name: "add-node-modules-external",
           options(options) {
             return { ...options, external: /node_modules/ };
+          },
+        },
+      ],
+    ],
+    [
+      "leaves a package that a plugin resolves elsewhere for import statements",
+      {},
+      false,
+      [importOnlyRedirectPlugin],
+    ],
+    [
+      "leaves a package that a plugin externalizes for import statements",
+      {},
+      false,
+      [importOnlyExternalPlugin],
+    ],
+    [
+      "leaves a require whose synthetic id a later post options hook external matches",
+      {},
+      false,
+      [
+        {
+          name: "late-node-modules-external",
+          options: {
+            order: "post",
+            handler(options) {
+              return { ...options, external: /node_modules/ };
+            },
           },
         },
       ],
