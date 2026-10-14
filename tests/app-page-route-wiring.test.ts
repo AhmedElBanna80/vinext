@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { describe, expect, it, vi } from "vite-plus/test";
-import { useSelectedLayoutSegments } from "../packages/vinext/src/shims/navigation.js";
+import { notFound, useSelectedLayoutSegments } from "../packages/vinext/src/shims/navigation.js";
 import {
   APP_BFCACHE_SEGMENT_IDENTITIES_KEY,
   APP_LAYOUT_IDS_KEY,
@@ -40,6 +40,8 @@ import {
   APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
 } from "../packages/vinext/src/server/app-rsc-render-mode.js";
 import { makeThenableParams } from "../packages/vinext/src/shims/thenable-params.js";
+import { registerCachedFunction } from "../packages/vinext/src/shims/cache-runtime.js";
+import { MemoryCacheHandler, setCacheHandler } from "../packages/vinext/src/shims/cache.js";
 import {
   createRequestContext,
   getRequestContext,
@@ -251,13 +253,16 @@ async function readStream(stream: ReadableStream<Uint8Array>): Promise<string> {
   return text + decoder.decode();
 }
 
-async function renderHtml(node: ReactNode): Promise<string> {
+function throwRenderError(error: unknown): never {
+  throw error instanceof Error ? error : new Error(String(error));
+}
+
+async function renderHtml(
+  node: ReactNode,
+  onError: (error: unknown) => void = throwRenderError,
+): Promise<string> {
   const { renderToReadableStream } = await import("react-dom/server.edge");
-  const stream = await renderToReadableStream(node, {
-    onError(error: unknown) {
-      throw error instanceof Error ? error : new Error(String(error));
-    },
-  });
+  const stream = await renderToReadableStream(node, { onError });
 
   return readStream(stream);
 }
@@ -273,7 +278,11 @@ async function renderRouteEntry(elements: AppElements, routeId: string): Promise
   );
 }
 
-async function renderRouteDocument(elements: AppElements, routeId: string): Promise<string> {
+async function renderRouteDocument(
+  elements: AppElements,
+  routeId: string,
+  onError?: (error: unknown) => void,
+): Promise<string> {
   const { ElementsContext, Slot } = await import("../packages/vinext/src/shims/slot.js");
   // Match production Flight serialization, which starts the flat page and
   // route entries concurrently before the decoded route tree is rendered.
@@ -298,6 +307,7 @@ async function renderRouteDocument(elements: AppElements, routeId: string): Prom
         ),
       ),
     ),
+    onError,
   );
 }
 
@@ -410,12 +420,27 @@ function PageProbe() {
   return createElement("main", { "data-page-segments": segments.join("|") }, "Page");
 }
 
-async function buildGeneratedMetadataRouteHtml(
+async function generatePageMetadata() {
+  return {
+    title: "generated page",
+    alternates: {
+      canonical: "https://example.com/generated",
+      languages: { "en-US": "https://example.com/en/generated" },
+    },
+    robots: { index: false, follow: false },
+  };
+}
+
+async function buildGeneratedMetadataRouteElements(
   userAgent: string,
   htmlLimitedBots?: string,
   serveStreamingMetadata?: boolean,
-): Promise<string> {
-  const elements = await buildResolvedPageElements({
+  options: {
+    generateMetadata?: () => Promise<Record<string, unknown>>;
+    placeStreamedMetadataInHead?: boolean;
+  } = {},
+): Promise<AppElements> {
+  return buildResolvedPageElements({
     route: {
       error: null,
       errors: [null],
@@ -426,16 +451,7 @@ async function buildGeneratedMetadataRouteHtml(
       notFounds: [null],
       page: {
         default: PageProbe,
-        async generateMetadata() {
-          return {
-            title: "generated page",
-            alternates: {
-              canonical: "https://example.com/generated",
-              languages: { "en-US": "https://example.com/en/generated" },
-            },
-            robots: { index: false, follow: false },
-          };
-        },
+        generateMetadata: options.generateMetadata ?? generatePageMetadata,
       },
       params: [],
       pattern: "/generated",
@@ -454,11 +470,25 @@ async function buildGeneratedMetadataRouteHtml(
       }),
       searchParams: null,
       serveStreamingMetadata,
+      placeStreamedMetadataInHead: options.placeStreamedMetadataInHead,
     },
     metadataRoutes: [],
     htmlLimitedBots,
   });
+}
 
+async function buildGeneratedMetadataRouteHtml(
+  userAgent: string,
+  htmlLimitedBots?: string,
+  serveStreamingMetadata?: boolean,
+  placeStreamedMetadataInHead?: boolean,
+): Promise<string> {
+  const elements = await buildGeneratedMetadataRouteElements(
+    userAgent,
+    htmlLimitedBots,
+    serveStreamingMetadata,
+    { placeStreamedMetadataInHead },
+  );
   return renderRouteDocument(elements, "route:/generated");
 }
 
@@ -475,6 +505,66 @@ function LayoutWithoutChildren() {
 }
 
 describe("app page route wiring helpers", () => {
+  // Parallel slots must render alongside children, including a scanner-supported
+  // name that matches the cache wrapper's page marker. Like Next.js, a slot named
+  // `$$isLayout` is overwritten by the layout marker.
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/parallel-routes-root-slot/parallel-routes-root-slot.test.ts
+  it.each(["$$isPage"])(
+    "renders the %s parallel slot in cached and uncached layouts",
+    async (slotName) => {
+      setCacheHandler(new MemoryCacheHandler());
+      const renderLayout = (props: Record<string, unknown>) =>
+        createElement(
+          "section",
+          null,
+          createElement("div", { key: "slot" }, props[slotName] as ReactNode),
+          createElement("div", { key: "children" }, props.children as ReactNode),
+        );
+      const cachedLayout = registerCachedFunction(
+        async (props: Record<string, unknown>) => renderLayout(props),
+        `wired-marker-slot:${slotName}`,
+      );
+      const build = (layout: typeof renderLayout | typeof cachedLayout) =>
+        buildAppPageElements({
+          element: createElement("main", null, "main page"),
+          makeThenableParams,
+          matchedParams: {},
+          route: {
+            error: null,
+            errors: [null],
+            layoutTreePositions: [0],
+            layouts: [{ default: layout }],
+            loading: null,
+            notFound: null,
+            notFounds: [null],
+            routeSegments: ["dashboard"],
+            slots: {
+              [slotName]: {
+                default: null,
+                error: null,
+                layout: null,
+                layoutIndex: 0,
+                loading: null,
+                name: slotName,
+                page: { default: () => createElement("aside", null, `${slotName} content`) },
+                routeSegments: [],
+              },
+            },
+            templateTreePositions: [],
+            templates: [],
+          },
+          routePath: "/dashboard",
+          rootNotFoundModule: null,
+        });
+      const uncached = await renderRouteEntry(build(renderLayout), "route:/dashboard");
+      const cached = await renderRouteEntry(build(cachedLayout), "route:/dashboard");
+      expect(uncached).toContain(`${slotName} content`);
+      expect(uncached).toContain("main page");
+      expect(cached).toBe(uncached);
+      expect(await renderRouteEntry(build(cachedLayout), "route:/dashboard")).toBe(uncached);
+    },
+  );
+
   it("selects the nearest positioned loading module with a default export", () => {
     const legacyLoading = { default: () => null };
     const rootLoading = { default: () => null };
@@ -637,6 +727,36 @@ describe("app page route wiring helpers", () => {
 
     expect(head).toContain("<title>generated page</title>");
     expect(body).not.toContain("<title>generated page</title>");
+  });
+
+  it("waits for streamed metadata in the head of a document rendered whole", async () => {
+    // Next.js renders a static or ISR page whole before serving it, so React
+    // hoists its streamed metadata into <head>.
+    const html = await buildGeneratedMetadataRouteHtml("HeadlessChrome", undefined, true, true);
+    const head = readDocumentSection(html, "head");
+    const body = readDocumentSection(html, "body");
+
+    expect(head).toContain("<title>generated page</title>");
+    expect(head).toContain('rel="canonical" href="https://example.com/generated"');
+    expect(body).not.toContain("<title>generated page</title>");
+  });
+
+  it("rethrows a head-placed streamed metadata error in the outlet, not the shell", async () => {
+    const elements = await buildGeneratedMetadataRouteElements("HeadlessChrome", undefined, true, {
+      async generateMetadata() {
+        notFound();
+      },
+      placeStreamedMetadataInHead: true,
+    });
+    const digests: unknown[] = [];
+
+    const html = await renderRouteDocument(elements, "route:/generated", (error) => {
+      digests.push((error as { digest?: unknown } | null)?.digest);
+    });
+
+    expect(html).toContain('data-layout="root"');
+    expect(readDocumentSection(html, "head")).not.toContain("<title>");
+    expect(digests).toEqual(["NEXT_HTTP_ERROR_FALLBACK;404"]);
   });
 
   it("falls back to the default html-limited bot list for an empty config string", async () => {

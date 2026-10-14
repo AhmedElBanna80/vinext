@@ -39,6 +39,8 @@ type ResponseStoreInvocation = {
 export type ResponseStoreInvocationCapture = {
   admittedResponse?: Promise<Response>;
   captureRscData?: boolean;
+  /** The render matched the request's If-None-Match; the adapter sends the 304. */
+  notModified?: boolean;
   rscData?: Promise<ArrayBuffer>;
   streamResponse?: boolean;
 };
@@ -79,6 +81,14 @@ export function captureResponseStoreRscData(rscData: Promise<ArrayBuffer>): void
   } else {
     void rscData.catch(() => {});
   }
+}
+
+/** A shared invocation stores the page, so its adapter sends the page's 304. */
+export function deferResponseStoreNotModified(): boolean {
+  const capture = invocationStorage.getStore()?.capture;
+  if (!capture) return false;
+  capture.notModified = true;
+  return true;
 }
 
 /** Stream the foreground body while retaining an independent admission branch. */
@@ -393,6 +403,9 @@ export class WorkersResponseStoreCacheHandler implements CacheHandler {
         cacheState = "expired";
       } else if (
         requestedStale ||
+        // Only an invalidate() marks a non-replayable entry stale; the Store cannot
+        // regenerate it, so the caller revalidates it.
+        storeStatus === "BLOB-STALE" ||
         (typeof entry.cacheControl?.revalidate === "number" &&
           entry.cacheControl.revalidate > 0 &&
           age > entry.cacheControl.revalidate * 1000)
@@ -505,7 +518,11 @@ export class WorkersResponseStoreCacheHandler implements CacheHandler {
       // A read that finds a page-replay entry expired must not wait for the replay: a page
       // reading two such entries would replay itself for each in turn (A -> B -> A). The
       // Store answers a miss and the caller recomputes, as in Next.js; refresh() still replays.
-      ...(revalidator?.id === DATA_REVALIDATOR_ID ? { expiryBehavior: "miss" as const } : {}),
+      // An entry without a revalidator only expires through invalidate()'s `expire`, and the
+      // Store can't regenerate it either.
+      ...(revalidator?.id !== CACHE_FUNCTION_REVALIDATOR_ID
+        ? { expiryBehavior: "miss" as const }
+        : {}),
       coalesce: true,
       purgeExisting: true,
     });
@@ -516,7 +533,11 @@ export class WorkersResponseStoreCacheHandler implements CacheHandler {
     const encodedTags = dataTags.map(encodeCloudflareCacheTag);
     if (!encodedTags.length) return;
     if (isStaleTagInvalidation(durations)) {
-      await this.store.refresh({ tags: encodedTags });
+      // Like Next.js, mark the entries stale and let the next read revalidate them.
+      await this.store.invalidate({
+        tags: encodedTags,
+        ...(durations?.expire === undefined ? {} : { expire: durations.expire }),
+      });
     } else {
       await this.store.purge({
         tags: encodedTags,
