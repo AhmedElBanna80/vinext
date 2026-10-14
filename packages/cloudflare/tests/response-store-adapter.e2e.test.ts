@@ -43,6 +43,33 @@ async function modules(directory: string, entry: string) {
   );
 }
 
+// The application Worker with the Response Store in the same Worker.
+async function selfContainedWorker(): Promise<Miniflare> {
+  return new Miniflare({
+    unsafeEphemeralDurableObjects: true,
+    workers: [
+      {
+        bindings: {
+          CF_VERSION_METADATA: {
+            id: crypto.randomUUID(),
+            tag: "test",
+            timestamp: new Date().toISOString(),
+          },
+        },
+        compatibilityDate: "2026-04-08",
+        compatibilityFlags: ["nodejs_compat", "experimental"],
+        durableObjects: {
+          CACHE_METADATA: { className: "CacheMetadata", useSQLite: true },
+        },
+        modules: await modules(selfContainedAppOutput, "index.js"),
+        name: "app",
+        r2Buckets: { CACHE_BODIES: crypto.randomUUID() },
+        serviceBindings: { ASSETS: async () => new Response(null, { status: 404 }) },
+      },
+    ],
+  } satisfies MiniflareOptions);
+}
+
 async function request(pathname: string, init?: Parameters<Miniflare["dispatchFetch"]>[1]) {
   return miniflare.dispatchFetch(`https://app.test${pathname}`, init);
 }
@@ -721,29 +748,7 @@ describe("Cloudflare Workers Response Store adapter", () => {
   });
 
   test("runs cold fills, hits, and SWR loopback in one Worker", async () => {
-    const inline = new Miniflare({
-      unsafeEphemeralDurableObjects: true,
-      workers: [
-        {
-          bindings: {
-            CF_VERSION_METADATA: {
-              id: crypto.randomUUID(),
-              tag: "test",
-              timestamp: new Date().toISOString(),
-            },
-          },
-          compatibilityDate: "2026-04-08",
-          compatibilityFlags: ["nodejs_compat", "experimental"],
-          durableObjects: {
-            CACHE_METADATA: { className: "CacheMetadata", useSQLite: true },
-          },
-          modules: await modules(selfContainedAppOutput, "index.js"),
-          name: "app",
-          r2Buckets: { CACHE_BODIES: crypto.randomUUID() },
-          serviceBindings: { ASSETS: async () => new Response(null, { status: 404 }) },
-        },
-      ],
-    } satisfies MiniflareOptions);
+    const inline = await selfContainedWorker();
 
     try {
       const fetch = () => inline.dispatchFetch("https://app.test/api/now");
@@ -759,6 +764,75 @@ describe("Cloudflare Workers Response Store adapter", () => {
       assert.equal(await stale.text(), firstBody);
       await new Promise((resolve) => setTimeout(resolve, 300));
       assert.notEqual(await (await fetch()).text(), firstBody);
+    } finally {
+      await inline.dispose();
+    }
+  });
+
+  // Next.js regenerates a generated path from its prerender manifest and never
+  // reruns getStaticPaths for it; the demo page stops listing its path after
+  // the first call.
+  test("regenerates a stored Pages entry without rerunning getStaticPaths", async () => {
+    const inline = await selfContainedWorker();
+
+    try {
+      const fetch = async () => {
+        const response = await inline.dispatchFetch(
+          "https://app.test/static-paths-regeneration/listed",
+        );
+        assert.equal(response.status, 200);
+        return htmlValue(await response.text(), "static-paths-regeneration-render-id");
+      };
+      const first = await fetch();
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      assert.equal(await fetch(), first);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.notEqual(await fetch(), first);
+    } finally {
+      await inline.dispose();
+    }
+  });
+
+  // Next.js stores the page before it evaluates the ETag, so a crawler's
+  // conditional request that fills a cold entry gets a 304 while later
+  // visitors get the stored page.
+  test("stores a Pages page whole when a crawler's conditional request fills it in one Worker", async () => {
+    const inline = await selfContainedWorker();
+    const fetch = (headers?: Record<string, string>) =>
+      inline.dispatchFetch("https://app.test/pages-prewarm", { headers });
+
+    try {
+      const conditional = await fetch({
+        // Fetch adds Cache-Control: no-cache to a conditional request without
+        // one, and no-cache skips the 304.
+        "Cache-Control": "max-age=0",
+        "If-None-Match": "*",
+        "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+      });
+      assert.equal(conditional.status, 304);
+      assert.equal(conditional.headers.get("x-vinext-cache"), "MISS");
+      assert.equal(await conditional.text(), "");
+      assert.ok(conditional.headers.get("etag"));
+
+      // Wait for the stored page itself, so a poll never fills the entry.
+      const bucket = await inline.getR2Bucket("CACHE_BODIES");
+      let statuses: (string | undefined)[] = [];
+      for (let attempt = 0; attempt < 50 && statuses.length === 0; attempt++) {
+        if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 50));
+        const { objects } = await bucket.list({ include: ["customMetadata"] });
+        statuses = objects
+          .filter((object) => object.customMetadata?.responseHeaders?.includes("text/html"))
+          .map((object) => object.customMetadata?.status);
+      }
+      assert.deepEqual(statuses, ["200"]);
+
+      for (const headers of [undefined, { "Cache-Control": "no-cache" }]) {
+        const visitor = await fetch(headers);
+        assert.equal(visitor.status, 200, JSON.stringify(headers));
+        assert.equal(visitor.headers.get("x-vinext-cache"), "HIT");
+        assert.equal(visitor.headers.get("etag"), conditional.headers.get("etag"));
+        assert.match(await visitor.text(), /Pages prewarm target/);
+      }
     } finally {
       await inline.dispose();
     }
@@ -1000,6 +1074,7 @@ describe("Cloudflare Workers Response Store adapter", () => {
     const conditional = await request("/pages-prewarm", conditionalRequest);
     assert.equal(conditional.status, 304);
     assert.equal(conditional.headers.get("x-vinext-cache"), "MISS");
+    assert.equal(conditional.headers.get("content-type"), null);
     assert.equal(await conditional.text(), "");
     await waitForResponseEntries("/pages-prewarm", 1);
 
@@ -1013,6 +1088,84 @@ describe("Cloudflare Workers Response Store adapter", () => {
     // The stored page carries the validator the crawler revalidated against.
     assert.equal(visitor.headers.get("etag"), conditional.headers.get("etag"));
     assert.match(await visitor.text(), /Pages prewarm target/);
+  });
+
+  test("answers a stored page's conditional request as Next.js does", async () => {
+    const rscHeaders = { Accept: "text/x-component", RSC: "1" };
+    const page = await request("/pages-prewarm");
+    const buildId = (await page.text()).match(/"buildId":"([^"]+)"/)?.[1];
+    assert.ok(buildId, "missing the Pages buildId");
+    const pages = [
+      { path: "/pages-prewarm", headers: {} },
+      { path: `/_next/data/${buildId}/pages-prewarm.json`, headers: {} },
+      { path: "/prewarm-target", headers: {} },
+      { path: "/prewarm-target", headers: rscHeaders },
+      // A stored notFound() keeps its status, and its 304 stays a 304.
+      { path: "/special-error/not-found?_rsc", headers: rscHeaders },
+    ];
+    for (const { path, headers } of [...pages, { path: "/api/now", headers: {} }]) {
+      await (await request(path, { headers })).arrayBuffer();
+    }
+    for (const path of [
+      "/pages-prewarm",
+      pages[1].path,
+      "/prewarm-target",
+      "/special-error/not-found",
+      "/api/now",
+    ]) {
+      await waitForStoredEntries(async () => (await responseEntries(path)).slice(0, 1), 1);
+    }
+
+    for (const { path, headers } of pages) {
+      const stored = await request(path, { headers });
+      assert.equal(stored.headers.get("x-vinext-cache"), "HIT", path);
+      const body = await stored.arrayBuffer();
+      const etag = stored.headers.get("etag");
+      assert.ok(etag, `missing the stored ETag for ${path}`);
+      // Fetch adds Cache-Control: no-cache to a conditional request without
+      // one, and no-cache sends the page.
+      const conditional = { ...headers, "Cache-Control": "max-age=0", "If-None-Match": etag };
+
+      const notModified = await request(path, { headers: conditional });
+      assert.equal(notModified.status, 304, path);
+      assert.equal(notModified.headers.get("x-vinext-cache"), "HIT");
+      assert.equal(notModified.headers.get("etag"), etag);
+      assert.equal(notModified.headers.get("cache-control"), stored.headers.get("cache-control"));
+      for (const name of ["content-encoding", "content-length", "content-type"]) {
+        assert.equal(notModified.headers.get(name), null, `${path} ${name}`);
+      }
+      assert.equal(await notModified.text(), "");
+      // Next.js sets the 304 after a middleware's status.
+      if (!path.startsWith("/special-error/")) {
+        const behindMiddleware = await request(path, {
+          headers: { ...conditional, "x-test-middleware-status": "1" },
+        });
+        assert.equal(behindMiddleware.status, 304, `${path} behind middleware`);
+        assert.equal(await behindMiddleware.text(), "");
+      }
+
+      for (const full of [
+        { ...conditional, "Cache-Control": "no-cache" },
+        { ...conditional, "If-None-Match": '"other"' },
+        { ...conditional, "If-Modified-Since": new Date().toUTCString() },
+      ]) {
+        const response = await request(path, { headers: full });
+        assert.equal(response.status, stored.status, `${path} ${JSON.stringify(full)}`);
+        assert.equal((await response.arrayBuffer()).byteLength, body.byteLength);
+      }
+    }
+
+    // Next.js sends a route handler's cached response in full.
+    const route = await request("/api/now");
+    const etag = route.headers.get("etag");
+    await route.arrayBuffer();
+    assert.ok(etag);
+    const routeConditional = await request("/api/now", {
+      headers: { "Cache-Control": "max-age=0", "If-None-Match": etag },
+    });
+    assert.equal(routeConditional.status, 200);
+    assert.equal(routeConditional.headers.get("x-vinext-cache"), "HIT");
+    assert.ok(((await routeConditional.json()) as { renderId?: string }).renderId);
   });
 
   test("caches HEAD independently without storing a body", async () => {
@@ -1071,6 +1224,63 @@ describe("Cloudflare Workers Response Store adapter", () => {
     const serialized = JSON.stringify((await metadataEntries()).flat());
     assert.doesNotMatch(serialized, /first-secret|second-secret/);
   });
+
+  test.each(["authorization", "cookie", "proxy-authorization", "x-api-key"])(
+    "never stores a public Pages API response for a request carrying %s",
+    async (header) => {
+      const pathname = "/api/credential-echo";
+      const read = async (credential?: string) => {
+        const response = await request(
+          pathname,
+          credential === undefined ? undefined : { headers: { [header]: credential } },
+        );
+        assert.equal(response.status, 200);
+        const body = (await response.json()) as {
+          credentials: Record<string, string | null>;
+          renderId: string;
+        };
+        return {
+          cache: response.headers.get("x-vinext-cache"),
+          credential: body.credentials[header],
+          renderId: body.renderId,
+        };
+      };
+
+      for (const credential of ["first-secret", "second-secret"]) {
+        const credentialed = await read(credential);
+        assert.equal(credentialed.credential, credential);
+        assert.notEqual(credentialed.cache, "HIT");
+      }
+
+      // The same route is stored for a request without credentials, so the
+      // credentialed requests above were rejected by the guardrail alone.
+      const anonymous = await read();
+      assert.equal(anonymous.credential, null);
+      assert.equal(anonymous.cache, "MISS");
+      await waitForResponseEntries(pathname, 1);
+      const hit = await read();
+      assert.equal(hit.cache, "HIT");
+      assert.equal(hit.credential, null);
+      assert.equal(hit.renderId, anonymous.renderId);
+    },
+  );
+
+  // A replay carries no credentials, so it cannot reproduce a credentialed render.
+  test.each(["none", "authorization", "cookie", "proxy-authorization", "x-api-key"])(
+    "replays the page for its data entries only without credentials (%s)",
+    async (credential) => {
+      const response = await request(
+        "/unstable-cache-siblings",
+        credential === "none" ? undefined : { headers: { [credential]: "secret" } },
+      );
+      assert.equal(response.status, 200);
+      await response.text();
+      const entries = async () => (await metadataEntries()).flat() as StoredResponseEntry[];
+      await waitForStoredEntries(entries, 2);
+      const replayed = (await entries()).filter((entry) => entry.revalidator?.id === "vinext:data");
+      assert.equal(replayed.length, credential === "none" ? 2 : 0);
+    },
+  );
 
   test("keeps concurrent cold renders successful", async () => {
     const responses = await Promise.all(

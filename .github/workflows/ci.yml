@@ -231,6 +231,11 @@ jobs:
         run: |
           node "$GITHUB_WORKSPACE/scripts/configure-local-vinext-types.mjs" "${{ runner.temp }}"
           vp add "${{ runner.temp }}"/vinext-[0-9]*.tgz
+          # Install the @vitejs/plugin-rsc version the repo is tested with. An
+          # unversioned install can resolve an older release under pnpm's
+          # minimumReleaseAge default, which vinext rejects.
+          RSC_VERSION=$(cd "$GITHUB_WORKSPACE/packages/vinext" && node -p "require('@vitejs/plugin-rsc/package.json').version")
+          vp add -D "@vitejs/plugin-rsc@$RSC_VERSION"
 
       - name: Run vinext init
         working-directory: ${{ runner.temp }}/cna-test
@@ -332,6 +337,11 @@ jobs:
         run: |
           node "$GITHUB_WORKSPACE/scripts/configure-local-vinext-types.mjs" "${{ runner.temp }}"
           vp add "${{ runner.temp }}"/vinext-[0-9]*.tgz "${{ runner.temp }}"/cloudflare-workers-response-store-*.tgz "${{ runner.temp }}"/vinext-cloudflare-*.tgz
+          # Install the @vitejs/plugin-rsc version the repo is tested with. An
+          # unversioned install can resolve an older release under pnpm's
+          # minimumReleaseAge default, which vinext rejects.
+          RSC_VERSION=$(cd "$GITHUB_WORKSPACE/packages/vinext" && node -p "require('@vitejs/plugin-rsc/package.json').version")
+          vp add -D "@vitejs/plugin-rsc@$RSC_VERSION"
 
       - name: Run Cloudflare init
         working-directory: ${{ runner.temp }}/cna-cloudflare
@@ -428,6 +438,11 @@ jobs:
         run: |
           node "$GITHUB_WORKSPACE/scripts/configure-local-vinext-types.mjs" "${{ runner.temp }}"
           vp add "${{ runner.temp }}"/vinext-[0-9]*.tgz "${{ runner.temp }}"/cloudflare-workers-response-store-*.tgz "${{ runner.temp }}"/vinext-cloudflare-*.tgz
+          # Install the @vitejs/plugin-rsc version the repo is tested with. An
+          # unversioned install can resolve an older release under pnpm's
+          # minimumReleaseAge default, which vinext rejects.
+          RSC_VERSION=$(cd "$GITHUB_WORKSPACE/packages/vinext" && node -p "require('@vitejs/plugin-rsc/package.json').version")
+          vp add -D "@vitejs/plugin-rsc@$RSC_VERSION"
 
       - name: Build generated Cloudflare project
         working-directory: ${{ runner.temp }}/cva-cloudflare
@@ -482,6 +497,14 @@ jobs:
             label: app-router-prefetch-searchparams
             shardIndex: 1
             shardTotal: 1
+          - project: app-router-encoded-basepath-i18n
+            label: app-router-encoded-basepath-i18n
+            shardIndex: 1
+            shardTotal: 1
+          - project: use-params-app-pages
+            label: use-params-app-pages
+            shardIndex: 1
+            shardTotal: 1
           - project: app-router
             label: app-router 3/3
             shardIndex: 3
@@ -524,6 +547,38 @@ jobs:
             shardTotal: 1
           - project: cloudflare-sentry-app
             label: cloudflare-sentry-app
+            shardIndex: 1
+            shardTotal: 1
+          - project: cloudflare-next-intl
+            label: cloudflare-next-intl
+            shardIndex: 1
+            shardTotal: 1
+          - project: cloudflare-next-intl-locale-prefix-never
+            label: cloudflare-next-intl-locale-prefix-never
+            shardIndex: 1
+            shardTotal: 1
+          - project: cloudflare-next-intl-trailing-slash
+            label: cloudflare-next-intl-trailing-slash
+            shardIndex: 1
+            shardTotal: 1
+          - project: cloudflare-next-intl-base-path
+            label: cloudflare-next-intl-base-path
+            shardIndex: 1
+            shardTotal: 1
+          - project: cloudflare-next-intl-domains
+            label: cloudflare-next-intl-domains
+            shardIndex: 1
+            shardTotal: 1
+          - project: cloudflare-next-intl-domains-locale-prefix
+            label: cloudflare-next-intl-domains-locale-prefix
+            shardIndex: 1
+            shardTotal: 1
+          - project: cloudflare-next-intl-locale-cookie-false
+            label: cloudflare-next-intl-locale-cookie-false
+            shardIndex: 1
+            shardTotal: 1
+          - project: cloudflare-next-intl-example
+            label: cloudflare-next-intl-example
             shardIndex: 1
             shardTotal: 1
           - project: cloudflare-sentry-app-workers-cache
@@ -590,6 +645,10 @@ jobs:
             label: ppr-impact-demo
             shardIndex: 1
             shardTotal: 1
+          - project: cacheability-components
+            label: cacheability-components
+            shardIndex: 1
+            shardTotal: 1
           - project: app-front-redirect-issue
             label: app-front-redirect-issue
             shardIndex: 1
@@ -608,6 +667,10 @@ jobs:
             shardTotal: 1
           - project: module-federation
             label: module-federation
+            shardIndex: 1
+            shardTotal: 1
+          - project: module-federation-cloudflare
+            label: module-federation-cloudflare
             shardIndex: 1
             shardTotal: 1
     steps:

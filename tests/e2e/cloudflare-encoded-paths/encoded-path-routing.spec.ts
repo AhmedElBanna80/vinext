@@ -53,6 +53,18 @@ test("does not treat a route handler's reflected static-file header as a Worker 
   expect(await reflected.text()).toBe("route handler body");
 });
 
+// run_worker_first sends public files through middleware, which sees the raw
+// and once-decoded pathname. A double-encoded alias must not reach the file.
+test("does not serve a middleware-protected public file through a double-encoded alias", async () => {
+  const direct = await getRawPath("/members%20only/confidential.txt");
+  expect(direct.status).toBe(403);
+  expect(direct.body).toBe("blocked by middleware");
+
+  const alias = await getRawPath("/members%2520only/confidential.txt");
+  expect(alias.status).toBe(404);
+  expect(alias.body).not.toContain("members-only public file");
+});
+
 test("keeps direct and middleware-rewritten Worker App Page params canonical", async ({
   request,
 }) => {
@@ -64,6 +76,34 @@ test("keeps direct and middleware-rewritten Worker App Page params canonical", a
     expect(response.status()).toBe(200);
     expect(await response.text()).toContain('["a%2561","b%2Fc"]');
   }
+});
+
+test("routes hybrid Pages by the raw Worker pathname", async () => {
+  const response = await getRawPath("/pages-encoded-parity/a%2561");
+  expect(response.status).toBe(200);
+  expect(response.body).toContain('data-slug="a%61"');
+
+  // Static Pages segments keep their encoded identity, as in Next.js.
+  const alias = await getRawPath("/%70ages-encoded-parity/a");
+  expect(alias.status).toBe(404);
+  expect(alias.body).not.toContain("Pages encoded parity");
+});
+
+// Middleware matches the raw path and one decode of it. Next.js decodes at most
+// once, so a double-encoded static segment must not reach the Pages page or
+// API route that its decoded-twice spelling names.
+test("keeps double-encoded static aliases out of hybrid Pages routing", async () => {
+  const api = await getRawPath("/api/ping");
+  expect(api.status).toBe(200);
+  expect(api.body).toContain('"ok":true');
+
+  const apiAlias = await getRawPath("/api/%2570ing");
+  expect(apiAlias.status).toBe(404);
+  expect(apiAlias.body).not.toContain('"ok":true');
+
+  const pageAlias = await getRawPath("/%2570ages-encoded-parity/a");
+  expect(pageAlias.status).toBe(404);
+  expect(pageAlias.body).not.toContain("Pages encoded parity");
 });
 
 test("enforces canonical dynamicParams=false values on Workers", async () => {

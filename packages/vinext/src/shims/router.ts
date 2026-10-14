@@ -86,6 +86,7 @@ import {
   type UrlQuery,
 } from "../utils/query.js";
 import { matchRoutePattern, routePattern, routePatternParts } from "../routing/route-pattern.js";
+import { disableSmoothScrollDuringRouteTransition } from "./disable-smooth-scroll.js";
 import { scrollToHashTarget } from "./hash-scroll.js";
 import {
   installPagesRouterRuntime,
@@ -264,19 +265,9 @@ function scrollToPagesRouterPosition({ x, y }: ScrollPosition): void {
     return;
   }
 
-  const htmlElement = document.documentElement;
-  const shouldDisableSmoothScroll = htmlElement.dataset.scrollBehavior === "smooth";
-
-  if (!shouldDisableSmoothScroll) {
+  disableSmoothScrollDuringRouteTransition(() => {
     window.scrollTo(x, y);
-    return;
-  }
-
-  const previousScrollBehavior = htmlElement.style.scrollBehavior;
-  htmlElement.style.scrollBehavior = "auto";
-  htmlElement.getClientRects();
-  window.scrollTo(x, y);
-  htmlElement.style.scrollBehavior = previousScrollBehavior;
+  });
 }
 
 function isAtScrollPosition({ x, y }: ScrollPosition): boolean {
@@ -3802,7 +3793,7 @@ async function performNavigation(
     // ordering of scroll-during-commit, then completion event.
     if (doScroll) {
       if (hash) scrollToHashTarget(hash);
-      else window.scrollTo(0, 0);
+      else scrollToPagesRouterPosition({ x: 0, y: 0 });
     }
   }
   onStateUpdate?.();
