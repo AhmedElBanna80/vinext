@@ -12,7 +12,8 @@ import fs from "node:fs";
 import { buildAppRscManifestCode } from "./app-rsc-manifest.js";
 import { resolveEntryPath } from "./runtime-entry-module.js";
 import { toSlash } from "pathslash";
-import { extractExportConstString } from "../build/report.js";
+import { classifyAppPageRouteStaticEligibility } from "../build/app-page-static-eligibility.js";
+import { extractExportConstString, getAppRouteRenderEntryPath } from "../build/report.js";
 import type {
   NextHeader,
   NextI18nConfig,
@@ -40,7 +41,6 @@ const middlewareRequestHeadersPath = resolveEntryPath(
   "../utils/middleware-request-headers.js",
   import.meta.url,
 );
-const normalizePathModulePath = resolveEntryPath("../server/normalize-path.js", import.meta.url);
 const appRouteHandlerDispatchPath = resolveEntryPath(
   "../server/app-route-handler-dispatch.js",
   import.meta.url,
@@ -59,6 +59,10 @@ const appRouteHandlerMiddlewareContextPath = resolveEntryPath(
 );
 const appServerActionExecutionPath = resolveEntryPath(
   "../server/app-server-action-execution.js",
+  import.meta.url,
+);
+const serverReferenceLoaderPath = resolveEntryPath(
+  "../server/server-reference-loader.js",
   import.meta.url,
 );
 const appActionForwardingPath = resolveEntryPath(
@@ -199,6 +203,8 @@ type AppRouterConfig = {
   globalNotFound?: boolean;
   /** Enables Next.js Cache Components semantics for App Router document HTML. */
   cacheComponents?: boolean;
+  /** Reads an MDX source's ESM exports, as the prerender listing does. */
+  readMdxEsm?: ((source: string) => string) | null;
   /** Resolved `experimental.prefetchInlining` thresholds. */
   prefetchInlining?: PrefetchInliningConfig;
   /** Whether the RSC build discovered any server references. Defaults to true. */
@@ -235,12 +241,16 @@ type AppRouterConfig = {
   draftModeSecret?: string;
   /** Server-only token used to authorize build-time prerender endpoints. */
   prerenderSecret?: string;
+  /** next.config `skipTrailingSlashRedirect`. */
+  skipTrailingSlashRedirect?: boolean;
+  /** Dev-only key authenticating the hybrid Pages handler's forwarded middleware context. */
+  devForwardedMiddlewareContextKey?: string;
 };
 
-function buildAppRequestRouteMetadata(routes: AppRoute[]): unknown[] {
+function createSegmentSourceReader(): (filePath: string | null | undefined) => string | null {
   const sourceCache = new Map<string, string | null>();
-  const forcesDynamic = (filePath: string | null | undefined): boolean => {
-    if (!filePath) return false;
+  return (filePath) => {
+    if (!filePath) return null;
     let source = sourceCache.get(filePath);
     if (source === undefined) {
       try {
@@ -250,6 +260,66 @@ function buildAppRequestRouteMetadata(routes: AppRoute[]): unknown[] {
       }
       sourceCache.set(filePath, source);
     }
+    return source;
+  };
+}
+
+/** Segment config files of the tree a direct request to a page route renders. */
+function appPageSegmentConfigPaths(route: AppRoute): (string | null | undefined)[] {
+  return [
+    ...route.layouts,
+    route.pagePath,
+    ...route.parallelSlots.flatMap((slot) => [
+      slot.layoutPath,
+      ...(slot.configLayoutPaths ?? []),
+      slot.pagePath ?? slot.defaultPath,
+    ]),
+  ];
+}
+
+/**
+ * Patterns of the static App pages that answer a request whose raw pathname
+ * reaches a dynamic sibling but whose segment-decoded pathname names them, so
+ * `/%61` and `/caf%C3%A9` render `/a` and `/café` rather than `/[slug]`.
+ *
+ * Next.js serves those requests from the response cached under the decoded
+ * pathname, which exists only for a page it prerendered. The prerender listing
+ * classifies those: a page whose effective segment config renders it
+ * dynamically (`dynamic = "force-dynamic"`, `revalidate = 0` or the edge
+ * runtime on any segment) and a Route Handler have no such entry, so the
+ * dynamic sibling renders. So does a page whose sources can't be read here;
+ * its sibling's render stays out of the shared caches. A cacheComponents
+ * build lists every page route, as the prerender listing does.
+ */
+function buildAppDecodedPathnamePatterns(
+  routes: AppRoute[],
+  config: AppRouterConfig | undefined,
+): string[] {
+  const isPrerenderedPage = (route: AppRoute): boolean => {
+    if (config?.cacheComponents) return true;
+    try {
+      return (
+        classifyAppPageRouteStaticEligibility(route, config?.readMdxEsm ?? null) === "eligible"
+      );
+    } catch {
+      return false;
+    }
+  };
+  return routes
+    .filter(
+      (route) =>
+        !route.isDynamic &&
+        !route.routePath &&
+        getAppRouteRenderEntryPath(route) !== null &&
+        isPrerenderedPage(route),
+    )
+    .map((route) => route.pattern);
+}
+
+function buildAppRequestRouteMetadata(routes: AppRoute[]): unknown[] {
+  const readSource = createSegmentSourceReader();
+  const forcesDynamic = (filePath: string | null | undefined): boolean => {
+    const source = readSource(filePath);
     return source !== null && extractExportConstString(source, "dynamic") === "force-dynamic";
   };
 
@@ -258,17 +328,13 @@ function buildAppRequestRouteMetadata(routes: AppRoute[]): unknown[] {
     forceDynamic: route.routePath
       ? forcesDynamic(route.routePath)
       : [
-          ...route.layouts,
-          route.pagePath,
-          ...route.parallelSlots.flatMap((slot) => [
-            slot.layoutPath,
-            ...(slot.configLayoutPaths ?? []),
-            slot.pagePath ?? slot.defaultPath,
-            ...slot.interceptingRoutes.flatMap((intercept) => [
+          ...appPageSegmentConfigPaths(route),
+          ...route.parallelSlots.flatMap((slot) =>
+            slot.interceptingRoutes.flatMap((intercept) => [
               ...intercept.layoutPaths,
               intercept.pagePath,
             ]),
-          ]),
+          ),
           ...route.siblingIntercepts.flatMap((intercept) => [
             ...intercept.layoutPaths,
             intercept.pagePath,
@@ -368,6 +434,7 @@ import { dispatchAppRequestStage as __dispatchAppRequestStage } from ${JSON.stri
 import { registerConfiguredCacheAdapters as __registerConfiguredCacheAdapters } from "virtual:vinext-cdn-cache-adapter";
 import { clearAppRequestStageContext as __clearRequestContext, setAppRequestStageNavigationContext as setNavigationContext } from ${JSON.stringify(appRequestStageContextPath)};
 import { matchRoutePattern as __matchRoutePattern } from ${JSON.stringify(routePatternPath)};
+import __pagesClientAssets from "virtual:vinext-pages-client-assets";
 ${middlewarePath ? `import { applyAppMiddleware as __applyAppMiddleware } from ${JSON.stringify(appMiddlewarePath)};` : ""}
 ${
   instrumentationPath
@@ -396,7 +463,6 @@ ${
 import * as __pagesRequestEntry from "virtual:vinext-pages-request-entry";
 import { renderPagesFallback as __renderPagesFallback } from ${JSON.stringify(appPagesBridgePath)};
 import { buildRequestHeadersFromMiddlewareResponse as __buildRequestHeadersFromMiddlewareResponse } from ${JSON.stringify(middlewareRequestHeadersPath)};
-import { decodePathParams as __decodePathParams } from ${JSON.stringify(normalizePathModulePath)};
 import { applyRouteHandlerMiddlewareContext as __applyRouteHandlerMiddlewareContext } from ${JSON.stringify(appRouteHandlerMiddlewareContextPath)};`
     : ""
 }
@@ -428,12 +494,14 @@ export const __imageConfig = ${JSON.stringify({
     contentSecurityPolicy: config?.imageConfig?.contentSecurityPolicy,
     minimumCacheTTL: config?.imageConfig?.minimumCacheTTL,
   })};
+export const __clientBuildFiles = __pagesClientAssets.clientBuildFiles ?? [];
 const __routes = ${JSON.stringify(requestRoutes)};
-const __routeMatcher = __createAppRscRouteMatcher(__routes);
+const __routeMatcher = __createAppRscRouteMatcher(__routes, ${JSON.stringify(buildAppDecodedPathnamePatterns(routes, config))});
 const __metadataRouteMatchers = ${JSON.stringify(metadataRouteMatchers)};
 
 function matchRoute(pathname) { return __routeMatcher.matchRoute(pathname); }
 function matchRequestRoute(pathname) { return __routeMatcher.matchRequestRoute(pathname); }
+function matchRawRequestRoute(pathname) { return __routeMatcher.matchRawRequestRoute(pathname); }
 function hasInterceptionId(interceptionId) { return __routeMatcher.hasInterceptionId(interceptionId); }
 function __isMetadataPath(pathname) {
   const parts = pathname.split("/").filter(Boolean);
@@ -476,6 +544,7 @@ const __requestHandler = createAppRscRequestHandler({
   configRedirects: ${JSON.stringify(config?.redirects ?? [])},
   configRewrites: ${JSON.stringify(config?.rewrites ?? { beforeFiles: [], afterFiles: [], fallback: [] })},
   draftModeSecret: __draftModeSecret,
+  devForwardedMiddlewareContextKey: ${JSON.stringify(config?.devForwardedMiddlewareContextKey ?? null)},
   dispatchMatchedPage() { throw new Error("App request stage attempted to render a page inline"); },
   dispatchMatchedRouteHandler() { throw new Error("App request stage attempted to render a route handler inline"); },
   ${instrumentationPath ? "ensureInstrumentation() { return __ensureInstrumentation(); }," : ""}
@@ -487,6 +556,7 @@ const __requestHandler = createAppRscRequestHandler({
   hasInterceptionId,
   matchRoute,
   matchRequestRoute,
+  matchRawRequestRoute,
   matchInterceptRoute(pathname, sourcePathname, interceptionId) {
     const intercept = __routeMatcher.findIntercept(pathname, sourcePathname, interceptionId);
     if (!intercept) return null;
@@ -520,6 +590,7 @@ const __requestHandler = createAppRscRequestHandler({
       middlewareRequest,
       module: middlewareModule,
       request,
+      skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
       trailingSlash: __trailingSlash,
       validateExternalRewriteRequest,
     });
@@ -549,7 +620,6 @@ const __requestHandler = createAppRscRequestHandler({
           };
         },
         buildRequestHeaders: __buildRequestHeadersFromMiddlewareResponse,
-        decodePathParams: __decodePathParams,
         applyRouteHandlerMiddlewareContext: __applyRouteHandlerMiddlewareContext,
         getDraftModeCookieHeader,
       }
@@ -559,6 +629,7 @@ const __requestHandler = createAppRscRequestHandler({
   }
   rootParamNamesByPattern: {},
   setNavigationContext,
+  skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
   staticParamsMap: {},
   trailingSlash: __trailingSlash,
   validateDevRequestOrigin: __validateDevRequestOrigin,
@@ -778,7 +849,6 @@ ${
     : ""
 }
 import { setPagesClientAssets as __setPagesClientAssets } from "vinext/server/pages-client-assets";
-import { decodePathParams as __decodePathParams } from ${JSON.stringify(normalizePathModulePath)};
 import { buildRequestHeadersFromMiddlewareResponse as __buildRequestHeadersFromMiddlewareResponse } from ${JSON.stringify(middlewareRequestHeadersPath)};
 ${
   hasPagesDir
@@ -791,7 +861,9 @@ const __loadAppRouteHandlerDispatch = () => import(${JSON.stringify(appRouteHand
 ${
   hasServerActions
     ? `const __loadAppServerActionExecution = () => import(${JSON.stringify(appServerActionExecutionPath)});
-const __loadAppActionForwarding = () => import(${JSON.stringify(appActionForwardingPath)});`
+const __loadAppActionForwarding = () => import(${JSON.stringify(appActionForwardingPath)});
+import { isolateServerReferenceLoads as __isolateServerReferenceLoads } from ${JSON.stringify(serverReferenceLoaderPath)};
+__isolateServerReferenceLoads();`
     : ""
 }
 ${
@@ -856,6 +928,8 @@ import {
   SIBLING_PAGE_INTERCEPT_SLOT_KEY as __SIBLING_PAGE_INTERCEPT_SLOT_KEY,
 } from ${JSON.stringify(appRscRouteMatchingPath)};
 import {
+  appIsrFallbackShellHtmlKey as __isrFallbackShellHtmlKey,
+  appIsrFallbackShellKey as __isrFallbackShellKey,
   appIsrHtmlKey as __isrHtmlKey,
   appIsrRscKey as __isrRscKey,
   appIsrRouteKey as __isrRouteKey,
@@ -1069,7 +1143,7 @@ function __VINEXT_CLASS_REASONS(routeIdx) {
 const routes = [
 ${routeEntries.join(",\n")}
 ];
-const __routeMatcher = __createAppRscRouteMatcher(routes);
+const __routeMatcher = __createAppRscRouteMatcher(routes, ${JSON.stringify(buildAppDecodedPathnamePatterns(routes, config))});
 
 ${
   instrumentationPath
@@ -1180,6 +1254,10 @@ function matchRequestRoute(url) {
   return __routeMatcher.matchRequestRoute(url);
 }
 
+function matchRawRequestRoute(url) {
+  return __routeMatcher.matchRawRequestRoute(url);
+}
+
 /**
  * Check if a pathname matches any intercepting route.
  * Returns the match info or null.
@@ -1245,6 +1323,9 @@ export async function seedMemoryCacheFromPrerender(serverDir) {
     buildAppPageHtmlKey(pathname) {
       return __isrHtmlKey(pathname);
     },
+    buildAppPageFallbackShellKey(pathname, suffix) {
+      return __isrFallbackShellKey(pathname, suffix);
+    },
     buildAppPageRscKey(pathname) {
       return __isrRscKey(pathname);
     },
@@ -1289,6 +1370,7 @@ ${rootParamNameEntries.join("\n")}
 };
 
 __setPagesClientAssets(__pagesClientAssets);
+export const __clientBuildFiles = __pagesClientAssets.clientBuildFiles ?? [];
 function __VINEXT_ACTION_OWNERS() { return ${actionOwners === undefined ? "__vinextActionOwners" : safeJsonStringify(actionOwners)}; }
 ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandler = createAppRscHandler({"}
   assetPrefix: __assetPrefix,
@@ -1314,6 +1396,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   ${config?.serveImagesInProcess ? "resolveImageSourceFetch: getNitroImageSourceFetch," : ""}
   isDev: process.env.NODE_ENV !== "production",
   draftModeSecret: __draftModeSecret,
+  devForwardedMiddlewareContextKey: ${JSON.stringify(config?.devForwardedMiddlewareContextKey ?? null)},
   dispatchMatchedPage({
     bypassInterceptionContextCache,
     cachePathname,
@@ -1437,6 +1520,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       isRscRequest,
       isrDebug: __isrDebug,
       isrGet: __isrGet,
+      isrFallbackShellHtmlKey: __isrFallbackShellHtmlKey,
       isrHtmlKey(pathname) {
         return __isrHtmlKey(pathname === cleanPathname ? cachePathname : pathname);
       },
@@ -1555,6 +1639,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       draftModeSecret: __draftModeSecret,
       i18n: __i18nConfig,
       trailingSlash: __trailingSlash,
+      skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
       isrDebug: __isrDebug,
       isrGet: __isrGet,
       isrRouteKey(pathname) {
@@ -1905,6 +1990,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   }
   matchRoute,
   matchRequestRoute,
+  matchRawRequestRoute,
   hasInterceptionId,
   matchInterceptRoute(pathname, sourcePathname, interceptionId) {
     const intercept = findIntercept(pathname, sourcePathname, interceptionId);
@@ -1939,6 +2025,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       middlewareRequest,
       module: middlewareModule,
       request,
+      skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
       trailingSlash: __trailingSlash,
       validateExternalRewriteRequest,
     });
@@ -1981,7 +2068,6 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
           };
         },
         buildRequestHeaders: __buildRequestHeadersFromMiddlewareResponse,
-        decodePathParams: __decodePathParams,
         applyRouteHandlerMiddlewareContext: __applyRouteHandlerMiddlewareContext,
         getDraftModeCookieHeader,
       }
@@ -1991,6 +2077,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   }
   rootParamNamesByPattern: rootParamNamesMap,
   setNavigationContext,
+  skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
   staticParamsMap: generateStaticParamsMap,
   trailingSlash: __trailingSlash,
   validateDevRequestOrigin: __validateDevRequestOrigin,

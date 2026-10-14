@@ -18,8 +18,10 @@
  */
 
 import { assetPrefixPathname, ASSET_PREFIX_URL_DIR } from "../utils/asset-prefix.js";
+import { hasBasePath } from "../utils/base-path.js";
 import { setCacheStateHeaders } from "./cache-headers.js";
 import { badRequestResponse } from "./http-error-responses.js";
+import { VINEXT_PRERENDER_SPECIAL_ERROR_HEADER } from "./headers.js";
 
 /** The pathname that triggers image optimization (matches Next.js). */
 export const IMAGE_OPTIMIZATION_PATH = "/_next/image";
@@ -124,6 +126,167 @@ export function resolveDevImageRedirect(
   return resolved.pathname + resolved.search;
 }
 
+const IMAGE_OPTIMIZATION_SIGNAL = Symbol.for("vinext.image-optimization-signal");
+
+export type ImageOptimizationSignal = {
+  /** Middleware response headers to send with the image. */
+  middlewareHeaders: Headers;
+  /** The request headers after middleware's overrides, when it set any. */
+  requestHeaders: Headers | null;
+  /** The image query after middleware and rewrites. */
+  search: string;
+};
+
+/**
+ * Mark the App Router's image endpoint response once the request has passed
+ * middleware and rewrites. A host that serves images itself (the Node
+ * production server) replaces the response with the image; other hosts send
+ * the response unchanged. The symbol carries the signal across the built RSC
+ * module boundary, so response headers cannot forge it.
+ */
+export function markImageOptimizationSignal(
+  response: Response,
+  signal: ImageOptimizationSignal,
+): Response {
+  Object.defineProperty(response, IMAGE_OPTIMIZATION_SIGNAL, { value: signal });
+  return response;
+}
+
+/** Return the signal of a framework-created image endpoint response. */
+export function readImageOptimizationSignal(response: Response): ImageOptimizationSignal | null {
+  const signal: unknown = Reflect.get(response, IMAGE_OPTIMIZATION_SIGNAL);
+  if (typeof signal !== "object" || signal === null) return null;
+  const { middlewareHeaders, requestHeaders, search } = signal as Partial<ImageOptimizationSignal>;
+  return middlewareHeaders instanceof Headers &&
+    (requestHeaders === null || requestHeaders instanceof Headers) &&
+    typeof search === "string"
+    ? { middlewareHeaders, requestHeaders, search }
+    : null;
+}
+
+const IMAGE_OPTIMIZATION_SIGNAL_TRANSPORT_HEADER = "x-vinext-stage-image-optimization";
+
+function isHeaderEntries(value: unknown): value is [string, string][] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (entry) =>
+        Array.isArray(entry) &&
+        entry.length === 2 &&
+        typeof entry[0] === "string" &&
+        typeof entry[1] === "string",
+    )
+  );
+}
+
+/**
+ * Carry a signal through the response-stage transport, which drops the
+ * symbol. The signal rides in the body of the bodiless carrier, with the
+ * carrier's status in the token-authenticated marker.
+ */
+export function serializeImageOptimizationSignalForTransport(
+  response: Response,
+  token: string,
+): Response {
+  const signal = readImageOptimizationSignal(response);
+  if (signal === null) return response;
+  const headers = new Headers(response.headers);
+  headers.set(IMAGE_OPTIMIZATION_SIGNAL_TRANSPORT_HEADER, `${token}:${response.status}`);
+  return new Response(
+    JSON.stringify({
+      middlewareHeaders: [...signal.middlewareHeaders],
+      requestHeaders: signal.requestHeaders ? [...signal.requestHeaders] : null,
+      search: signal.search,
+    }),
+    { headers },
+  );
+}
+
+/** Restore and consume a signal returned by the trusted response-stage wrapper. */
+export async function restoreImageOptimizationSignalFromTransport(
+  response: Response,
+  token: string,
+): Promise<Response> {
+  const marker = response.headers.get(IMAGE_OPTIMIZATION_SIGNAL_TRANSPORT_HEADER);
+  // Non-standard responses such as Worker WebSocket upgrades cannot be
+  // reconstructed, and can never carry the signal.
+  if (marker === null || response.status < 200 || response.status > 599) return response;
+  const headers = new Headers(response.headers);
+  headers.delete(IMAGE_OPTIMIZATION_SIGNAL_TRANSPORT_HEADER);
+  const prefix = `${token}:`;
+  const status = marker.startsWith(prefix) ? Number(marker.slice(prefix.length)) : NaN;
+  if (!Number.isInteger(status) || status < 200 || status > 599) {
+    // An application value under the reserved name stays inert.
+    const body =
+      response.status === 204 || response.status === 205 || response.status === 304
+        ? null
+        : response.body;
+    return new Response(body, {
+      headers,
+      status: response.status,
+      statusText: response.statusText,
+    });
+  }
+  // The token authenticates this body as the response stage's own output.
+  const transported: unknown = JSON.parse(await response.text());
+  const { middlewareHeaders, requestHeaders, search } = (transported ?? {}) as Record<
+    string,
+    unknown
+  >;
+  if (
+    !isHeaderEntries(middlewareHeaders) ||
+    (requestHeaders !== null && !isHeaderEntries(requestHeaders)) ||
+    typeof search !== "string"
+  ) {
+    throw new Error("Invalid image optimization signal from the response stage");
+  }
+  return markImageOptimizationSignal(new Response(null, { headers, status }), {
+    middlewareHeaders: new Headers(middlewareHeaders),
+    requestHeaders: requestHeaders ? new Headers(requestHeaders) : null,
+    search,
+  });
+}
+
+/**
+ * Whether a local source's pipeline status carries the file's bytes. A no-body
+ * success such as 204 serves no file, which Next.js rejects as an invalid
+ * image.
+ */
+export function isImageSourceBodyStatus(status: number): boolean {
+  return status >= 200 && status < 300 && status !== 204 && status !== 205;
+}
+
+/**
+ * Body Next.js answers, with a 400, for a local source that yields no image:
+ * a missing file, or anything middleware or routing answers in its place.
+ */
+export const INVALID_IMAGE_SOURCE_MESSAGE = "The requested resource isn't a valid image.";
+
+export function invalidImageSourceResponse(): Response {
+  return new Response(INVALID_IMAGE_SOURCE_MESSAGE, { status: 400 });
+}
+
+const RECURSIVE_IMAGE_URL_RE = /\/_(?:next|vinext)\/image(?:$|\/)/;
+
+/**
+ * The URL of a local image source. vinext's next/image emits the endpoint
+ * without the basePath, so a host that admits that form passes the basePath
+ * as `sourceBasePath` and an unprefixed source resolves under it. Build output
+ * under a path `assetPrefix` is already served at its emitted URL.
+ */
+export function resolveImageSourceUrl(
+  imageUrl: string,
+  sourceBasePath: string,
+  assetPathPrefix: string,
+  requestUrl: string,
+): URL {
+  const servedAsEmitted =
+    !sourceBasePath ||
+    hasBasePath(imageUrl, sourceBasePath) ||
+    (assetPathPrefix !== "" && imageUrl.startsWith(`${assetPathPrefix}/${ASSET_PREFIX_URL_DIR}/`));
+  return new URL(servedAsEmitted ? imageUrl : sourceBasePath + imageUrl, requestUrl);
+}
+
 /**
  * Parse and validate image optimization query parameters.
  * Returns null if the request is malformed.
@@ -185,6 +348,12 @@ export function parseImageParams(
     const base = "https://localhost";
     const resolved = new URL(normalizedUrl, base);
     if (resolved.origin !== base) {
+      return null;
+    }
+    // Hosts fetch a local source through the application, so a source that is
+    // itself the image endpoint would recurse. Next.js rejects it the same way
+    // (`"url" parameter cannot be recursive` in validateParams).
+    if (RECURSIVE_IMAGE_URL_RE.test(decodeURIComponent(resolved.pathname))) {
       return null;
     }
   } catch {
@@ -340,7 +509,7 @@ export async function handleImageOptimization(
   // Fetch source image
   const source = await handlers.fetchAsset(imageUrl, request);
   if (!source.ok || !source.body) {
-    return new Response("Image not found", { status: 404 });
+    return invalidImageSourceResponse();
   }
 
   // Negotiate output format from Accept header
@@ -392,7 +561,7 @@ export async function handleImageOptimization(
     console.error("[vinext] Image fallback error, refetching source image:", e);
     const refetchedSource = await handlers.fetchAsset(imageUrl, request);
     if (!refetchedSource.ok || !refetchedSource.body) {
-      return new Response("Image not found", { status: 404 });
+      return invalidImageSourceResponse();
     }
 
     const refetchedContentType = refetchedSource.headers.get("Content-Type");
@@ -627,4 +796,41 @@ export async function handleImageOptimizationFromSource(
     );
   }
   return response;
+}
+
+/** Middleware response headers that describe its own body, never the image. */
+const IMAGE_OMITTED_MIDDLEWARE_HEADERS = new Set([
+  "content-encoding",
+  "content-length",
+  "content-range",
+  "content-type",
+  "transfer-encoding",
+  VINEXT_PRERENDER_SPECIAL_ERROR_HEADER,
+]);
+
+/**
+ * Send middleware's response headers with an image the App Router answered
+ * itself, as the Node and Worker hosts do for a signalled image endpoint. The
+ * image's own headers win; cookies from both are kept.
+ */
+export function mergeImageMiddlewareResponseHeaders(
+  response: Response,
+  middlewareHeaders: Headers,
+): Response {
+  const headers = new Headers();
+  middlewareHeaders.forEach((value, name) => {
+    if (name === "set-cookie" || IMAGE_OMITTED_MIDDLEWARE_HEADERS.has(name)) return;
+    headers.set(name, value);
+  });
+  response.headers.forEach((value, name) => {
+    if (name !== "set-cookie") headers.set(name, value);
+  });
+  for (const cookie of middlewareHeaders.getSetCookie()) headers.append("set-cookie", cookie);
+  for (const cookie of response.headers.getSetCookie()) headers.append("set-cookie", cookie);
+  const status = response.status;
+  return new Response(status === 204 || status === 205 || status === 304 ? null : response.body, {
+    headers,
+    status,
+    statusText: response.statusText,
+  });
 }

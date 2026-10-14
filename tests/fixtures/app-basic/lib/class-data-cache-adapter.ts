@@ -9,7 +9,10 @@
 type AdapterArgs = { env: unknown; options: { label: string } };
 type Entry = { lastModified: number; value: unknown };
 
-const PROBE_KEY_PREFIX = "unstable_cache:v2:unstable-cache-test:";
+// unstable_cache keys are a digest of the callback, keyParts and arguments, so
+// the probe answers every unstable_cache lookup. The test only renders the
+// `/unstable-cache-test` page, which makes the one lookup.
+const PROBE_KEY_PREFIX = "unstable_cache:";
 
 export default class ClassDataCacheAdapter {
   readonly #label: string;

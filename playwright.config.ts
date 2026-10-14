@@ -59,11 +59,18 @@ const projectServers = {
   "app-router-isr-prod": {
     testDir: "./tests/e2e",
     testMatch: [
+      "app-router/action-bound-args.spec.ts",
       "app-router/isr.spec.ts",
       "app-router/metadata-react-cache.spec.ts",
+      "app-router-prod/action-error-sanitization.spec.ts",
       "app-router-prod/special-error-navigation.spec.ts",
       "app-router-prod/static-hydration.spec.ts",
       "app-router-prod/use-cache.spec.ts",
+      "app-router-prod/public-file-encoding.spec.ts",
+      "app-router-prod/image-middleware.spec.ts",
+      "app-router-prod/pages-res-revalidate.spec.ts",
+      "app-router/preload-rejection.spec.ts",
+      "app-router/external-rewrite-host-capture.spec.ts",
     ],
     use: { baseURL: "http://localhost:4198" },
     server: {
@@ -278,11 +285,14 @@ const projectServers = {
     testDir: "./tests/e2e",
     testMatch: [
       "**/cloudflare-pages-router-dev/**/*.spec.ts",
+      "**/cloudflare-pages-router/middleware-data-guard.spec.ts",
       "**/pages-router/instrumentation-startup.spec.ts",
     ],
     use: { baseURL: "http://localhost:4179" },
     server: {
-      command: "npx vp dev --force --port 4179",
+      // Cover the Worker request stage with raw `_next/data` URLs reaching
+      // middleware; the production project keeps the default config.
+      command: "VINEXT_E2E_SKIP_PROXY_URL_NORMALIZE=1 npx vp dev --force --port 4179",
       cwd: "./examples/pages-router-cloudflare",
       port: 4179,
       reuseExistingServer: !process.env.CI,
@@ -572,7 +582,8 @@ const projectServers = {
     testDir: "./tests/e2e/cloudflare-encoded-paths",
     use: { baseURL: "http://localhost:4197" },
     server: {
-      command: "npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4197",
+      command:
+        "CF_APP_BASIC_RUN_WORKER_FIRST=1 npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4197",
       cwd: "./tests/fixtures/cf-app-basic",
       port: 4197,
       reuseExistingServer: !process.env.CI,
@@ -602,6 +613,49 @@ const projectServers = {
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
     },
+  },
+  "module-federation": {
+    testDir: "./tests/e2e/module-federation",
+    use: { baseURL: "http://localhost:4220" },
+    server: {
+      command: "npx vp run vinext#build && npx vp build && npx vp preview --port 4220 --strictPort",
+      cwd: "./tests/fixtures/module-federation-host",
+      port: 4220,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    // Playwright starts web servers in order, so vinext is built before the
+    // remote imports vinext/client.
+    additionalServers: [
+      {
+        command: "npx vp build && npx vp preview --port 4221 --strictPort",
+        cwd: "./tests/fixtures/module-federation-remote",
+        port: 4221,
+        reuseExistingServer: !process.env.CI,
+        timeout: 60_000,
+      },
+    ],
+  },
+  "module-federation-cloudflare": {
+    testDir: "./tests/e2e/module-federation",
+    use: { baseURL: "http://localhost:4222" },
+    server: {
+      command:
+        "npx vp run vinext#build && npx vp build --config vite.cloudflare.config.ts && npx wrangler dev --config dist/server/wrangler.json --port 4222",
+      cwd: "./tests/fixtures/module-federation-host",
+      port: 4222,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    additionalServers: [
+      {
+        command: "npx vp build && npx vp preview --port 4221 --strictPort",
+        cwd: "./tests/fixtures/module-federation-remote",
+        port: 4221,
+        reuseExistingServer: !process.env.CI,
+        timeout: 60_000,
+      },
+    ],
   },
   "nextjs-worker-cloudflare": {
     testDir: "./tests/e2e/nextjs-worker",
