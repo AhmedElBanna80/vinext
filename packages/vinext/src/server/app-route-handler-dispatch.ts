@@ -8,6 +8,7 @@ import {
   setCurrentForceDynamicFetchDefault,
   type FetchCacheMode,
 } from "vinext/shims/fetch-cache";
+import { runInWorkStoreScope } from "vinext/shims/internal/work-store-scope";
 import { _drainPendingRevalidations } from "vinext/shims/cache-request-state";
 import {
   consumeDynamicUsage,
@@ -98,6 +99,7 @@ type DispatchAppRouteHandlerOptions = {
   isrRouteKey: (pathname: string) => string;
   isrSet: RouteHandlerCacheSetter;
   trailingSlash?: boolean;
+  skipTrailingSlashRedirect?: boolean;
   middlewareContext: RouteHandlerMiddlewareContext;
   middlewareRequestHeaders?: Headers | null;
   /**
@@ -149,25 +151,27 @@ async function runInRouteHandlerRevalidationContext(
     unstableCacheRevalidation: "foreground",
   });
 
-  const revalidation = runWithRequestContext(requestContext, async () => {
-    ensureFetchPatch();
-    setCurrentFetchSoftTags(
-      buildRouteHandlerPageCacheTags(options.cleanPathname, [], options.routeSegments),
-    );
-    // The revalidation render runs in a fresh request context, so the fetch
-    // defaults applied by `dispatchAppRouteHandler` must be re-applied here.
-    setCurrentFetchCacheMode(options.fetchCacheMode);
-    setCurrentFetchRevalidate(options.revalidateSeconds);
-    setCurrentForceDynamicFetchDefault(options.dynamicConfig === "force-dynamic");
-    try {
-      await renderFn();
-    } finally {
-      // Stale ISR regeneration invokes the route handler directly instead of
-      // going through executeAppRouteHandler(), so its fresh request context
-      // owns and drains any synchronous next/cache invalidations here.
-      await _drainPendingRevalidations();
-    }
-  });
+  const revalidation = runWithRequestContext(requestContext, () =>
+    runInWorkStoreScope(async () => {
+      ensureFetchPatch();
+      setCurrentFetchSoftTags(
+        buildRouteHandlerPageCacheTags(options.cleanPathname, [], options.routeSegments),
+      );
+      // The revalidation render runs in a fresh request context, so the fetch
+      // defaults applied by `dispatchAppRouteHandler` must be re-applied here.
+      setCurrentFetchCacheMode(options.fetchCacheMode);
+      setCurrentFetchRevalidate(options.revalidateSeconds);
+      setCurrentForceDynamicFetchDefault(options.dynamicConfig === "force-dynamic");
+      try {
+        await renderFn();
+      } finally {
+        // Stale ISR regeneration invokes the route handler directly instead of
+        // going through executeAppRouteHandler(), so its fresh request context
+        // owns and drains any synchronous next/cache invalidations here.
+        await _drainPendingRevalidations();
+      }
+    }),
+  );
   try {
     await revalidation;
   } finally {
@@ -272,7 +276,7 @@ async function dispatchAppRouteHandlerImpl(
     options.request.headers.get(PRERENDER_REVALIDATE_HEADER),
   )
     ? "on-demand"
-    : shouldReadRouteCache
+    : shouldReadRouteCache && revalidateSeconds !== Infinity
       ? "stale"
       : undefined;
 
@@ -288,6 +292,7 @@ async function dispatchAppRouteHandlerImpl(
   setCurrentFetchRevalidate(configuredRevalidateSeconds);
   setCurrentForceDynamicFetchDefault(handler.dynamic === "force-dynamic");
 
+  let isRevalidation = false;
   if (shouldReadRouteCache && resolvedHandlerFn) {
     const cachedRouteResponse = await readAppRouteHandlerCacheResponse({
       basePath: options.basePath,
@@ -302,10 +307,15 @@ async function dispatchAppRouteHandlerImpl(
       handlerFn: resolvedHandlerFn,
       i18n: options.i18n,
       trailingSlash: options.trailingSlash,
+      skipTrailingSlashRedirect: options.skipTrailingSlashRedirect,
       isAutoHead,
       appendResponseLink,
       isrDebug: options.isrDebug,
-      isrGet: options.isrGet,
+      async isrGet(key) {
+        const entry = await options.isrGet(key);
+        isRevalidation = entry?.value.value?.kind === "APP_ROUTE";
+        return entry;
+      },
       isrRouteKey: options.isrRouteKey,
       isrSet: options.isrSet,
       markDynamicUsage,
@@ -347,6 +357,7 @@ async function dispatchAppRouteHandlerImpl(
 
   if (resolvedHandlerFn) {
     const response = await executeAppRouteHandler({
+      isRevalidation,
       basePath: options.basePath,
       bypassSharedCache: options.bypassSharedCache,
       buildPageCacheTags(pathname, extraTags) {
@@ -365,6 +376,7 @@ async function dispatchAppRouteHandlerImpl(
       handlerFn: resolvedHandlerFn,
       i18n: options.i18n,
       trailingSlash: options.trailingSlash,
+      skipTrailingSlashRedirect: options.skipTrailingSlashRedirect,
       isAutoHead,
       initialDraftModeCookie,
       isDraftMode,

@@ -3251,6 +3251,90 @@ describe("fetch cache shim", () => {
       expect((await res2.json()).count).toBe(2);
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
+
+    // Bodies such as async iterables are built into a Request as fetch would,
+    // and keyed by that Request's bytes.
+    describe("bodies built into a Request", () => {
+      const read = async (body: unknown, init: RequestInit = {}) => {
+        startNewFetchCacheScope();
+        const res = await fetch("https://api.example.com/body-built-request", {
+          method: "POST",
+          body: body as BodyInit,
+          duplex: "half",
+          next: { revalidate: 60 },
+          ...init,
+        } as RequestInit);
+        return (await res.json()).count as number;
+      };
+      const sent = (callIndex: number) => fetchMock.mock.calls[callIndex][0] as Request;
+      async function* iterable(...chunks: string[]) {
+        for (const chunk of chunks) yield new TextEncoder().encode(chunk);
+      }
+
+      it("keys async iterable bodies by their bytes and sends each body", async () => {
+        expect(await read(iterable('{"user":', '"a"}'))).toBe(1);
+        expect(await read(iterable('{"user":', '"b"}'))).toBe(2);
+        expect(await read(iterable('{"user":"a"}'))).toBe(1);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(await sent(0).text()).toBe('{"user":"a"}');
+        expect(await sent(1).text()).toBe('{"user":"b"}');
+      });
+
+      it("keys bodies the runtime converts to strings by that string", async () => {
+        expect(await read({ toString: () => "a" })).toBe(1);
+        expect(await read({ toString: () => "b" })).toBe(2);
+        expect(await read({ toString: () => "a" })).toBe(1);
+        expect(sent(0).headers.get("content-type")).toBe("text/plain;charset=UTF-8");
+        expect(await sent(1).text()).toBe("b");
+      });
+
+      it("sends objects shaped like FormData or a Blob as the runtime does", async () => {
+        // An array has keys() and a Response has arrayBuffer(), but neither is
+        // a FormData or Blob body.
+        expect(await read([1, 2])).toBe(1);
+        expect(await read([1, 3])).toBe(2);
+        expect(await read(new Response("payload"))).toBe(3);
+        expect(await sent(0).text()).toBe("1,2");
+        expect(await sent(2).text()).toBe("[object Response]");
+      });
+
+      it("keys a form body's bytes as sent", async () => {
+        const form = { headers: { "content-type": "application/x-www-form-urlencoded" } };
+        expect(await read({ toString: () => "a=%41" }, form)).toBe(1);
+        expect(await read({ toString: () => "a=A" }, form)).toBe(2);
+        expect(await read({ toString: () => "a=%41" }, form)).toBe(1);
+      });
+
+      it("rejects a body fetch would reject before reading it", async () => {
+        let pulls = 0;
+        async function* body() {
+          pulls++;
+          yield new TextEncoder().encode("a");
+        }
+        await expect(read(body(), { method: "GET" })).rejects.toThrow(TypeError);
+        expect(pulls).toBe(0);
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it("fetches a Request body with chunks other than Uint8Array uncached", async () => {
+        const request = () =>
+          new Request("https://api.example.com/body-request-string-chunks", {
+            method: "POST",
+            body: new ReadableStream({
+              start(controller) {
+                controller.enqueue("a");
+                controller.close();
+              },
+            }),
+            duplex: "half",
+          } as RequestInit);
+        startNewFetchCacheScope();
+        await fetch(request(), { next: { revalidate: 60 } });
+        startNewFetchCacheScope();
+        await fetch(request(), { next: { revalidate: 60 } });
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      });
+    });
   });
 
   // ── Cache key: header inclusion (all headers minus blocklist) ──────
@@ -3370,6 +3454,116 @@ describe("fetch cache shim", () => {
       });
       const data2 = await res2.json();
       expect(data2.count).toBe(2); // Different cache entry
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ── Workers cf.resolveOverride ──────────────────────────────────────
+
+  describe("cf.resolveOverride in cache keys", () => {
+    type WorkersInit = RequestInit & { cf?: Record<string, unknown> };
+
+    // Node's Request drops `cf`; workerd's Request carries it.
+    function requestWithCf(url: string, cf: Record<string, unknown>): Request {
+      const request = new Request(url);
+      Object.defineProperty(request, "cf", { value: cf, configurable: true });
+      return request;
+    }
+
+    function readOrigin(input: string | URL | Request, init?: RequestInit): unknown {
+      const initCf = (init as WorkersInit | undefined)?.cf;
+      if (initCf !== undefined) return initCf.resolveOverride ?? null;
+      return (input as { cf?: { resolveOverride?: unknown } }).cf?.resolveOverride ?? null;
+    }
+
+    beforeEach(() => {
+      fetchMock.mockImplementation(async (input, init) => {
+        requestCount++;
+        return new Response(
+          JSON.stringify({ origin: readOrigin(input, init), count: requestCount }),
+        );
+      });
+    });
+
+    async function cachedFetch(cf: Record<string, unknown>) {
+      const init: WorkersInit = { cf, next: { revalidate: 60 } };
+      return (await fetch("https://api.example.com/tenant-data", init)).json();
+    }
+
+    it("keeps different origins in separate persistent entries", async () => {
+      expect(await cachedFetch({ resolveOverride: "origin-a.example.com" })).toEqual({
+        origin: "origin-a.example.com",
+        count: 1,
+      });
+
+      startNewFetchCacheScope();
+      expect(await cachedFetch({ resolveOverride: "origin-b.example.com" })).toEqual({
+        origin: "origin-b.example.com",
+        count: 2,
+      });
+
+      startNewFetchCacheScope();
+      expect(await cachedFetch({ resolveOverride: "origin-a.example.com" })).toEqual({
+        origin: "origin-a.example.com",
+        count: 1,
+      });
+      expect(await cachedFetch({ resolveOverride: "origin-b.example.com" })).toEqual({
+        origin: "origin-b.example.com",
+        count: 2,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("ignores cf properties that do not select the origin", async () => {
+      await cachedFetch({ resolveOverride: "origin-a.example.com", cacheTtl: 5 });
+
+      startNewFetchCacheScope();
+      const cached = await cachedFetch({
+        resolveOverride: "origin-a.example.com",
+        cacheTtlByStatus: { "100-599": -1 },
+        cacheTags: ["tenant-a"],
+      });
+      expect(cached).toEqual({ origin: "origin-a.example.com", count: 1 });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("keys a Request input's resolveOverride, replaced by a RequestInit cf", async () => {
+      const request = requestWithCf("https://api.example.com/request-cf", {
+        resolveOverride: "origin-a.example.com",
+      });
+
+      const inherited = await fetch(request, { next: { revalidate: 60 } });
+      expect(await inherited.json()).toEqual({ origin: "origin-a.example.com", count: 1 });
+
+      startNewFetchCacheScope();
+      const overrideInit: WorkersInit = {
+        cf: { resolveOverride: "origin-b.example.com" },
+        next: { revalidate: 60 },
+      };
+      const overridden = await fetch(request, overrideInit);
+      expect(await overridden.json()).toEqual({ origin: "origin-b.example.com", count: 2 });
+
+      startNewFetchCacheScope();
+      const plain = await fetch("https://api.example.com/request-cf", { next: { revalidate: 60 } });
+      expect(await plain.json()).toEqual({ origin: null, count: 3 });
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it("dedupes render fetches only within the same origin", async () => {
+      const fetchOrigin = (cf: Record<string, unknown>) => {
+        const init: WorkersInit = { cf, cache: "no-store" };
+        return fetch("https://api.example.com/tenant-dedupe", init).then((res) => res.json());
+      };
+
+      const [a1, b, a2] = await Promise.all([
+        fetchOrigin({ resolveOverride: "origin-a.example.com" }),
+        fetchOrigin({ resolveOverride: "origin-b.example.com" }),
+        fetchOrigin({ resolveOverride: "origin-a.example.com", cacheTtl: 5 }),
+      ]);
+
+      expect(a1).toEqual({ origin: "origin-a.example.com", count: 1 });
+      expect(b).toEqual({ origin: "origin-b.example.com", count: 2 });
+      expect(a2).toEqual(a1);
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
   });

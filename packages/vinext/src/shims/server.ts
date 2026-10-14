@@ -109,10 +109,69 @@ export type RequestInit = globalThis.RequestInit & {
       }>;
     } | null;
     trailingSlash?: boolean;
+    skipTrailingSlashRedirect?: boolean;
   };
   signal?: AbortSignal;
   duplex?: "half";
 };
+
+/**
+ * Workers can hand a GET/HEAD a non-null body (e.g. a GET sent with
+ * Content-Length). Next.js nulls GET/HEAD bodies before user code runs, so a
+ * NextRequest never carries one either.
+ */
+function hasGetOrHeadBody(request: Request): boolean {
+  return (request.method === "GET" || request.method === "HEAD") && request.body !== null;
+}
+
+/**
+ * The Request constructor rejects such a body when it reads a Request init as
+ * a dictionary, as it does for the route handler's tracking Proxy, so rebuild
+ * the init without it. Every other standard field, plus workerd's `cf` and
+ * `fetcher`, is copied so a framed GET builds the same Request as an unframed
+ * one. (`duplex` only applies to a body.)
+ */
+function requestInitFromRequest(request: Request): RequestInit {
+  if (!hasGetOrHeadBody(request)) return request;
+  const cf: unknown = Reflect.get(request, "cf");
+  const fetcher: unknown = Reflect.get(request, "fetcher");
+  const init: RequestInit & { cf?: unknown; fetcher?: unknown } = {
+    method: request.method,
+    headers: request.headers,
+    // An absent body would inherit the input Request's body.
+    body: null,
+    cache: request.cache,
+    credentials: request.credentials,
+    integrity: request.integrity,
+    keepalive: request.keepalive,
+    mode: request.mode,
+    redirect: request.redirect,
+    referrer: request.referrer,
+    referrerPolicy: request.referrerPolicy,
+    signal: request.signal,
+    ...(cf !== undefined ? { cf } : {}),
+    ...(fetcher !== undefined ? { fetcher } : {}),
+  };
+  return init;
+}
+
+/**
+ * A Request input passes its body on unless the init replaces it, so drop a
+ * GET/HEAD input's body when the init keeps the input's method and body. This
+ * covers the requests vinext hands to middleware, route handlers and edge API
+ * routes.
+ */
+function initWithoutInputBody(input: Request, init: RequestInit): RequestInit {
+  if (
+    init instanceof Request ||
+    init.method !== undefined ||
+    init.body !== undefined ||
+    !hasGetOrHeadBody(input)
+  ) {
+    return init;
+  }
+  return { ...init, body: null };
+}
 
 export class NextRequest extends Request {
   private _nextUrl: NextURL;
@@ -130,14 +189,19 @@ export class NextRequest extends Request {
     validateURL(rawUrl);
     // Strip nextConfig before passing to super() — it's vinext-internal,
     // not a valid RequestInit property.
-    const { nextConfig: _nextConfig, ...requestInit } = init ?? {};
+    const { nextConfig: _nextConfig, ...plainInit } = init ?? {};
+    // A Request passed as init (e.g. `new NextRequest(url, request)`) keeps its
+    // method, headers and body on Request.prototype, so the spread above copies
+    // none of them. Hand it to super() as-is, like Next.js does.
+    const requestInit: RequestInit =
+      init instanceof Request ? requestInitFromRequest(init) : plainInit;
     if (input instanceof Request) {
       // Transfer the body like Next.js does (`super(input, init)`). Cloning here
       // would tee the stream, and the branch left on `input` buffers the entire
       // body in memory because nothing reads or cancels it. Callers that need
       // the source request to stay readable must branch it themselves and
       // cancel the branch they do not consume.
-      super(input, requestInit);
+      super(input, initWithoutInputBody(input, requestInit));
       const cfDescriptor = Reflect.getOwnPropertyDescriptor(input, "cf");
       if (cfDescriptor) {
         Object.defineProperty(this, "cf", cfDescriptor);
@@ -173,7 +237,11 @@ export class NextRequest extends Request {
     const urlConfig: NextURLConfig | undefined = _nextConfig
       ? {
           basePath: _nextConfig.basePath,
-          nextConfig: { i18n, trailingSlash: _nextConfig.trailingSlash },
+          nextConfig: {
+            i18n,
+            trailingSlash: _nextConfig.trailingSlash,
+            skipTrailingSlashRedirect: _nextConfig.skipTrailingSlashRedirect,
+          },
         }
       : undefined;
     this._nextUrl = new NextURL(url, undefined, urlConfig);
@@ -363,6 +431,14 @@ export type NextURLConfig = {
      * honour the user's `trailingSlash` config.
      */
     trailingSlash?: boolean;
+    /**
+     * When true, the trailing slash follows the parsed URL instead, and
+     * `trailingSlash` only decides the root, like Next.js's
+     * getNextPathnameInfo. Without the trailing-slash redirect, requests
+     * arrive in either form, so the config can no longer be applied as a
+     * policy.
+     */
+    skipTrailingSlashRedirect?: boolean;
   };
 };
 
@@ -376,6 +452,8 @@ export class NextURL {
    */
   private _configBasePath: string;
   private _basePath: string;
+  private _configTrailingSlash: boolean;
+  private _manualTrailingSlash: boolean;
   private _trailingSlash: boolean;
   private _locale: string | undefined;
   private _configDefaultLocale: string | undefined;
@@ -390,7 +468,10 @@ export class NextURL {
     this._url = new URL(input.toString(), base);
     this._configBasePath = config?.basePath ?? "";
     this._basePath = this._configBasePath;
-    this._trailingSlash = config?.nextConfig?.trailingSlash ?? false;
+    this._configTrailingSlash = config?.nextConfig?.trailingSlash ?? false;
+    this._manualTrailingSlash = config?.nextConfig?.skipTrailingSlashRedirect === true;
+    this._trailingSlash = this._configTrailingSlash;
+    this._analyzeTrailingSlash();
     this._stripBasePath();
     const i18n = config?.nextConfig?.i18n;
     if (i18n) {
@@ -402,6 +483,16 @@ export class NextURL {
       this._configDefaultLocale = i18n.defaultLocale;
       this._analyzeI18n();
     }
+  }
+
+  /**
+   * With `skipTrailingSlashRedirect`, take the slash from the parsed pathname
+   * (before basePath and locale are stripped), as getNextPathnameInfo does.
+   */
+  private _analyzeTrailingSlash(): void {
+    if (!this._manualTrailingSlash) return;
+    const { pathname } = this._url;
+    this._trailingSlash = pathname !== "/" ? pathname.endsWith("/") : this._configTrailingSlash;
   }
 
   /** Strip basePath prefix from the internal pathname.
@@ -483,8 +574,11 @@ export class NextURL {
       : pathname;
     // Internal Next.js assets retain their request shape. In particular,
     // missing build manifests still run middleware without acquiring a slash
-    // from `trailingSlash: true`.
-    if (pathnameWithoutBasePath.startsWith("/_next/")) return removeTrailingSlash(pathname);
+    // from `trailingSlash: true`. With `skipTrailingSlashRedirect` the slash
+    // already comes from the request itself.
+    if (!this._manualTrailingSlash && pathnameWithoutBasePath.startsWith("/_next/")) {
+      return removeTrailingSlash(pathname);
+    }
     if (this._trailingSlash) {
       return pathname.endsWith("/") ? pathname : pathname + "/";
     }
@@ -502,6 +596,7 @@ export class NextURL {
   }
   set href(value: string) {
     this._url.href = value;
+    this._analyzeTrailingSlash();
     this._stripBasePath();
     this._analyzeI18n();
   }
@@ -631,7 +726,12 @@ export class NextURL {
         })),
       };
     }
-    if (this._trailingSlash) {
+    if (this._manualTrailingSlash) {
+      // The constructor re-reads the slash from href; keep the config value
+      // for the root.
+      nextConfig.skipTrailingSlashRedirect = true;
+      if (this._configTrailingSlash) nextConfig.trailingSlash = true;
+    } else if (this._trailingSlash) {
       nextConfig.trailingSlash = true;
     }
     const config: NextURLConfig = {

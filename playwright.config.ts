@@ -48,6 +48,7 @@ const projectServers = {
     testIgnore: [
       appRouterBrowserSpecificTests,
       "**/app-router/nextjs-compat/client-cache.spec.ts",
+      "**/app-router/nextjs-compat/prefetch-redirect.spec.ts",
       "**/app-router/nextjs-compat/route-handler-draft-cache.spec.ts",
       "**/app-router/nextjs-compat/segment-cache-client-params.spec.ts",
       "**/app-router/isr.spec.ts",
@@ -58,9 +59,18 @@ const projectServers = {
   "app-router-isr-prod": {
     testDir: "./tests/e2e",
     testMatch: [
+      "app-router/action-bound-args.spec.ts",
       "app-router/isr.spec.ts",
+      "app-router/metadata-react-cache.spec.ts",
+      "app-router-prod/action-error-sanitization.spec.ts",
+      "app-router-prod/special-error-navigation.spec.ts",
       "app-router-prod/static-hydration.spec.ts",
       "app-router-prod/use-cache.spec.ts",
+      "app-router-prod/public-file-encoding.spec.ts",
+      "app-router-prod/image-middleware.spec.ts",
+      "app-router-prod/pages-res-revalidate.spec.ts",
+      "app-router/preload-rejection.spec.ts",
+      "app-router/external-rewrite-host-capture.spec.ts",
     ],
     use: { baseURL: "http://localhost:4198" },
     server: {
@@ -76,6 +86,7 @@ const projectServers = {
     testDir: "./tests/e2e/app-router/nextjs-compat",
     testMatch: [
       "client-cache.spec.ts",
+      "prefetch-redirect.spec.ts",
       "route-handler-draft-cache.spec.ts",
       "segment-cache-client-params.spec.ts",
     ],
@@ -188,8 +199,10 @@ const projectServers = {
     testMatch: ["**/cloudflare-sentry-app/**/*.spec.ts"],
     use: { baseURL: "http://localhost:4193" },
     server: {
+      // Exercise the built Worker through Miniflare without Wrangler's extra
+      // development proxy, which can exit when a browser connection resets.
       command:
-        "NEXT_PUBLIC_VINEXT_TEST_SENTRY_DSN=http://public@localhost:4193/1 npx vp build && npx wrangler dev --port 4193",
+        "NEXT_PUBLIC_VINEXT_TEST_SENTRY_DSN=http://public@localhost:4193/1 npx vp build && npx vp preview --port 4193",
       cwd: "./tests/fixtures/cf-sentry-app",
       port: 4193,
       reuseExistingServer: !process.env.CI,
@@ -272,11 +285,14 @@ const projectServers = {
     testDir: "./tests/e2e",
     testMatch: [
       "**/cloudflare-pages-router-dev/**/*.spec.ts",
+      "**/cloudflare-pages-router/middleware-data-guard.spec.ts",
       "**/pages-router/instrumentation-startup.spec.ts",
     ],
     use: { baseURL: "http://localhost:4179" },
     server: {
-      command: "npx vp dev --force --port 4179",
+      // Cover the Worker request stage with raw `_next/data` URLs reaching
+      // middleware; the production project keeps the default config.
+      command: "VINEXT_E2E_SKIP_PROXY_URL_NORMALIZE=1 npx vp dev --force --port 4179",
       cwd: "./examples/pages-router-cloudflare",
       port: 4179,
       reuseExistingServer: !process.env.CI,
@@ -313,6 +329,34 @@ const projectServers = {
           timeout: 180_000,
         },
   },
+  "cloudflare-static-assets-pages": {
+    testDir: "./tests/e2e/cloudflare-static-assets-pages",
+    use: { baseURL: process.env.VINEXT_E2E_BASE_URL ?? "http://localhost:4218" },
+    // Deployed runs set VINEXT_E2E_I18N_BASE_URL for the companion example.
+    server: process.env.VINEXT_E2E_BASE_URL
+      ? null
+      : {
+          // Local builds enable the preview/revalidation test controls.
+          command:
+            "npx vp run vinext#build && npx vp run @vinext/cloudflare#build && VINEXT_E2E_CONTROLS=1 npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4218",
+          cwd: "./examples/static-assets-pages",
+          port: 4218,
+          reuseExistingServer: !process.env.CI,
+          timeout: 180_000,
+        },
+    additionalServers: process.env.VINEXT_E2E_BASE_URL
+      ? []
+      : [
+          {
+            command:
+              "npx vp run vinext#build && npx vp run @vinext/cloudflare#build && npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4219",
+            cwd: "./examples/static-assets-pages-i18n",
+            port: 4219,
+            reuseExistingServer: !process.env.CI,
+            timeout: 180_000,
+          },
+        ],
+  },
   "cloudflare-static-export": {
     testDir: "./tests/e2e/cloudflare-static-export",
     use: { baseURL: "http://localhost:4215" },
@@ -335,6 +379,33 @@ const projectServers = {
       port: 4203,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
+    },
+  },
+  "app-router-nitro": {
+    testDir: "./tests/e2e/app-router-nitro",
+    testMatch: ["preview.spec.ts"],
+    use: { baseURL: "http://localhost:4216" },
+    server: {
+      // `vite preview` serves Nitro's own build output. vinext must turn off
+      // @vitejs/plugin-rsc's preview handler, which would otherwise import an
+      // RSC build from dist/server that Nitro never writes.
+      command: "npx vp run vinext#build && npx vp build && npx vp preview --port 4216 --strictPort",
+      cwd: "./examples/app-router-nitro",
+      port: 4216,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+  },
+  "app-router-nitro-dev": {
+    testDir: "./tests/e2e/app-router-nitro",
+    testMatch: ["dev.spec.ts"],
+    use: { baseURL: "http://localhost:4217" },
+    server: {
+      command: "npx vp dev --port 4217 --strictPort",
+      cwd: "./examples/app-router-nitro",
+      port: 4217,
+      reuseExistingServer: !process.env.CI,
+      timeout: 30_000,
     },
   },
   "app-with-src": {
@@ -511,7 +582,8 @@ const projectServers = {
     testDir: "./tests/e2e/cloudflare-encoded-paths",
     use: { baseURL: "http://localhost:4197" },
     server: {
-      command: "npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4197",
+      command:
+        "CF_APP_BASIC_RUN_WORKER_FIRST=1 npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4197",
       cwd: "./tests/fixtures/cf-app-basic",
       port: 4197,
       reuseExistingServer: !process.env.CI,
@@ -541,6 +613,49 @@ const projectServers = {
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
     },
+  },
+  "module-federation": {
+    testDir: "./tests/e2e/module-federation",
+    use: { baseURL: "http://localhost:4220" },
+    server: {
+      command: "npx vp run vinext#build && npx vp build && npx vp preview --port 4220 --strictPort",
+      cwd: "./tests/fixtures/module-federation-host",
+      port: 4220,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    // Playwright starts web servers in order, so vinext is built before the
+    // remote imports vinext/client.
+    additionalServers: [
+      {
+        command: "npx vp build && npx vp preview --port 4221 --strictPort",
+        cwd: "./tests/fixtures/module-federation-remote",
+        port: 4221,
+        reuseExistingServer: !process.env.CI,
+        timeout: 60_000,
+      },
+    ],
+  },
+  "module-federation-cloudflare": {
+    testDir: "./tests/e2e/module-federation",
+    use: { baseURL: "http://localhost:4222" },
+    server: {
+      command:
+        "npx vp run vinext#build && npx vp build --config vite.cloudflare.config.ts && npx wrangler dev --config dist/server/wrangler.json --port 4222",
+      cwd: "./tests/fixtures/module-federation-host",
+      port: 4222,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    additionalServers: [
+      {
+        command: "npx vp build && npx vp preview --port 4221 --strictPort",
+        cwd: "./tests/fixtures/module-federation-remote",
+        port: 4221,
+        reuseExistingServer: !process.env.CI,
+        timeout: 60_000,
+      },
+    ],
   },
   "nextjs-worker-cloudflare": {
     testDir: "./tests/e2e/nextjs-worker",
