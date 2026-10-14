@@ -100,7 +100,7 @@ import { planRouteClassificationInjection } from "./build/route-classification-i
 import { createActionOwnerManifestPlugin } from "./plugins/action-owner-manifest.js";
 import {
   createRscScanGlobImportsPlugin,
-  RSC_SCAN_GLOB_IMPORTS_AFFECTED_FROM,
+  isRscScanGlobImportsAffected,
 } from "./plugins/rsc-scan-glob-imports.js";
 import {
   normalizePathnameForRouteMatch,
@@ -295,6 +295,7 @@ import {
 } from "./plugins/sass.js";
 import {
   createClientFileNameConfig,
+  assertClientOutDirIsSeparate,
   createClientManualChunks,
   createClientCodeSplittingConfig,
   createClientAssetFileNames,
@@ -377,7 +378,7 @@ import {
   isViteCliConfigFile,
 } from "./utils/vite-cli-invocation.js";
 import { assertPluginRscVersion } from "./utils/plugin-rsc-version.js";
-import { getReactUpgradeDeps, isVersionBelow } from "./utils/react-version.js";
+import { getReactUpgradeDeps } from "./utils/react-version.js";
 import {
   isPathInside,
   isPathInsideOrEqual,
@@ -1555,7 +1556,9 @@ export type VinextOptions = {
   ssrOutDir?: string;
   /**
    * Override the output directory for the client bundle.
-   * Defaults to Vite's default (dist/client or dist).
+   * Defaults to "dist/client". Like rscOutDir and ssrOutDir, it is not
+   * supported by `vinext start` or `output: "standalone"`, which expect the
+   * default dist/ layout.
    */
   clientOutDir?: string;
   /**
@@ -2617,6 +2620,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           typeof config.build?.emptyOutDir === "boolean" ? config.build.emptyOutDir : undefined;
         isServeCommand = env.command === "serve";
         root = path.resolve(toSlash(process.cwd()), config.root ?? ".");
+        if (env.command === "build") assertClientOutDirIsSeparate(root, options);
         const devCliLifecycleEnabled =
           env.command === "serve" &&
           env.isPreview !== true &&
@@ -4226,6 +4230,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 // that should be preloaded when a dynamic boundary renders.
                 // Cloudflare builds also use it to inject lazy chunk metadata
                 // into the Worker entry.
+                ...(options.clientOutDir ? { outDir: options.clientOutDir } : {}),
                 manifest: true,
                 ...(hasPagesDir ? { ssrManifest: true } : {}),
                 // Client-scoped so RSC/SSR keep their normal asset handling
@@ -4253,6 +4258,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 ...depOptimizeNodeEnvOptions,
               },
               build: {
+                ...(options.clientOutDir ? { outDir: options.clientOutDir } : {}),
                 manifest: true,
                 ssrManifest: true,
                 assetsInlineLimit: clientAssetsInlineLimit,
@@ -4282,7 +4288,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 ...depOptimizeNodeEnvOptions,
               },
               build: {
-                outDir: "dist/client",
+                outDir: options.clientOutDir ?? "dist/client",
                 manifest: true,
                 ssrManifest: true,
                 assetsInlineLimit: clientAssetsInlineLimit,
@@ -6914,6 +6920,7 @@ export const loadServerActionClient = ${
                             h: mwCtxEntries,
                             s: mwStatus ?? null,
                             r: result.rewriteUrl ?? null,
+                            b: result.rewriteHadBasePath ?? null,
                           }),
                         );
                       }
@@ -7027,10 +7034,13 @@ export const loadServerActionClient = ${
                   stagedHeaders,
                   phase,
                   resolvedUrl,
+                  _request,
+                  resolvedPathnameHasBasePath,
                 ) => {
                   // Next.js resolves middleware and beforeFiles rewrites before
-                  // dispatching the built-in image endpoint.
-                  if (isImageOptimizationPath(requestPathname)) {
+                  // dispatching the built-in image endpoint, which it serves
+                  // only under the basePath.
+                  if (resolvedPathnameHasBasePath && isImageOptimizationPath(requestPathname)) {
                     const imageRequestUrl = new URL(resolvedUrl, requestOrigin);
                     const allowedWidths = [
                       ...(nextConfig.images?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
@@ -8426,7 +8436,7 @@ export const loadServerActionClient = ${
           if (!envConfig) return;
 
           const buildRoot = envConfig.root ?? process.cwd();
-          const clientDir = path.resolve(buildRoot, "dist", "client");
+          const clientDir = path.resolve(buildRoot, envConfig.build.outDir);
           const manifest = collectInlineCssManifest(clientDir, nextConfig.assetPrefix);
           const rscOutDir = path.resolve(
             buildRoot,
@@ -8683,7 +8693,7 @@ export const loadServerActionClient = ${
   if (rscPluginPromise) {
     plugins.push(rscPluginPromise);
   }
-  if (rscVersion && !isVersionBelow(rscVersion, RSC_SCAN_GLOB_IMPORTS_AFFECTED_FROM)) {
+  if (rscVersion && isRscScanGlobImportsAffected(rscVersion)) {
     plugins.push(
       createRscScanGlobImportsPlugin({
         async getManager(config) {

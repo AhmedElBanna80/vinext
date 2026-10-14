@@ -47,6 +47,8 @@ export type MiddlewareResult = {
   redirectUrl?: string;
   redirectStatus?: number;
   rewriteUrl?: string;
+  /** False when a same-origin rewrite target was outside the basePath. */
+  rewriteHadBasePath?: boolean;
   rewriteStatus?: number;
   status?: number;
   responseHeaders?: Headers;
@@ -591,16 +593,6 @@ async function executeMiddlewareModule(
     return { continue: true, waitUntilPromises };
   }
 
-  if (response.headers.get(MIDDLEWARE_NEXT_HEADER) === "1") {
-    releaseMiddlewareRequestBody(nextRequest, waitUntilPromises);
-    return {
-      continue: true,
-      responseHeaders: collectMiddlewareHeaders(response),
-      status: response.status !== 200 ? response.status : undefined,
-      waitUntilPromises,
-    };
-  }
-
   if (response.status >= 300 && response.status < 400) {
     const location = response.headers.get("Location") ?? response.headers.get("location");
     if (location) {
@@ -688,6 +680,7 @@ async function executeMiddlewareModule(
   const rewriteUrl = response.headers.get(MIDDLEWARE_REWRITE_HEADER);
   if (rewriteUrl) {
     let rewritePath: string;
+    let rewriteHadBasePath: boolean | undefined;
     try {
       const rewriteParsed = new URL(rewriteUrl, options.request.url);
       const requestOrigin = new URL(options.request.url).origin;
@@ -710,6 +703,8 @@ async function executeMiddlewareModule(
         // but callers (pages pipeline, App Router handler) always operate on
         // basePath-stripped paths. This mirrors the Next.js behavior where the
         // rewrite target is normalized via getNextPathnameInfo before routing.
+        rewriteHadBasePath =
+          !options.basePath || hasBasePath(rewriteParsed.pathname, options.basePath);
         const rewritePathname = options.basePath
           ? stripBasePath(rewriteParsed.pathname, options.basePath)
           : rewriteParsed.pathname;
@@ -726,7 +721,24 @@ async function executeMiddlewareModule(
     return {
       continue: true,
       rewriteUrl: rewritePath,
+      rewriteHadBasePath,
       rewriteStatus: response.status !== 200 ? response.status : undefined,
+      responseHeaders: collectMiddlewareHeaders(response),
+      status: response.status !== 200 ? response.status : undefined,
+      waitUntilPromises,
+    };
+  }
+
+  // Checked after redirects and rewrites: a response can carry both
+  // `x-middleware-next` and `x-middleware-rewrite`, e.g.
+  // `NextResponse.rewrite(url, {headers: NextResponse.next().headers})`, which
+  // next-intl's playground proxy does. Next.js drops `x-middleware-next` and
+  // applies the rewrite.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/lib/router-utils/resolve-routes.ts
+  if (response.headers.get(MIDDLEWARE_NEXT_HEADER) === "1") {
+    releaseMiddlewareRequestBody(nextRequest, waitUntilPromises);
+    return {
+      continue: true,
       responseHeaders: collectMiddlewareHeaders(response),
       status: response.status !== 200 ? response.status : undefined,
       waitUntilPromises,

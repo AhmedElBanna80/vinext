@@ -84,13 +84,6 @@ const __dangerouslyAllowLocalIP = process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_L
 const __globallyUnoptimized = process.env.__VINEXT_IMAGE_UNOPTIMIZED === "true";
 /** `images.loader: "custom"`: optimized images need a loader prop. */
 const __customImageLoader = process.env.__VINEXT_IMAGE_CUSTOM_LOADER === "true";
-/**
- * Whether trailingSlash is enabled in next.config.js. Mirrors the define
- * consumed by the Link/Router shims (shims/link.tsx, shims/router.ts,
- * shims/navigation.ts) so the image optimization endpoint's own path obeys
- * the same config, matching Next.js's `images.path` normalization.
- */
-const __trailingSlash: boolean = process.env.__VINEXT_TRAILING_SLASH === "true";
 
 /**
  * Validate that a remote URL is allowed by the configured remote patterns.
@@ -293,6 +286,12 @@ function extractLocalDeploymentId(src: string): { src: string; deploymentId?: st
   };
 }
 
+// Next.js defaults `images.path` to `${basePath}/_next/image` and appends a
+// slash when trailingSlash is enabled. The `url` source is never prefixed.
+const __imageEndpoint = `${process.env.__NEXT_ROUTER_BASEPATH ?? ""}/_next/image${
+  process.env.__VINEXT_TRAILING_SLASH === "true" ? "/" : ""
+}`;
+
 /**
  * Build a `/_next/image` optimization URL.
  *
@@ -304,10 +303,7 @@ export function imageOptimizationUrl(src: string, width: number, quality: number
   const source = extractLocalDeploymentId(src);
   const deploymentQuery =
     source.src.startsWith("/") && source.deploymentId ? `&dpl=${source.deploymentId}` : "";
-  // Matches Next.js: when `trailingSlash` is set, the image optimizer's own
-  // path gets a trailing slash too, same as every other route.
-  const imagePath = __trailingSlash ? "/_next/image/" : "/_next/image";
-  return `${imagePath}?url=${encodeURIComponent(source.src)}&w=${width}&q=${quality}${deploymentQuery}`;
+  return `${__imageEndpoint}?url=${encodeURIComponent(source.src)}&w=${width}&q=${quality}${deploymentQuery}`;
 }
 
 function preloadImageResource(input: {
