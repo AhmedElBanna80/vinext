@@ -58,7 +58,7 @@ export type { FetchCacheMode, FetchCacheState } from "./fetch-cache-state.js";
 const HEADER_BLOCKLIST = ["traceparent", "tracestate"];
 
 // Cache key version — bump when changing the key format to bust stale entries
-const CACHE_KEY_PREFIX = "v6";
+const CACHE_KEY_PREFIX = "v7";
 const MAX_CACHE_KEY_BODY_BYTES = 1024 * 1024; // 1 MiB
 
 // "Cache indefinitely" duration — mirrors upstream's CACHE_ONE_YEAR_SECONDS.
@@ -251,6 +251,60 @@ function normalizeFetchMethod(method: string): string {
   return NORMALIZED_FETCH_METHODS.has(upperMethod) ? upperMethod : method;
 }
 
+// A view's own properties can shadow `buffer`, `byteOffset` and `byteLength`,
+// but runtimes send the bytes its internal slots cover. These intrinsic getters
+// read those slots.
+function getIntrinsic<T>(prototype: object, key: PropertyKey): (target: unknown) => T {
+  // The getter is deliberately invoked with Reflect.apply on the target.
+  // oxlint-disable-next-line typescript/unbound-method
+  const getter = Object.getOwnPropertyDescriptor(prototype, key)?.get;
+  if (!getter) throw new Error(`Missing intrinsic getter: ${String(key)}`);
+  return (target) => Reflect.apply(getter, target, []) as T;
+}
+const typedArrayPrototype: object = Object.getPrototypeOf(Uint8Array.prototype);
+// Undefined for anything that isn't a typed array, rather than throwing.
+const getTypedArrayTag = getIntrinsic<string | undefined>(typedArrayPrototype, Symbol.toStringTag);
+const getTypedArrayBuffer = getIntrinsic<ArrayBufferLike>(typedArrayPrototype, "buffer");
+const getTypedArrayByteOffset = getIntrinsic<number>(typedArrayPrototype, "byteOffset");
+const getTypedArrayByteLength = getIntrinsic<number>(typedArrayPrototype, "byteLength");
+const getDataViewBuffer = getIntrinsic<ArrayBufferLike>(DataView.prototype, "buffer");
+const getDataViewByteOffset = getIntrinsic<number>(DataView.prototype, "byteOffset");
+const getDataViewByteLength = getIntrinsic<number>(DataView.prototype, "byteLength");
+const getArrayBufferByteLength = getIntrinsic<number>(ArrayBuffer.prototype, "byteLength");
+
+function isArrayBuffer(value: unknown): value is ArrayBuffer {
+  if (!(value instanceof ArrayBuffer)) return false;
+  try {
+    getArrayBufferByteLength(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The bytes sent for a binary body chunk: the bytes an ArrayBuffer holds, or
+ * those a typed array or DataView covers. Undefined for any other chunk.
+ */
+function getBinaryChunkBytes(value: unknown): Uint8Array | undefined {
+  if (ArrayBuffer.isView(value)) {
+    if (getTypedArrayTag(value) !== undefined) {
+      return new Uint8Array(
+        getTypedArrayBuffer(value),
+        getTypedArrayByteOffset(value),
+        getTypedArrayByteLength(value),
+      );
+    }
+    return new Uint8Array(
+      getDataViewBuffer(value),
+      getDataViewByteOffset(value),
+      getDataViewByteLength(value),
+    );
+  }
+  if (isArrayBuffer(value)) return new Uint8Array(value);
+  return undefined;
+}
+
 async function readRequestBodyChunksWithinLimit(
   request: Request,
   effectiveHeaders: Headers,
@@ -281,15 +335,17 @@ async function readRequestBodyChunksWithinLimit(
       const { done, value } = await reader.read();
       if (done) break;
       // A runtime may pass other chunk types through (Workers does for
-      // iterable bodies), and those are not keyed.
-      if (!(value instanceof Uint8Array)) throw new SkipCacheKeyGenerationError();
+      // iterable bodies). Binary chunks are keyed by their bytes, and others
+      // are not keyed.
+      const bytes = getBinaryChunkBytes(value);
+      if (!bytes) throw new SkipCacheKeyGenerationError();
 
-      totalBodyBytes += value.byteLength;
+      totalBodyBytes += bytes.byteLength;
       if (totalBodyBytes > MAX_CACHE_KEY_BODY_BYTES) {
         throw new BodyTooLargeForCacheKeyError();
       }
 
-      chunks.push(value);
+      chunks.push(bytes);
     }
   } catch (err) {
     void reader.cancel().catch(() => {});
@@ -356,11 +412,9 @@ async function serializeBody(
   };
   const getTotalBodyBytes = (): number => totalBodyBytes;
 
-  if (init?.body instanceof ArrayBuffer || (init?.body && ArrayBuffer.isView(init.body))) {
-    const bytes =
-      init.body instanceof ArrayBuffer
-        ? new Uint8Array(init.body)
-        : new Uint8Array(init.body.buffer, init.body.byteOffset, init.body.byteLength);
+  const directBodyBytes = getBinaryChunkBytes(init?.body);
+  if (init?.body && directBodyBytes) {
+    const bytes = directBodyBytes;
     if (bytes.byteLength > MAX_CACHE_KEY_BODY_BYTES) {
       throw new BodyTooLargeForCacheKeyError();
     }
@@ -368,7 +422,7 @@ async function serializeBody(
     (init as ExtendedRequestInit)._ogBody = init.body;
   } else if (init?.body && typeof (init.body as { getReader?: unknown }).getReader === "function") {
     // ReadableStream
-    const readableBody = init.body as ReadableStream<Uint8Array | string>;
+    const readableBody = init.body as ReadableStream<unknown>;
     const [bodyForHashing, bodyForFetch] = readableBody.tee();
     (init as ExtendedRequestInit)._ogBody = bodyForFetch;
     const reader = bodyForHashing.getReader();
@@ -378,7 +432,11 @@ async function serializeBody(
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const bytes = typeof value === "string" ? encoder.encode(value) : value;
+        // Workers also sends the bytes of ArrayBuffer and other typed array
+        // chunks, so those are keyed by their bytes. Other chunks are not keyed.
+        const bytes =
+          typeof value === "string" ? encoder.encode(value) : getBinaryChunkBytes(value);
+        if (!bytes) throw new SkipCacheKeyGenerationError();
         totalBodyBytes += bytes.byteLength;
         if (totalBodyBytes > MAX_CACHE_KEY_BODY_BYTES) {
           throw new BodyTooLargeForCacheKeyError();
