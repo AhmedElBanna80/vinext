@@ -1,8 +1,54 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
+import {
+  handleRequestSignalProbe,
+  REQUEST_SIGNAL_OVERRIDE_HEADER,
+} from "./lib/request-signal-probe";
 
 export function middleware(request: NextRequest) {
   const url = new URL(request.url);
+
+  // Client-disconnect coverage: tests/node-request-cancellation.test.ts
+  if (url.pathname === "/middleware-request-signal") {
+    return handleRequestSignalProbe(request);
+  }
+  if (url.pathname === "/middleware-truncated-body") {
+    // Ends early with the code Node also uses for a client disconnect.
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.error(
+            Object.assign(new Error("Premature close"), { code: "ERR_STREAM_PREMATURE_CLOSE" }),
+          );
+        },
+      }),
+    );
+  }
+  if (url.pathname === "/api/edge-request-signal") {
+    if (!url.searchParams.has("override")) return NextResponse.next();
+    const headers = new Headers(request.headers);
+    headers.set(REQUEST_SIGNAL_OVERRIDE_HEADER, "1");
+    return NextResponse.next({ request: { headers } });
+  }
+
+  // A `members=1` cookie admits direct requests; the image optimizer fetches
+  // its source without the caller's cookies, as Next.js does.
+  // Coverage: tests/e2e/pages-router-prod/image-middleware.spec.ts
+  if (
+    url.pathname.startsWith("/members%20only/") &&
+    request.cookies.get("members")?.value !== "1"
+  ) {
+    return new Response("blocked by middleware", {
+      status: 403,
+      headers: { "content-type": "text/plain" },
+    });
+  }
+  if (url.pathname === "/image-source-redirect.png") {
+    return NextResponse.redirect(new URL("/heart.png", request.url));
+  }
+  if (url.pathname === "/image-source-rewrite.png") {
+    return NextResponse.rewrite(new URL("/heart.png", request.url));
+  }
 
   if (
     url.pathname === "/revalidate-middleware-sentinel" &&
@@ -311,6 +357,7 @@ export function middleware(request: NextRequest) {
 export const config = {
   matcher: [
     "/api/edge-search-params",
+    "/api/edge-request-signal",
     "/edge-api-rewrite/:path*",
     "/((?!api|_next|favicon\\.ico|mw-object-gated).*)",
     {

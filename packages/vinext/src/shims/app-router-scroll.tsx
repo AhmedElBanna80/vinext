@@ -6,6 +6,7 @@ import {
   consumeAppRouterScrollIntent,
   getPendingAppRouterScrollIntent,
 } from "./app-router-scroll-state.js";
+import { disableSmoothScrollDuringRouteTransition } from "./disable-smooth-scroll.js";
 import { decodeHashFragment } from "./hash-scroll.js";
 
 const AppRouterScrollCommitContext = React.createContext<number | null>(null);
@@ -155,7 +156,9 @@ export class AppRouterScrollTargetInner extends React.Component<{
       const hashTarget = getHashFragmentDomNode(intent.hash);
       if (hashTarget !== null) {
         if (consumeAppRouterScrollIntent(intent, this.props.commitId) === null) return;
-        hashTarget.scrollIntoView({ behavior: "auto" });
+        disableSmoothScrollDuringRouteTransition(() => {
+          hashTarget.scrollIntoView({ behavior: "auto" });
+        });
         return;
       }
     }
@@ -177,12 +180,14 @@ export class AppRouterScrollTargetInner extends React.Component<{
 
     if (consumeAppRouterScrollIntent(intent, this.props.commitId) === null) return;
 
-    if (intent.hash !== null) {
-      // The hash is missing from the navigated page: scroll the segment itself.
-      scrollFirstBoxIntoView(elements);
-    } else {
-      scrollToRouteContent(elements);
-    }
+    disableSmoothScrollDuringRouteTransition(() => {
+      if (intent.hash !== null) {
+        // The hash is missing from the navigated page: scroll the segment itself.
+        scrollFirstBoxIntoView(elements);
+      } else {
+        scrollToRouteContent(elements);
+      }
+    });
   };
 
   componentDidMount() {

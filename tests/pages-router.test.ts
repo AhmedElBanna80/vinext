@@ -2527,6 +2527,20 @@ export const config = { matcher: "${matcher}" };
     expect(html).toContain("Loaded dynamically");
   });
 
+  // Issue #3718 only changes the App Router: a Pages dynamic() without a
+  // loading option keeps its Suspense boundary on the server, matching the
+  // boundary the hydrating client renders. This differs from Next.js on
+  // purpose until Pages parity lands: Next's Pages next/dynamic
+  // (react-loadable) preloads before SSR and renders no boundary.
+  it("keeps the Suspense boundary for dynamic() without loading during SSR", async () => {
+    const res = await fetch(`${baseUrl}/dynamic-no-loading`);
+    expect(res.status).toBe(200);
+
+    const html = await res.text();
+    expect(html).toMatch(/<!--\$\??-->/);
+    expect(html).toContain("Loaded without loading option");
+  });
+
   // --- Hydration ---
 
   // --- next/config ---
@@ -3196,6 +3210,30 @@ export const config = { matcher: "${matcher}" };
   it("allows page requests without Origin header", async () => {
     const res = await fetch(`${baseUrl}/`);
     expect(res.status).toBe(200);
+  });
+
+  // Next.js has no `.html` route aliases: `/about.html` is its own path.
+  // Routing it as `/about` would bypass middleware gated on `/about`.
+  it("routes .html request paths as written in development", async () => {
+    const canonical = await fetch(`${baseUrl}/middleware-protected-data`);
+    expect(canonical.status).toBe(403);
+
+    const cases = [
+      ["/middleware-protected-data.html", "only visible after middleware"],
+      ["/middleware-protected-data.html?x=1", "only visible after middleware"],
+      ["/index.html", "Hello, vinext!"],
+      ["/api/hello.html", "Hello from API!"],
+    ];
+    for (const [pathname, body] of cases) {
+      const response = await fetch(`${baseUrl}${pathname}`);
+      expect(response.status).toBe(404);
+      expect(await response.text()).not.toContain(body);
+    }
+
+    // `.html` stays part of the path, so a dynamic route still receives it.
+    const docs = await fetch(`${baseUrl}/docs/release/foo.html`);
+    expect(docs.status).toBe(200);
+    expect(await docs.text()).toMatch(/Path:\s*(<!--\s*-->)?\s*release\/foo\.html/);
   });
 
   // ── /_next/data JSON endpoint (issue #1330) ──────────────────────
@@ -5789,7 +5827,7 @@ export const config = { matcher: ["/protected"] };
     // retaining a tight guard against framework code entering the bootstrap.
     if (entryChunk) {
       const entrySize = fs.statSync(path.join(assetsDir, entryChunk)).size;
-      expect(entrySize).toBeLessThan(30 * 1024); // < 30 KB, including storage-policy fixture routes
+      expect(entrySize).toBeLessThan(36 * 1024); // < 36 KB, including storage-policy, encoded-path, config query-param, res.revalidate and getStaticPaths request-time fixture routes
     }
 
     const counterManifestEntry = Object.entries(manifest).find(
@@ -6888,7 +6926,7 @@ export default function CounterPage() {
       // metadata derived from getStaticProps must advance with the body rather
       // than remaining in the cached shell. Exercise vinext's natural stale
       // background path here: on-demand revalidation uses a different
-      // foreground-render path and would not cover renderPagesIsrHtml().
+      // foreground-render path and would not cover background regeneration.
       await new Promise((resolve) => setTimeout(resolve, 1_100));
       const staleRes = await fetch(`${prodUrl}/isr-second-render-state`);
       expect(staleRes.status).toBe(200);
@@ -7421,6 +7459,29 @@ describe("Production server middleware (Pages Router)", () => {
         id: "id-1",
       },
     });
+  });
+
+  // Next.js keeps no fetch state outside a work store (patch-fetch.ts returns
+  // originFetch), so a Pages API route's fetches must not pile up for the
+  // life of the process or carry their no-store into later requests.
+  it("keeps no process-wide fetch state from Pages API route fetches in production", async () => {
+    // A page render installs the fetch patch for the whole process.
+    expect((await fetch(`${prodUrl}/about`)).status).toBe(200);
+
+    const id = `fallback-${Date.now()}`;
+    const res = await fetch(`${prodUrl}/api/fetch-request-url?id=${id}`);
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ id });
+
+    const fallback = (globalThis as Record<PropertyKey, unknown>)[
+      Symbol.for("vinext.fetchCache.fallback")
+    ] as { dynamicFetchUrls: Set<string>; currentFetchRevalidate: number | null };
+    // Only the route's own outgoing fetches, not this test's request to it.
+    const routeFetchUrls = [...fallback.dynamicFetchUrls].filter(
+      (url) => url.startsWith("http://127.0.0.1:9/upstream?") && url.includes(id),
+    );
+    expect(routeFetchUrls).toEqual([]);
+    expect(fallback.currentFetchRevalidate).toBeNull();
   });
 
   // Refs #1463: prod-server parity for the dev-server 405 check. POST to a
@@ -8155,6 +8216,30 @@ describe("Production server middleware (Pages Router)", () => {
     expect(res.status).toBe(404);
   });
 
+  // Next.js has no `.html` route aliases: `/about.html` is its own path.
+  // Routing it as `/about` would bypass middleware gated on `/about`.
+  it("routes .html request paths as written in production", async () => {
+    const canonical = await fetch(`${prodUrl}/middleware-protected-data`);
+    expect(canonical.status).toBe(403);
+
+    const cases = [
+      ["/middleware-protected-data.html", "only visible after middleware"],
+      ["/middleware-protected-data.html?x=1", "only visible after middleware"],
+      ["/index.html", "Hello, vinext!"],
+      ["/api/hello.html", "Hello from API!"],
+    ];
+    for (const [pathname, body] of cases) {
+      const response = await fetch(`${prodUrl}${pathname}`);
+      expect(response.status).toBe(404);
+      expect(await response.text()).not.toContain(body);
+    }
+
+    // `.html` stays part of the path, so a dynamic route still receives it.
+    const docs = await fetch(`${prodUrl}/docs/release/foo.html`);
+    expect(docs.status).toBe(200);
+    expect(await docs.text()).toMatch(/Path:\s*(<!--\s*-->)?\s*release\/foo\.html/);
+  });
+
   // ── /_next/data JSON endpoint in production (issue #1330) ─────────
   // Ported from Next.js: test/e2e/middleware-general/test/index.test.ts
   // ("should trigger middleware for data requests", "should normalize data
@@ -8633,6 +8718,25 @@ export default class CustomDocument extends Document {
     expectFragmentsInOrder(headContents, ['id="head-marker-content"', 'name="document-child"']);
   });
 
+  it("keeps collected head tags when a dev HTML transform drops the Head marker", async () => {
+    const transform = devServer.transformIndexHtml.bind(devServer);
+    const transformSpy = vi
+      .spyOn(devServer, "transformIndexHtml")
+      .mockImplementation(async (...args) =>
+        (await transform(...args)).replace(/ data-vinext-head-open="[^"]*"/, ""),
+      );
+    try {
+      const response = await fetch(`${devUrl}/`);
+      expect(response.status).toBe(200);
+      const html = await response.text();
+      const headContents = html.match(/<head[^>]*>([\s\S]*?)<\/head>/i)?.[1] ?? "";
+      expect(headContents).toContain('name="page-head"');
+      expect(html).not.toContain("VINEXT_SSR_HEAD");
+    } finally {
+      transformSpy.mockRestore();
+    }
+  });
+
   it.each(["dev", "prod"] as const)(
     "uses direct document html and styles without rendering the page in %s",
     async (mode) => {
@@ -8882,7 +8986,11 @@ describe("Production Pages Router SSR streaming", () => {
     expect(response.headers["content-length"]).toBeUndefined();
     expect(String(transferEncoding)).toBe("chunked");
     expect(response.firstChunkMs).toBeGreaterThanOrEqual(0);
-    expect(response.firstChunkMs).toBeLessThan(400);
+    // The fixture holds its Suspense boundary for 600ms after render starts.
+    // Measure the shell against the response end rather than the request
+    // start, since a cold first request spends time loading modules before
+    // rendering begins. A buffering compressor would deliver both together.
+    expect(response.endMs - response.firstChunkMs).toBeGreaterThanOrEqual(200);
     expect(response.endMs).toBeGreaterThanOrEqual(400);
     expect(response.rawBody.byteLength).toBeGreaterThan(0);
     expect(response.rawSnapshot.byteLength).toBeGreaterThan(0);
@@ -8910,7 +9018,7 @@ describe("Production Pages Router SSR streaming", () => {
     expect(response.headers["content-length"]).toBeUndefined();
     expect(String(response.headers["transfer-encoding"])).toBe("chunked");
     expect(response.firstChunkMs).toBeGreaterThanOrEqual(0);
-    expect(response.firstChunkMs).toBeLessThan(400);
+    expect(response.endMs - response.firstChunkMs).toBeGreaterThanOrEqual(200);
     expect(response.endMs).toBeGreaterThanOrEqual(400);
     expect(partialHtml).toContain("Loading delayed chunk...");
     expect(partialHtml).not.toContain("Delayed stream content loaded");
@@ -8994,7 +9102,7 @@ describe("Production Pages Router SSR streaming", () => {
     expect(response.headers["content-length"]).toBeUndefined();
     expect(String(response.headers["transfer-encoding"])).toBe("chunked");
     expect(response.firstChunkMs).toBeGreaterThanOrEqual(0);
-    expect(response.firstChunkMs).toBeLessThan(400);
+    expect(response.endMs - response.firstChunkMs).toBeGreaterThanOrEqual(200);
     expect(partialHtml).toContain("Loading delayed gSSP chunk...");
     expect(partialHtml).not.toContain("Delayed gSSP stream content loaded");
     expect(finalHtml).toContain("Streaming gSSP Content-Length Test");
@@ -10246,6 +10354,24 @@ describe("custom App optional pageProps envelope parity", () => {
       expect(hitHtml).toContain('<div id="app-router-pathname">/gsp-string</div>');
     });
   }
+
+  // Next.js ignores a response App.getInitialProps sent for a getStaticProps
+  // page (`isResSent(res) && !isSSG`): the visitor gets the sent response, but
+  // the page is still rendered and stored.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/render.tsx
+  it("stores a GSP page whose App.getInitialProps sent the response in prod", async () => {
+    const missResponse = await fetch(`${prodUrl}/gsp-sent-response`, { redirect: "manual" });
+    expect(missResponse.status).toBe(302);
+    expect(missResponse.headers.get("location")).toBe("/missing");
+    await missResponse.body?.cancel();
+
+    await vi.waitFor(async () => {
+      const hitResponse = await fetch(`${prodUrl}/gsp-sent-response`, { redirect: "manual" });
+      expect(hitResponse.status).toBe(200);
+      expect(hitResponse.headers.get("x-nextjs-cache")).toBe("HIT");
+      expect(await hitResponse.text()).toContain('<div id="page-content">gsp-sent-response</div>');
+    });
+  });
 });
 
 describe("Pages production asset manifest reuse", () => {
