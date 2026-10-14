@@ -271,9 +271,10 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
     status: "unsupported",
     detail: "custom cacheLife profiles are ignored; only the built-in profiles are available",
   },
-  skipTrailingSlashRedirect: {
-    status: "unsupported",
-    detail: "ignored; trailing-slash redirects are always applied",
+  skipTrailingSlashRedirect: { status: "supported" },
+  "experimental.skipTrailingSlashRedirect": {
+    status: "supported",
+    detail: "legacy alias of skipTrailingSlashRedirect",
   },
   reactCompiler: {
     status: "partial",
@@ -464,9 +465,9 @@ const LIBRARY_SUPPORT: Record<string, { status: Status; detail?: string }> = {
     detail: "renders client-side; by default events are only collected when deployed on Vercel",
   },
   "next-intl": {
-    status: "partial",
+    status: "supported",
     detail:
-      'auto-detected from (src/)i18n/request.{ts,tsx,js,jsx}, so createNextIntlPlugin isn\'t needed; client components can fail with "No intl context found" (cloudflare/vinext#177)',
+      "createNextIntlPlugin is only optional with the request config at (src/)i18n/request.*; its experimental messages, precompile and extract options don't work (they need webpack/Turbopack loaders)",
   },
   "@clerk/nextjs": {
     status: "supported",

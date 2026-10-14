@@ -1,6 +1,7 @@
 import { type ReactNode } from "react";
 import type { ReactFormState } from "react-dom/client";
 import type { NavigationContext } from "vinext/shims/navigation";
+import { runInWorkStoreScope } from "vinext/shims/internal/work-store-scope";
 import type { ClassificationReason } from "../build/layout-classification-types.js";
 import { _captureRequestScopedCacheLifeAccessors } from "vinext/shims/cache-request-state";
 import type { RootParams } from "vinext/shims/root-params";
@@ -378,6 +379,7 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   isRscRequest: boolean;
   isrDebug?: AppPageDebugLogger;
   isrGet: AppPageCacheGetter;
+  isrFallbackShellHtmlKey: (pathname: string) => string;
   isrHtmlKey: (pathname: string) => string;
   isrRscKey: (
     pathname: string,
@@ -625,17 +627,19 @@ async function runAppPageRevalidationContext<
     unstableCacheRevalidation: "foreground",
   });
 
-  const revalidation = runWithRequestContext(requestContext, async () => {
-    ensureFetchPatch();
-    setRefreshStaleFetchesInForeground(process.env.VINEXT_PRERENDER === "1");
-    setCurrentFetchSoftTags(buildAppPageTags(options.cleanPathname, [], options.routeSegments));
-    options.setNavigationContext({
-      pathname: options.displayPathname ?? options.cleanPathname,
-      searchParams: new URLSearchParams(),
-      params: options.params,
-    });
-    return await runWithFetchDedupe(renderFn);
-  });
+  const revalidation = runWithRequestContext(requestContext, () =>
+    runInWorkStoreScope(async () => {
+      ensureFetchPatch();
+      setRefreshStaleFetchesInForeground(process.env.VINEXT_PRERENDER === "1");
+      setCurrentFetchSoftTags(buildAppPageTags(options.cleanPathname, [], options.routeSegments));
+      options.setNavigationContext({
+        pathname: options.displayPathname ?? options.cleanPathname,
+        searchParams: new URLSearchParams(),
+        params: options.params,
+      });
+      return await runWithFetchDedupe(renderFn);
+    }),
+  );
   try {
     return await revalidation;
   } finally {
@@ -873,12 +877,13 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     !isRouteCacheabilityProbe() && isCacheEligibleRender && !isNeverStoredPath;
   // A render that may be stored, and so must not let the request's query reach
   // its output unless it turns out dynamic. The Workers Cache deploy probe
-  // renders this way too, so its manifest matches the runtime. PPR fallback
-  // shells follow cacheComponents' model instead.
+  // renders this way too, so its manifest matches the runtime. A
+  // cacheComponents page is stored under the same key, so it's gated too. Only
+  // the build's PPR fallback shell renders follow their own model.
   const isCacheCandidate =
     isCacheEligibleRender &&
     isStaticEligible &&
-    options.pprRuntime === undefined &&
+    options.pprFallbackShell === undefined &&
     !isNeverStoredPath;
   if (shouldReadCache && isStaticEligible) {
     traceOperation = resolveAppPageTraceOperation({

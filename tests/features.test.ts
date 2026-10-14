@@ -1603,6 +1603,27 @@ describe("i18n domain routing with basePath (Pages Router)", () => {
     expect(res.status).toBe(200);
     expect(res.body).toContain('href="http://example.fr/app/about" id="switch-locale"');
   });
+
+  // Next.js renders the shared getStaticProps /404 for "/404", keeping the
+  // request's trailing slash even when a locale prefix is stripped.
+  it("renders the shared /404 for its own path under a locale prefix", async () => {
+    // A locale-prefixed miss, a direct status request and a rewritten miss.
+    for (const [path, host, requestToken] of [
+      ["/app/en/missing-share-token/", "example.fr", "missing-share-token"],
+      ["/app/fr/404/", "example.com", "/fr/404"],
+      ["/app/missing-alias/", "example.com", "missing-alias"],
+    ]) {
+      const res = await requestNodeServerWithHost(domainPort, path, host);
+
+      if (requestToken === "missing-share-token") expect(res.status).toBe(404);
+      // Vite's dev html-proxy script URLs carry the request path, so check the
+      // rendered router state rather than the whole document.
+      expect({ path, body: res.body.match(/<p id="as-path">[^<]*<\/p>/)?.[0] }).toEqual({
+        path,
+        body: '<p id="as-path">/404/</p>',
+      });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3474,6 +3495,30 @@ describe("createAppPageRouteBodyMetadata (body-placement canonical)", () => {
     expect(marker("/products/vb9e3r", "/favicon.ico")).not.toBe(
       marker("/products/obz81c", "/favicon.ico"),
     );
+  });
+
+  it("body placement: keeps replacement patterns in the pathname out of icon markup", () => {
+    const render = (pathname: string) =>
+      renderToStaticMarkup(
+        createAppPageRouteBodyMetadata(
+          { icons: { icon: "/favicon.ico", apple: "/apple.png" } },
+          pathname,
+          "body",
+        ) as React.ReactElement,
+      );
+
+    // `$<` matters because attribute escaping turns `<` into `&lt;`, producing `$&`.
+    for (const pattern of ["$&", "$'", "$<"]) {
+      const html = render(`/blog/x${pattern} onerror=alert(1) x`);
+      expect(html).not.toContain("onerror");
+      const markers = [...html.matchAll(/data-vinext-streamed-icon="([^"]+)"/g)].map(
+        ([, marker]) => marker,
+      );
+      expect(markers).toHaveLength(2);
+      for (const marker of markers) {
+        expect(marker).toMatch(/^vi[a-z0-9]+:\d$/);
+      }
+    }
   });
 
   it("body placement: serializes icon-bearing metadata once", () => {

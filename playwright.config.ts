@@ -21,6 +21,25 @@ const appRouterBfcacheServer = {
   timeout: 30_000,
 };
 
+// Port of next-intl's App Router playground, built for Workers and served
+// through Miniflare. Like upstream, each NEXT_PUBLIC_USE_CASE gets its own build
+// and runs only its own spec file. Preview binds IPv4 because the domain specs
+// map their hostnames to 127.0.0.1.
+function cloudflareNextIntlProject(useCase: string, port: number) {
+  return {
+    testDir: "./tests/e2e",
+    testMatch: [`**/cloudflare-next-intl/${useCase}.spec.ts`],
+    use: { baseURL: `http://localhost:${port}` },
+    server: {
+      command: `NEXT_PUBLIC_USE_CASE=${useCase} npx vp build && NEXT_PUBLIC_USE_CASE=${useCase} npx vp preview --host 127.0.0.1 --port ${port}`,
+      cwd: "./tests/fixtures/cf-next-intl",
+      port,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+  };
+}
+
 /**
  * Each project maps to a single webServer. Some browser-specific projects share
  * a server with the base project, and shared servers are de-duped by port.
@@ -59,11 +78,18 @@ const projectServers = {
   "app-router-isr-prod": {
     testDir: "./tests/e2e",
     testMatch: [
+      "app-router/action-bound-args.spec.ts",
       "app-router/isr.spec.ts",
       "app-router/metadata-react-cache.spec.ts",
+      "app-router-prod/action-error-sanitization.spec.ts",
       "app-router-prod/special-error-navigation.spec.ts",
       "app-router-prod/static-hydration.spec.ts",
       "app-router-prod/use-cache.spec.ts",
+      "app-router-prod/public-file-encoding.spec.ts",
+      "app-router-prod/image-middleware.spec.ts",
+      "app-router-prod/pages-res-revalidate.spec.ts",
+      "app-router/preload-rejection.spec.ts",
+      "app-router/external-rewrite-host-capture.spec.ts",
     ],
     use: { baseURL: "http://localhost:4198" },
     server: {
@@ -202,6 +228,35 @@ const projectServers = {
       timeout: 60_000,
     },
   },
+  "cloudflare-next-intl": cloudflareNextIntlProject("main", 4223),
+  "cloudflare-next-intl-locale-prefix-never": cloudflareNextIntlProject(
+    "locale-prefix-never",
+    4231,
+  ),
+  "cloudflare-next-intl-trailing-slash": cloudflareNextIntlProject("trailing-slash", 4232),
+  "cloudflare-next-intl-base-path": cloudflareNextIntlProject("base-path", 4233),
+  "cloudflare-next-intl-domains": cloudflareNextIntlProject("domains", 4234),
+  "cloudflare-next-intl-domains-locale-prefix": cloudflareNextIntlProject(
+    "domains-locale-prefix",
+    4235,
+  ),
+  "cloudflare-next-intl-locale-cookie-false": cloudflareNextIntlProject(
+    "locale-cookie-false",
+    4236,
+  ),
+  // Port of next-intl's canonical App Router example (static rendering with
+  // `setRequestLocale`), built for Workers and served through Miniflare.
+  "cloudflare-next-intl-example": {
+    testDir: "./tests/e2e/cloudflare-next-intl-example",
+    use: { baseURL: "http://localhost:4237" },
+    server: {
+      command: "npx vp build && npx vp preview --port 4237",
+      cwd: "./tests/fixtures/cf-next-intl-example",
+      port: 4237,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+  },
   "cloudflare-sentry-app-workers-cache": {
     testDir: "./tests/e2e",
     testMatch: ["**/cloudflare-sentry-app/**/*.spec.ts"],
@@ -278,11 +333,14 @@ const projectServers = {
     testDir: "./tests/e2e",
     testMatch: [
       "**/cloudflare-pages-router-dev/**/*.spec.ts",
+      "**/cloudflare-pages-router/middleware-data-guard.spec.ts",
       "**/pages-router/instrumentation-startup.spec.ts",
     ],
     use: { baseURL: "http://localhost:4179" },
     server: {
-      command: "npx vp dev --force --port 4179",
+      // Cover the Worker request stage with raw `_next/data` URLs reaching
+      // middleware; the production project keeps the default config.
+      command: "VINEXT_E2E_SKIP_PROXY_URL_NORMALIZE=1 npx vp dev --force --port 4179",
       cwd: "./examples/pages-router-cloudflare",
       port: 4179,
       reuseExistingServer: !process.env.CI,
@@ -572,7 +630,8 @@ const projectServers = {
     testDir: "./tests/e2e/cloudflare-encoded-paths",
     use: { baseURL: "http://localhost:4197" },
     server: {
-      command: "npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4197",
+      command:
+        "CF_APP_BASIC_RUN_WORKER_FIRST=1 npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4197",
       cwd: "./tests/fixtures/cf-app-basic",
       port: 4197,
       reuseExistingServer: !process.env.CI,
@@ -615,6 +674,27 @@ const projectServers = {
     },
     // Playwright starts web servers in order, so vinext is built before the
     // remote imports vinext/client.
+    additionalServers: [
+      {
+        command: "npx vp build && npx vp preview --port 4221 --strictPort",
+        cwd: "./tests/fixtures/module-federation-remote",
+        port: 4221,
+        reuseExistingServer: !process.env.CI,
+        timeout: 60_000,
+      },
+    ],
+  },
+  "module-federation-cloudflare": {
+    testDir: "./tests/e2e/module-federation",
+    use: { baseURL: "http://localhost:4222" },
+    server: {
+      command:
+        "npx vp run vinext#build && npx vp build --config vite.cloudflare.config.ts && npx wrangler dev --config dist/server/wrangler.json --port 4222",
+      cwd: "./tests/fixtures/module-federation-host",
+      port: 4222,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
     additionalServers: [
       {
         command: "npx vp build && npx vp preview --port 4221 --strictPort",

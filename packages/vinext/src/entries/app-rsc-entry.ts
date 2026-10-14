@@ -41,7 +41,6 @@ const middlewareRequestHeadersPath = resolveEntryPath(
   "../utils/middleware-request-headers.js",
   import.meta.url,
 );
-const normalizePathModulePath = resolveEntryPath("../server/normalize-path.js", import.meta.url);
 const appRouteHandlerDispatchPath = resolveEntryPath(
   "../server/app-route-handler-dispatch.js",
   import.meta.url,
@@ -60,6 +59,10 @@ const appRouteHandlerMiddlewareContextPath = resolveEntryPath(
 );
 const appServerActionExecutionPath = resolveEntryPath(
   "../server/app-server-action-execution.js",
+  import.meta.url,
+);
+const serverReferenceLoaderPath = resolveEntryPath(
+  "../server/server-reference-loader.js",
   import.meta.url,
 );
 const appActionForwardingPath = resolveEntryPath(
@@ -233,6 +236,10 @@ type AppRouterConfig = {
   draftModeSecret?: string;
   /** Server-only token used to authorize build-time prerender endpoints. */
   prerenderSecret?: string;
+  /** next.config `skipTrailingSlashRedirect`. */
+  skipTrailingSlashRedirect?: boolean;
+  /** Dev-only key authenticating the hybrid Pages handler's forwarded middleware context. */
+  devForwardedMiddlewareContextKey?: string;
 };
 
 function createSegmentSourceReader(): (filePath: string | null | undefined) => string | null {
@@ -421,6 +428,7 @@ import { dispatchAppRequestStage as __dispatchAppRequestStage } from ${JSON.stri
 import { registerConfiguredCacheAdapters as __registerConfiguredCacheAdapters } from "virtual:vinext-cdn-cache-adapter";
 import { clearAppRequestStageContext as __clearRequestContext, setAppRequestStageNavigationContext as setNavigationContext } from ${JSON.stringify(appRequestStageContextPath)};
 import { matchRoutePattern as __matchRoutePattern } from ${JSON.stringify(routePatternPath)};
+import __pagesClientAssets from "virtual:vinext-pages-client-assets";
 ${middlewarePath ? `import { applyAppMiddleware as __applyAppMiddleware } from ${JSON.stringify(appMiddlewarePath)};` : ""}
 ${
   instrumentationPath
@@ -449,7 +457,6 @@ ${
 import * as __pagesRequestEntry from "virtual:vinext-pages-request-entry";
 import { renderPagesFallback as __renderPagesFallback } from ${JSON.stringify(appPagesBridgePath)};
 import { buildRequestHeadersFromMiddlewareResponse as __buildRequestHeadersFromMiddlewareResponse } from ${JSON.stringify(middlewareRequestHeadersPath)};
-import { decodePathParams as __decodePathParams } from ${JSON.stringify(normalizePathModulePath)};
 import { applyRouteHandlerMiddlewareContext as __applyRouteHandlerMiddlewareContext } from ${JSON.stringify(appRouteHandlerMiddlewareContextPath)};`
     : ""
 }
@@ -480,6 +487,7 @@ export const __imageConfig = ${JSON.stringify({
     contentDispositionType: config?.imageConfig?.contentDispositionType,
     contentSecurityPolicy: config?.imageConfig?.contentSecurityPolicy,
   })};
+export const __clientBuildFiles = __pagesClientAssets.clientBuildFiles ?? [];
 const __routes = ${JSON.stringify(requestRoutes)};
 const __routeMatcher = __createAppRscRouteMatcher(__routes, ${JSON.stringify(buildAppDecodedPathnamePatterns(routes, config))});
 const __metadataRouteMatchers = ${JSON.stringify(metadataRouteMatchers)};
@@ -529,6 +537,7 @@ const __requestHandler = createAppRscRequestHandler({
   configRedirects: ${JSON.stringify(config?.redirects ?? [])},
   configRewrites: ${JSON.stringify(config?.rewrites ?? { beforeFiles: [], afterFiles: [], fallback: [] })},
   draftModeSecret: __draftModeSecret,
+  devForwardedMiddlewareContextKey: ${JSON.stringify(config?.devForwardedMiddlewareContextKey ?? null)},
   dispatchMatchedPage() { throw new Error("App request stage attempted to render a page inline"); },
   dispatchMatchedRouteHandler() { throw new Error("App request stage attempted to render a route handler inline"); },
   ${instrumentationPath ? "ensureInstrumentation() { return __ensureInstrumentation(); }," : ""}
@@ -573,6 +582,7 @@ const __requestHandler = createAppRscRequestHandler({
       middlewareRequest,
       module: middlewareModule,
       request,
+      skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
       trailingSlash: __trailingSlash,
       validateExternalRewriteRequest,
     });
@@ -602,7 +612,6 @@ const __requestHandler = createAppRscRequestHandler({
           };
         },
         buildRequestHeaders: __buildRequestHeadersFromMiddlewareResponse,
-        decodePathParams: __decodePathParams,
         applyRouteHandlerMiddlewareContext: __applyRouteHandlerMiddlewareContext,
         getDraftModeCookieHeader,
       }
@@ -612,6 +621,7 @@ const __requestHandler = createAppRscRequestHandler({
   }
   rootParamNamesByPattern: {},
   setNavigationContext,
+  skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
   staticParamsMap: {},
   trailingSlash: __trailingSlash,
   validateDevRequestOrigin: __validateDevRequestOrigin,
@@ -829,7 +839,6 @@ ${
     : ""
 }
 import { setPagesClientAssets as __setPagesClientAssets } from "vinext/server/pages-client-assets";
-import { decodePathParams as __decodePathParams } from ${JSON.stringify(normalizePathModulePath)};
 import { buildRequestHeadersFromMiddlewareResponse as __buildRequestHeadersFromMiddlewareResponse } from ${JSON.stringify(middlewareRequestHeadersPath)};
 ${
   hasPagesDir
@@ -842,7 +851,9 @@ const __loadAppRouteHandlerDispatch = () => import(${JSON.stringify(appRouteHand
 ${
   hasServerActions
     ? `const __loadAppServerActionExecution = () => import(${JSON.stringify(appServerActionExecutionPath)});
-const __loadAppActionForwarding = () => import(${JSON.stringify(appActionForwardingPath)});`
+const __loadAppActionForwarding = () => import(${JSON.stringify(appActionForwardingPath)});
+import { isolateServerReferenceLoads as __isolateServerReferenceLoads } from ${JSON.stringify(serverReferenceLoaderPath)};
+__isolateServerReferenceLoads();`
     : ""
 }
 ${
@@ -907,6 +918,8 @@ import {
   SIBLING_PAGE_INTERCEPT_SLOT_KEY as __SIBLING_PAGE_INTERCEPT_SLOT_KEY,
 } from ${JSON.stringify(appRscRouteMatchingPath)};
 import {
+  appIsrFallbackShellHtmlKey as __isrFallbackShellHtmlKey,
+  appIsrFallbackShellKey as __isrFallbackShellKey,
   appIsrHtmlKey as __isrHtmlKey,
   appIsrRscKey as __isrRscKey,
   appIsrRouteKey as __isrRouteKey,
@@ -1300,6 +1313,9 @@ export async function seedMemoryCacheFromPrerender(serverDir) {
     buildAppPageHtmlKey(pathname) {
       return __isrHtmlKey(pathname);
     },
+    buildAppPageFallbackShellKey(pathname, suffix) {
+      return __isrFallbackShellKey(pathname, suffix);
+    },
     buildAppPageRscKey(pathname) {
       return __isrRscKey(pathname);
     },
@@ -1344,6 +1360,7 @@ ${rootParamNameEntries.join("\n")}
 };
 
 __setPagesClientAssets(__pagesClientAssets);
+export const __clientBuildFiles = __pagesClientAssets.clientBuildFiles ?? [];
 function __VINEXT_ACTION_OWNERS() { return ${actionOwners === undefined ? "__vinextActionOwners" : safeJsonStringify(actionOwners)}; }
 ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandler = createAppRscHandler({"}
   assetPrefix: __assetPrefix,
@@ -1368,6 +1385,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   imageConfig: __runtimeImageConfig,
   isDev: process.env.NODE_ENV !== "production",
   draftModeSecret: __draftModeSecret,
+  devForwardedMiddlewareContextKey: ${JSON.stringify(config?.devForwardedMiddlewareContextKey ?? null)},
   dispatchMatchedPage({
     bypassInterceptionContextCache,
     cachePathname,
@@ -1491,6 +1509,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       isRscRequest,
       isrDebug: __isrDebug,
       isrGet: __isrGet,
+      isrFallbackShellHtmlKey: __isrFallbackShellHtmlKey,
       isrHtmlKey(pathname) {
         return __isrHtmlKey(pathname === cleanPathname ? cachePathname : pathname);
       },
@@ -1609,6 +1628,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       draftModeSecret: __draftModeSecret,
       i18n: __i18nConfig,
       trailingSlash: __trailingSlash,
+      skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
       isrDebug: __isrDebug,
       isrGet: __isrGet,
       isrRouteKey(pathname) {
@@ -1994,6 +2014,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       middlewareRequest,
       module: middlewareModule,
       request,
+      skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
       trailingSlash: __trailingSlash,
       validateExternalRewriteRequest,
     });
@@ -2036,7 +2057,6 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
           };
         },
         buildRequestHeaders: __buildRequestHeadersFromMiddlewareResponse,
-        decodePathParams: __decodePathParams,
         applyRouteHandlerMiddlewareContext: __applyRouteHandlerMiddlewareContext,
         getDraftModeCookieHeader,
       }
@@ -2046,6 +2066,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   }
   rootParamNamesByPattern: rootParamNamesMap,
   setNavigationContext,
+  skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
   staticParamsMap: generateStaticParamsMap,
   trailingSlash: __trailingSlash,
   validateDevRequestOrigin: __validateDevRequestOrigin,

@@ -229,6 +229,28 @@ describe("trailing slash normalization", () => {
   });
 });
 
+// Ported from Next.js: test/e2e/skip-trailing-slash-redirect/index.test.ts
+// https://github.com/vercel/next.js/blob/canary/test/e2e/skip-trailing-slash-redirect/index.test.ts
+describe("skipTrailingSlashRedirect", () => {
+  it.each([
+    { trailingSlash: false, pathname: "/foo/" },
+    { trailingSlash: true, pathname: "/foo" },
+  ])(
+    "renders $pathname without a redirect (trailingSlash: $trailingSlash)",
+    async ({ trailingSlash, pathname }) => {
+      const renderPage = makeRenderPage();
+      const result = await runPagesRequest(
+        makeRequest(pathname),
+        baseDeps({ trailingSlash, skipTrailingSlashRedirect: true, renderPage }),
+      );
+      expect(result.type).toBe("response");
+      if (result.type !== "response") return;
+      expect(result.response.status).toBe(200);
+      expect(renderPage).toHaveBeenCalledOnce();
+    },
+  );
+});
+
 // 2. Config redirect: permanent redirect → status 308 with Location
 describe("config redirects", () => {
   it("fails probing closed when an unkeyed redirect condition misses", async () => {
@@ -423,6 +445,11 @@ describe("middleware", () => {
       }),
     );
 
+    // Next.js matches a stale data URL raw, so the runtime needs to know.
+    expect(runMiddleware.mock.calls[0]?.[2]).toEqual({
+      isDataRequest: true,
+      isStaleDataRequest: true,
+    });
     expect(result.type).toBe("response");
     if (result.type !== "response") return;
     expect(result.response.status).toBe(200);
@@ -857,6 +884,7 @@ describe("middleware", () => {
 
     expect(runMiddleware).toHaveBeenCalledWith(expect.any(Request), null, {
       isDataRequest: false,
+      isStaleDataRequest: false,
     });
     expect(result.type).toBe("response");
     if (result.type !== "response") return;
@@ -1716,6 +1744,7 @@ describe("serveFilesystemRoute", () => {
       "direct",
       "/robots.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -1737,6 +1766,74 @@ describe("serveFilesystemRoute", () => {
     expect(filesystemRequest.headers.get("if-none-match")).toBe('"override"');
     expect(filesystemRequest.headers.get("range")).toBeNull();
   });
+
+  // Next.js only serves filesystem items whose resolved pathname carries the
+  // basePath (filesystem.ts getItem), so adapters gate the image endpoint on it.
+  it.each([
+    [
+      "a middleware rewrite into basePath",
+      false,
+      { rewriteUrl: "/_next/image", rewriteHadBasePath: true },
+      [],
+      true,
+    ],
+    [
+      "a middleware rewrite outside basePath",
+      true,
+      { rewriteUrl: "/_next/image", rewriteHadBasePath: false },
+      [],
+      false,
+    ],
+    [
+      "a default beforeFiles rewrite",
+      true,
+      {},
+      [{ source: "/legacy", destination: "/_next/image" }],
+      true,
+    ],
+    [
+      "a basePath: false beforeFiles rewrite",
+      false,
+      {},
+      [{ source: "/legacy", destination: "/_next/image", basePath: false as const }],
+      false,
+    ],
+    [
+      "a default beforeFiles rewrite after a middleware rewrite outside basePath",
+      true,
+      { rewriteUrl: "/outside", rewriteHadBasePath: false },
+      [{ source: "/outside", destination: "/_next/image" }],
+      false,
+    ],
+    [
+      "a default beforeFiles rewrite after a middleware rewrite into basePath",
+      false,
+      { rewriteUrl: "/legacy", rewriteHadBasePath: true },
+      [{ source: "/legacy", destination: "/_next/image" }],
+      true,
+    ],
+  ])(
+    "reports whether %s keeps the basePath",
+    async (_name, hadBasePath, middlewareResult, beforeFiles, expected) => {
+      const serveFilesystemRoute = vi.fn(
+        async (..._args: Parameters<NonNullable<PagesPipelineDeps["serveFilesystemRoute"]>>) =>
+          true,
+      );
+      await runPagesRequest(
+        makeRequest("/legacy"),
+        baseDeps({
+          basePath: "/docs",
+          hadBasePath,
+          runMiddleware: makeMiddleware(middlewareResult),
+          configRewrites: { beforeFiles, afterFiles: [], fallback: [] },
+          serveFilesystemRoute,
+        }),
+      );
+      // Rules that don't match the current basePath state never reach the image endpoint.
+      const imageCall = serveFilesystemRoute.mock.calls.find((call) => call[0] === "/_next/image");
+      expect(imageCall?.[5] ?? false).toBe(expected);
+    },
+  );
 
   it.each([
     ["beforeFiles", null],
@@ -1768,6 +1865,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       destination,
       expect.any(Request),
+      true,
     );
   });
 
@@ -1821,6 +1919,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       "/file.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -1861,6 +1960,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       "/api/rewritten",
       expect.any(Request),
+      true,
     );
     expect(handleApi).toHaveBeenCalledWith(
       expect.any(Request),
@@ -1901,6 +2001,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       "/api/from-middleware",
       expect.any(Request),
+      true,
     );
     expect(handleApi).toHaveBeenCalledWith(
       expect.any(Request),
@@ -1935,6 +2036,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       "/asset.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -2046,6 +2148,7 @@ describe("afterFiles rewrites", () => {
       "afterFiles",
       "/file.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -2074,6 +2177,7 @@ describe("afterFiles rewrites", () => {
       "direct",
       "/after-control",
       expect.any(Request),
+      true,
     );
     expect(renderPage).toHaveBeenCalledWith(
       expect.any(Request),
@@ -2165,6 +2269,39 @@ describe("afterFiles rewrites", () => {
       undefined,
       expect.any(Headers),
     );
+  });
+
+  it("serializes rewrite destinations in every rewrite phase", async () => {
+    // Next.js parses every rewrite destination as a URL, so a literal `é`
+    // reaches route matching as `%C3%A9`, the same as the raw request pathname.
+    for (const phase of ["beforeFiles", "afterFiles", "fallback"] as const) {
+      const renderPage = vi.fn(
+        async (_req: Request, url: string, _opts?: PagesRenderOptions) =>
+          new Response("page", { status: url.startsWith("/source") ? 404 : 200 }),
+      );
+      const matchPageRoute = vi.fn((pathname: string) =>
+        pathname === "/caf%C3%A9" ? { route: { isDynamic: false } } : null,
+      );
+      await runPagesRequest(
+        makeRequest("/source?q=1"),
+        baseDeps({
+          matchPageRoute,
+          configRewrites: {
+            beforeFiles: [],
+            afterFiles: [],
+            fallback: [],
+            [phase]: [{ source: "/source", destination: "/café" }],
+          },
+          renderPage,
+        }),
+      );
+      expect(renderPage, phase).toHaveBeenLastCalledWith(
+        expect.any(Request),
+        "/caf%C3%A9?q=1",
+        undefined,
+        expect.any(Headers),
+      );
+    }
   });
 
   it("continues afterFiles rewrites until a Pages destination resolves", async () => {
@@ -2372,6 +2509,7 @@ describe("fallback rewrites on 404", () => {
       "fallback",
       "/file.txt",
       expect.any(Request),
+      true,
     );
   });
 
