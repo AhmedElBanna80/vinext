@@ -16,6 +16,7 @@ import {
   DEFAULT_IMAGE_SIZES,
   handleConfiguredImageOptimization,
   isImageOptimizationPath,
+  isImageSourceBodyStatus,
 } from "./image-optimization.js";
 import type { ImageConfig } from "./image-optimization.js";
 import {
@@ -23,11 +24,14 @@ import {
   cloneRequestWithHeaders,
   cloneRequestWithUrl,
   filterInternalHeaders,
-  isOpenRedirectShaped,
+  guardProtocolRelativeUrl,
 } from "./request-pipeline.js";
 import { notFoundStaticAssetResponse } from "./http-error-responses.js";
 import { assetPrefixPathname, isNextStaticPath } from "../utils/asset-prefix.js";
+import { resolveClientBuildFile } from "./client-build-files.js";
+import { createStaticAssetRequest } from "./worker-utils.js";
 import { hasBasePath, stripBasePath } from "../utils/base-path.js";
+import { isNextDataPathname } from "./pages-data-route.js";
 import { createWorkerRevalidationContext } from "./worker-revalidation-context.js";
 import {
   VINEXT_CACHEABILITY_PROBE_HEADER,
@@ -144,6 +148,7 @@ const {
   matchPageRoute,
   normalizeDataRequest,
   publicFiles,
+  clientBuildFiles,
   runMiddleware,
   vinextConfig,
 } = pagesEntry;
@@ -154,6 +159,7 @@ export const pagesRequestStagePrerenderSecret: string | null = pagesEntry.preren
 const basePath: string = vinextConfig?.basePath ?? "";
 const assetPathPrefix: string = assetPrefixPathname(vinextConfig?.assetPrefix ?? "");
 const trailingSlash: boolean = vinextConfig?.trailingSlash ?? false;
+const skipTrailingSlashRedirect: boolean = vinextConfig?.skipTrailingSlashRedirect ?? false;
 const i18nConfig = vinextConfig?.i18n ?? null;
 const configRedirects = vinextConfig?.redirects ?? [];
 const configRewrites = vinextConfig?.rewrites ?? {
@@ -171,6 +177,35 @@ const imageConfig: ImageConfig | undefined = vinextConfig?.images
       contentSecurityPolicy: vinextConfig.images.contentSecurityPolicy,
     }
   : undefined;
+
+/**
+ * Whether the request stage serves this request as a client build file
+ * outside `_next/static`. Such responses resolve no route, so the Worker
+ * keeps their ASSETS cache policy out of route cacheability admission.
+ */
+export function isPagesClientBuildFileRequest(
+  request: Request,
+  env: PagesWorkerEnv | undefined,
+  ctx: PagesWorkerExecutionContext | undefined,
+): boolean {
+  return (
+    (request.method === "GET" || request.method === "HEAD") &&
+    resolveAssetFetcher(ctx?.assets, env, "worker") !== undefined &&
+    resolveClientBuildFile(new URL(request.url).pathname, basePath, clientBuildFiles) !== null
+  );
+}
+
+function resolveAssetFetcher(
+  assets: VinextAssetFetcher | undefined,
+  env: PagesWorkerEnv | undefined,
+  defaultHostRuntime: "node" | "worker",
+): VinextAssetFetcher | undefined {
+  return (
+    assets ??
+    getExplicitCdnCacheAdapter()?.assets ??
+    (defaultHostRuntime === "worker" ? env?.ASSETS : undefined)
+  );
+}
 
 /** Run the request-time stage with a host-owned response dispatcher. */
 export function handleRequestStage(
@@ -276,9 +311,7 @@ async function handleRequestImpl(
   // Pass the Worker env so binding-backed adapters (for example KV and Images)
   // can resolve their configured bindings before request handling begins.
   configuredCdnCacheAdapters.registerConfiguredCacheAdapters(env);
-  assets ??=
-    getExplicitCdnCacheAdapter()?.assets ??
-    (defaultHostRuntime === "worker" ? env?.ASSETS : undefined);
+  assets = resolveAssetFetcher(assets, env, defaultHostRuntime);
   if (configuredCdnCacheAdapters.hasConfiguredDataCache) {
     registerLazyDataCacheHandler(async () => {
       // @ts-expect-error -- virtual module resolved by vinext at build time
@@ -374,19 +407,24 @@ async function handleRequestImpl(
       );
     }
 
-    // Block protocol-relative URL open redirects in all shapes:
-    //   literal  //evil.com, /\\evil.com
-    //   encoded  /%5Cevil.com, /%2F/evil.com
-    // Browsers normalize backslash to forward slash, and percent-decode
-    // Location headers, so encoded variants must be rejected before any
-    // downstream redirect can echo them.
-    if (isOpenRedirectShaped(pathname)) {
-      return new Response("This page could not be found", { status: 404 });
-    }
+    // Redirect repeated slashes / backslashes like Next.js (//evil.com →
+    // /evil.com) and block encoded protocol-relative shapes (/%5Cevil.com,
+    // /%2F/evil.com) before any downstream redirect can echo them.
+    const protocolRelativeGuard = guardProtocolRelativeUrl(pathname, url.search);
+    if (protocolRelativeGuard) return protocolRelativeGuard;
     try {
       normalizePathnameForRouteMatchStrict(pathname);
     } catch {
       return new Response("Bad Request", { status: 400 });
+    }
+
+    // Client build files outside `_next/static` are build output like the
+    // hashed assets, so serve them before middleware when the Worker runs first.
+    if (assets && (request.method === "GET" || request.method === "HEAD")) {
+      const clientBuildFile = resolveClientBuildFile(pathname, basePath, clientBuildFiles);
+      if (clientBuildFile) {
+        return await assets.fetch(createStaticAssetRequest(clientBuildFile, request));
+      }
     }
 
     // Valid assets are served by Cloudflare's ASSETS binding before the worker
@@ -440,6 +478,7 @@ async function handleRequestImpl(
       assetPrefix: vinextConfig?.assetPrefix,
       basePath,
       trailingSlash,
+      skipTrailingSlashRedirect,
       i18nConfig,
       configRedirects,
       configRewrites,
@@ -595,33 +634,115 @@ async function handleRequestImpl(
             })
           : dispatched;
       },
-      serveFilesystemRoute: async (requestPathname, _stagedHeaders, phase, resolvedUrl) => {
+      serveFilesystemRoute: async (
+        requestPathname,
+        _stagedHeaders,
+        phase,
+        resolvedUrl,
+        filesystemRequest,
+      ) => {
         if (!assets) return false;
         if (isImageOptimizationPath(requestPathname)) {
           const imageUrl = new URL(resolvedUrl, request.url);
-          const imageRequest = new Request(imageUrl, request);
+          const imageRequest = cloneRequestWithUrl(request, imageUrl.href);
           const allowedWidths = [
             ...(vinextConfig?.images?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
             ...(vinextConfig?.images?.imageSizes ?? DEFAULT_IMAGE_SIZES),
           ];
+          const { fetchWorkerImageSource } = await import("./worker-image-optimization.js");
           return handleConfiguredImageOptimization(
             imageRequest,
-            (assetPath) =>
-              Promise.resolve(assets.fetch(new Request(new URL(assetPath, request.url)))),
+            (sourceUrl, sourceImageRequest) =>
+              fetchWorkerImageSource(sourceUrl, sourceImageRequest, {
+                assets,
+                basePath,
+                assetPathPrefix,
+                clientBuildFiles,
+                // vinext's next/image emits the endpoint without the basePath.
+                sourceBasePath: hadBasePath ? "" : basePath,
+                fetchPublicFile: (sourceRequest) => resolvePublicImageSource(sourceRequest, assets),
+              }),
             allowedWidths,
             imageConfig,
           );
         }
         return fetchWorkerFilesystemRoute(
-          request,
+          filesystemRequest,
           requestPathname,
           phase,
           (assetRequest) => Promise.resolve(assets.fetch(assetRequest)),
           publicFiles,
           basePath,
           assetPathPrefix,
+          hadBasePath,
         );
       },
+    };
+
+    // Run an image source through the pipeline as a direct request without the
+    // caller's headers, like Next.js' fetchInternalImage, so middleware admits
+    // it. Only a public file the pipeline selects with a 2xx outcome is served.
+    const resolvePublicImageSource = async (
+      sourceRequest: Request,
+      sourceAssets: AssetFetcher,
+    ): Promise<Response | null> => {
+      const sourceUrl = new URL(sourceRequest.url);
+      if (guardProtocolRelativeUrl(sourceUrl.pathname, sourceUrl.search)) return null;
+      const sourceHadBasePath = !basePath || hasBasePath(sourceUrl.pathname, basePath);
+      const sourcePathname = stripBasePath(sourceUrl.pathname, basePath);
+      if (isNextDataPathname(sourcePathname)) return null;
+      let sourceAsset = null as Response | null;
+      const sourceResult = await runPagesRequest(
+        attachRequestCfMetadata(
+          new Request(new URL(sourcePathname + sourceUrl.search, sourceUrl), {
+            signal: sourceRequest.signal,
+          }),
+          sourceRequest,
+        ),
+        {
+          ...deps,
+          hadBasePath: sourceHadBasePath,
+          isDataReq: false,
+          isDataRequest: false,
+          middlewareRequest: undefined,
+          dataNotFoundResponse: null,
+          recordCacheability: false,
+          runMiddleware:
+            typeof runMiddleware === "function"
+              ? wrapMiddlewareWithBasePath(runMiddleware, basePath, sourceHadBasePath)
+              : null,
+          renderPage: null,
+          handleApi: null,
+          serveFilesystemRoute: async (
+            candidate,
+            _stagedHeaders,
+            phase,
+            _resolvedUrl,
+            filesystemRequest,
+          ) => {
+            if (isImageOptimizationPath(candidate)) return false;
+            const asset = await fetchWorkerFilesystemRoute(
+              filesystemRequest,
+              candidate,
+              phase,
+              (assetRequest) => Promise.resolve(sourceAssets.fetch(assetRequest)),
+              publicFiles,
+              basePath,
+              assetPathPrefix,
+              sourceHadBasePath,
+            );
+            if (asset === false) return false;
+            sourceAsset = asset;
+            // An empty response lets the pipeline apply middleware's status.
+            return new Response(null);
+          },
+        },
+      );
+      if (sourceResult.type !== "response") return null;
+      await sourceResult.response.body?.cancel().catch(() => {});
+      if (isImageSourceBodyStatus(sourceResult.response.status)) return sourceAsset;
+      await sourceAsset?.body?.cancel().catch(() => {});
+      return null;
     };
 
     const result = await runPagesRequest(request, deps);

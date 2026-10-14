@@ -226,7 +226,8 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
   },
   transpilePackages: {
     status: "supported",
-    detail: "listed packages are bundled instead of externalized on the server",
+    detail:
+      "listed packages are bundled instead of externalized on the server, and their next/dynamic() calls get SSR preload links",
   },
   serverExternalPackages: {
     status: "supported",
@@ -270,9 +271,10 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
     status: "unsupported",
     detail: "custom cacheLife profiles are ignored; only the built-in profiles are available",
   },
-  skipTrailingSlashRedirect: {
-    status: "unsupported",
-    detail: "ignored; trailing-slash redirects are always applied",
+  skipTrailingSlashRedirect: { status: "supported" },
+  "experimental.skipTrailingSlashRedirect": {
+    status: "supported",
+    detail: "legacy alias of skipTrailingSlashRedirect",
   },
   reactCompiler: {
     status: "partial",

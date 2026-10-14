@@ -27,6 +27,7 @@ import rscHandler, {
   __assetPrefix as __rscAssetPrefix,
   __basePath as __rscBasePath,
   __cacheabilityManifest as __rscCacheabilityManifest,
+  __clientBuildFiles as __rscClientBuildFiles,
   __ensureInstrumentation,
   __ensureHybridPagesApplication,
   __imageAllowedWidths as __rscImageAllowedWidths,
@@ -42,14 +43,16 @@ import { applyCdnResponseIdentityHeaders, validateCdnRequest } from "./cache-con
 import { registerConfiguredImageOptimizer } from "virtual:vinext-image-adapters";
 import {
   getImageOptimizer,
-  handleConfiguredImageOptimization,
   isImageOptimizationPath,
+  readImageOptimizationSignal,
 } from "./image-optimization.js";
 import { createStaticAssetRequest, resolveStaticAssetSignal } from "./worker-utils.js";
+import { resolveClientBuildFile } from "./client-build-files.js";
 import {
   cloneRequestWithHeaders,
+  cloneRequestWithUrl,
   filterInternalHeaders,
-  isOpenRedirectShaped,
+  guardProtocolRelativeUrl,
 } from "./request-pipeline.js";
 import {
   NEXT_ACTION_HEADER,
@@ -83,6 +86,9 @@ import type { VinextRequestStageContext } from "./multi-stage.js";
 // detection. Both `__basePath` and `__assetPrefix` are inlined as
 // compile-time constants in the generated RSC entry — see entries/app-rsc-entry.ts.
 const __workerBasePath: string = typeof __rscBasePath === "string" ? __rscBasePath : "";
+const __workerClientBuildFiles: ReadonlySet<string> = new Set(
+  Array.isArray(__rscClientBuildFiles) ? __rscClientBuildFiles : [],
+);
 const __workerAssetPathPrefix: string = assetPrefixPathname(
   typeof __rscAssetPrefix === "string" ? __rscAssetPrefix : "",
 );
@@ -207,22 +213,30 @@ async function handleRequest(
 
   const url = new URL(request.url);
 
-  if (isImageOptimizationPath(url.pathname) && assets && getImageOptimizer()) {
-    return handleConfiguredImageOptimization(
+  // The image endpoint runs through middleware and rewrites like any request;
+  // the handler then signals that the Worker may serve the image itself.
+  const servesImages = Boolean(assets) && getImageOptimizer() !== null;
+  // vinext's next/image emits the endpoint without the basePath, where Next.js
+  // prefixes it. Admit that form as the basePath endpoint and resolve its
+  // unprefixed sources under the basePath, as the Node server does.
+  const imageEndpointBasePath =
+    servesImages && __workerBasePath && isImageOptimizationPath(url.pathname)
+      ? __workerBasePath
+      : "";
+  if (imageEndpointBasePath) {
+    request = cloneRequestWithUrl(
       request,
-      (assetPath) => Promise.resolve(assets.fetch(new Request(new URL(assetPath, request.url)))),
-      __rscImageAllowedWidths,
-      __rscImageConfig,
+      new URL(imageEndpointBasePath + url.pathname + url.search, url).href,
     );
   }
 
-  // Block protocol-relative URL open redirects (//evil.com/, /\evil.com/,
-  // /%5Cevil.com/, /%2F/evil.com/). Check BEFORE decode so both literal and
-  // percent-encoded variants are caught — encoded forms survive segment-wise
-  // decoding and would otherwise reach trailing-slash redirect emitters.
-  if (isOpenRedirectShaped(url.pathname)) {
-    return notFoundResponse();
-  }
+  // Redirect repeated slashes / backslashes like Next.js (//evil.com/ →
+  // /evil.com/) and block encoded protocol-relative shapes (/%5Cevil.com/,
+  // /%2F/evil.com/). Check BEFORE decode so both literal and percent-encoded
+  // variants are caught — encoded forms survive segment-wise decoding and
+  // would otherwise reach trailing-slash redirect emitters.
+  const protocolRelativeGuard = guardProtocolRelativeUrl(url.pathname, url.search);
+  if (protocolRelativeGuard) return protocolRelativeGuard;
 
   // Validate that percent-encoding is well-formed. The RSC handler performs
   // the actual decode + normalize; we only check here to return a clean 400
@@ -232,6 +246,21 @@ async function handleRequest(
   } catch {
     // Malformed percent-encoding (e.g. /%E0%A4%A) — return 400 instead of throwing.
     return badRequestResponse();
+  }
+
+  // Client build files outside `_next/static` are build output like the
+  // hashed assets, so serve them before middleware when the Worker runs first.
+  // They resolve no application route, so they keep the ASSETS cache policy
+  // instead of passing through route cacheability admission.
+  if (assets && (request.method === "GET" || request.method === "HEAD")) {
+    const clientBuildFile = resolveClientBuildFile(
+      url.pathname,
+      __workerBasePath,
+      __workerClientBuildFiles,
+    );
+    if (clientBuildFile) {
+      return await assets.fetch(createStaticAssetRequest(clientBuildFile, request));
+    }
   }
 
   // Valid assets are served by Cloudflare's ASSETS binding before the worker
@@ -282,10 +311,36 @@ async function handleRequest(
 
   if (result instanceof Response) {
     let response = result;
-    if (assets) {
+    const imageSignal = servesImages ? readImageOptimizationSignal(response) : null;
+    if (imageSignal && assets) {
+      const { fetchSignalledPublicFile, serveWorkerImageOptimization } =
+        await import("./worker-image-optimization.js");
+      response = await serveWorkerImageOptimization(
+        request,
+        imageSignal,
+        __rscImageAllowedWidths,
+        __rscImageConfig,
+        {
+          assets,
+          basePath: __workerBasePath,
+          assetPathPrefix: __workerAssetPathPrefix,
+          clientBuildFiles: __workerClientBuildFiles,
+          sourceBasePath: imageEndpointBasePath,
+          // The source runs outside this request's cacheability context.
+          fetchPublicFile: async (sourceRequest) => {
+            const sourceResult = await runWithExecutionContext(requestCtx, () =>
+              rscHandler(sourceRequest, requestCtx),
+            );
+            return sourceResult instanceof Response
+              ? fetchSignalledPublicFile(sourceResult, sourceRequest, assets)
+              : null;
+          },
+        },
+      );
+    } else if (assets) {
       const assetResponse = await resolveStaticAssetSignal(response, {
-        fetchAsset: (path) =>
-          Promise.resolve(assets.fetch(createStaticAssetRequest(path, request))),
+        fetchAsset: (path, requestHeaders) =>
+          Promise.resolve(assets.fetch(createStaticAssetRequest(path, request, requestHeaders))),
       });
       if (assetResponse) response = assetResponse;
     }

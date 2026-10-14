@@ -211,6 +211,72 @@ async function assertEncodedDelimiterAuthGuard(baseUrl: string): Promise<void> {
   }
 }
 
+async function assertStaticAssetExclusionAuthGuard(baseUrl: string): Promise<void> {
+  const headers = { "x-static-asset-auth": "1" };
+  // `js(?!on)` excludes `.js` but not `.json`, and `.cs` is not `.css`/`.csv`.
+  const guardedPaths = ["/public", "/public.json", "/public.cs"];
+  const excludedPaths = [
+    "/public.htm",
+    "/public.html",
+    "/public.js",
+    "/public.jpg",
+    "/public.jpeg",
+    "/public.woff",
+    "/public.woff2",
+    "/public.docx",
+  ];
+
+  for (const pathname of guardedPaths) {
+    const response = await fetch(`${baseUrl}${pathname}`, { headers });
+    const body = await response.text();
+    expect(response.status, pathname).toBe(403);
+    expect(response.headers.get("x-auth-guard"), pathname).toBe("blocked");
+    expect(body, pathname).toBe("blocked by middleware");
+  }
+  for (const pathname of excludedPaths) {
+    const response = await fetch(`${baseUrl}${pathname}`, { headers });
+    await response.body?.cancel();
+    expect(response.status, pathname).not.toBe(403);
+    expect(response.headers.get("x-auth-guard"), pathname).toBeNull();
+  }
+}
+
+async function assertHybridPagesEncodedAliasAuthGuard(baseUrl: string): Promise<void> {
+  // Middleware and Next.js' filesystem lookup each test the raw pathname and at
+  // most one decode of it. Routing a Pages page or API route in a hybrid
+  // App+Pages app must not decode a `%25xx` alias a second time into a route
+  // that middleware never matched.
+  const headers = { "x-hybrid-pages-auth": "1" };
+  const targets = [
+    { body: "protected pages staff panel", pathname: "/staff/panel" },
+    { body: "protected pages staff api", pathname: "/api/staff/users" },
+  ];
+  const guardedAliasPaths = ["/%73taff/panel", "/api/%73taff/users", "/api/staff/%2575sers"];
+  const aliasPaths = ["/%2573taff/panel", "/api/%2573taff/users"];
+
+  for (const target of targets) {
+    const response = await fetch(`${baseUrl}${target.pathname}`);
+    const body = await response.text();
+    expect(response.status, target.pathname).toBe(200);
+    expect(response.headers.get("x-auth-guard"), target.pathname).toBeNull();
+    expect(body, target.pathname).toContain(target.body);
+  }
+  for (const pathname of [...targets.map((target) => target.pathname), ...guardedAliasPaths]) {
+    const response = await fetch(`${baseUrl}${pathname}`, { headers });
+    const body = await response.text();
+    expect(response.status, pathname).toBe(403);
+    expect(response.headers.get("x-auth-guard"), pathname).toBe("blocked");
+    expect(body, pathname).toBe("blocked by middleware");
+  }
+  for (const pathname of aliasPaths) {
+    const response = await fetch(`${baseUrl}${pathname}`, { headers });
+    const body = await response.text();
+    expect(response.status, pathname).toBe(404);
+    expect(response.headers.get("x-auth-guard"), pathname).toBeNull();
+    expect(body, pathname).not.toContain("protected pages staff");
+  }
+}
+
 async function closeHttpServer(server: http.Server | undefined): Promise<void> {
   if (!server) return;
   await new Promise<void>((resolve, reject) => {
@@ -265,6 +331,14 @@ describe("valid middleware matcher auth guards", () => {
     it("matches decoded path delimiters with constrained matcher parity", async () => {
       await assertEncodedDelimiterAuthGuard(baseUrl);
     }, 30_000);
+
+    it("skips extensions excluded by bounded optional matcher branches", async () => {
+      await assertStaticAssetExclusionAuthGuard(baseUrl);
+    }, 30_000);
+
+    it("keeps double-encoded aliases out of hybrid Pages routes", async () => {
+      await assertHybridPagesEncodedAliasAuthGuard(baseUrl);
+    }, 30_000);
   });
 
   describe("built Node production server", () => {
@@ -316,6 +390,14 @@ describe("valid middleware matcher auth guards", () => {
 
     it("matches decoded path delimiters with constrained matcher parity", async () => {
       await assertEncodedDelimiterAuthGuard(baseUrl);
+    });
+
+    it("skips extensions excluded by bounded optional matcher branches", async () => {
+      await assertStaticAssetExclusionAuthGuard(baseUrl);
+    });
+
+    it("keeps double-encoded aliases out of hybrid Pages routes", async () => {
+      await assertHybridPagesEncodedAliasAuthGuard(baseUrl);
     });
   });
 
@@ -394,6 +476,14 @@ describe("valid middleware matcher auth guards", () => {
     it("matches decoded path delimiters with constrained matcher parity", async () => {
       await assertEncodedDelimiterAuthGuard(baseUrl);
     });
+
+    it("skips extensions excluded by bounded optional matcher branches", async () => {
+      await assertStaticAssetExclusionAuthGuard(baseUrl);
+    });
+
+    it("keeps double-encoded aliases out of hybrid Pages routes", async () => {
+      await assertHybridPagesEncodedAliasAuthGuard(baseUrl);
+    });
   });
 });
 
@@ -418,6 +508,14 @@ describe("unsafe middleware matcher rejection", () => {
     [`/:path(${"(?:a+)".repeat(9)})`, /contains overlapping sequential repetition/],
     [`/:path(${"(?:a+)".repeat(10)})`, /contains overlapping sequential repetition/],
     [`/:path(${"(?:a|aa)".repeat(26)})`, /contains ambiguous sequence expansion/],
+    [`/:path(${"(?:a|aa?)".repeat(26)})`, /contains ambiguous sequence expansion/],
+    [`/:path(${"(?:a?|b)".repeat(26)}c)`, /contains ambiguous sequence expansion/],
+    [`/:path(${"(?:a*|b)".repeat(8)}c)`, /contains ambiguous sequence expansion/],
+    ["/:path((?:\\.x|.y|ay)+)", /contains ambiguous alternatives under repetition/],
+    [`/:path(${"(?:\\.x|.y|ay|b?z)".repeat(26)}c)`, /contains ambiguous sequence expansion/],
+    [`/:path(${"(?:\\cA?x|\\x01x)".repeat(26)}c)`, /contains ambiguous sequence expansion/],
+    ["/:path((?:\\c|\\\\c)+)", /contains ambiguous alternatives under repetition/],
+    ["/:a((?<z>a))/:b((?:\\k<z>x|ax)+c)", /contains ambiguous alternatives under repetition/],
     ["/:path(a+.*a+)", /contains overlapping sequential repetition/],
     ["/:path(a+(?:b*)a+)", /contains overlapping sequential repetition/],
   ] as const)(
