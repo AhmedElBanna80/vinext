@@ -58,7 +58,7 @@ export type { FetchCacheMode, FetchCacheState } from "./fetch-cache-state.js";
 const HEADER_BLOCKLIST = ["traceparent", "tracestate"];
 
 // Cache key version — bump when changing the key format to bust stale entries
-const CACHE_KEY_PREFIX = "v7";
+const CACHE_KEY_PREFIX = "v8";
 const MAX_CACHE_KEY_BODY_BYTES = 1024 * 1024; // 1 MiB
 
 // "Cache indefinitely" duration — mirrors upstream's CACHE_ONE_YEAR_SECONDS.
@@ -153,7 +153,7 @@ function encodeBodyBytes(bytes: Uint8Array): string {
   return encoded;
 }
 
-function concatBodyBytes(chunks: Uint8Array[]): Uint8Array {
+function concatBodyBytes(chunks: Uint8Array[]): Uint8Array<ArrayBuffer> {
   const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
   const bytes = new Uint8Array(length);
   let offset = 0;
@@ -377,6 +377,90 @@ function isKeyableInitBody(body: BodyInit): boolean {
 }
 
 /**
+ * Copy a cacheable fetch's request when fetch is called, as fetch itself does.
+ * Its cache key is built, and it is sent, only after awaits. A URL, headers,
+ * body or `cf` the caller changes in the meantime must reach neither: the
+ * request would be sent with values its key doesn't hold, and its response
+ * cached for the values the key does hold. A stream body is read after the
+ * call, as fetch reads it, and sent as the bytes its key is built from.
+ */
+function snapshotFetchRequest(
+  input: string | URL | Request,
+  init: RequestInit | undefined,
+): { input: string | URL | Request; init: RequestInit } {
+  const snapshotInit: RequestInit & { cf?: unknown } = { ...init };
+  // A Request's URL and method can't change, but its headers and `cf` can, so
+  // they're copied onto init. Its body is sent as the bytes it's keyed by.
+  // RequestInit headers and `cf` replace a Request input's, like the Request
+  // constructor.
+  const headers =
+    snapshotInit.headers !== undefined
+      ? snapshotInit.headers
+      : input instanceof Request
+        ? input.headers
+        : undefined;
+  if (headers !== undefined) {
+    snapshotInit.headers = new Headers(headers);
+  }
+  const cf =
+    snapshotInit.cf !== undefined
+      ? snapshotInit.cf
+      : input instanceof Request
+        ? (input as { cf?: unknown }).cf
+        : undefined;
+  if (cf !== null && typeof cf === "object") {
+    snapshotInit.cf = snapshotCf(cf);
+  }
+  if (snapshotInit.body !== undefined && snapshotInit.body !== null) {
+    snapshotInit.body = snapshotBody(snapshotInit.body);
+  }
+  return {
+    // fetch reads a URL input as a string when it is called.
+    input: input instanceof Request ? input : String(input),
+    init: snapshotInit,
+  };
+}
+
+// `cf` options are plain data, some of them nested (`image`, `cacheTags`).
+// Workers copies them as JSON when fetch is called, which drops values JSON
+// can't hold, like functions.
+function snapshotCf(cf: object): object {
+  try {
+    return JSON.parse(JSON.stringify(cf)) as object;
+  } catch {
+    // Options JSON can't hold, like a cycle, are left for the runtime to reject.
+    return cf;
+  }
+}
+
+function snapshotBody(body: BodyInit): BodyInit {
+  const bytes = getBinaryChunkBytes(body);
+  if (bytes) return bytes.slice();
+  if (body instanceof URLSearchParams) return new URLSearchParams(body);
+  if (body instanceof FormData) {
+    const formData = new FormData();
+    for (const [name, value] of body) {
+      formData.append(name, typeof value === "string" ? value : snapshotBlob(value));
+    }
+    return formData;
+  }
+  if (body instanceof Blob) return snapshotBlob(body);
+  // Strings can't change. A stream can't be read synchronously, so, as in
+  // fetch, its chunks are read after the call. They're sent as the bytes
+  // they're keyed by, as is any other body, which is built into a Request.
+  return body;
+}
+
+// A Blob's bytes can't change, but the properties and methods it's keyed and
+// sent through can be redefined on it. A new Blob copies its bytes.
+function snapshotBlob(blob: Blob): Blob {
+  if (blob instanceof File) {
+    return new File([blob], blob.name, { type: blob.type, lastModified: blob.lastModified });
+  }
+  return new Blob([blob], { type: blob.type });
+}
+
+/**
  * Serialize request body into string chunks for cache key inclusion.
  * Handles all body types: string, Uint8Array, ReadableStream, FormData, Blob,
  * and Request object bodies.
@@ -443,7 +527,12 @@ async function serializeBody(
         }
         chunks.push(bytes);
       }
-      bodyChunks.push(encodeBodyBytes(concatBodyBytes(chunks)));
+      const bytes = concatBodyBytes(chunks);
+      bodyChunks.push(encodeBodyBytes(bytes));
+      // Send the bytes the key was built from, as Next.js does, rather than
+      // chunks the caller could still change.
+      (init as ExtendedRequestInit)._ogBody = bytes;
+      void bodyForFetch.cancel().catch(() => {});
     } catch (err) {
       // Do not await cancellation of one tee branch: it may not settle until
       // the fallback fetch starts consuming the other branch.
@@ -510,6 +599,11 @@ async function serializeBody(
         throw err;
       }
       throw new SkipCacheKeyGenerationError();
+    }
+    // Send the bytes the key is built from rather than the Request's own body,
+    // whose chunks the caller could still change.
+    if (init) {
+      (init as ExtendedRequestInit)._ogBody = concatBodyBytes(chunks);
     }
     const formContentType = builtBodyRequests.has(input)
       ? undefined
@@ -1309,15 +1403,19 @@ function createPatchedFetch(): typeof globalThis.fetch {
     }
 
     const softTags = _getState().currentFetchSoftTags;
-    let fetchInit = stripNextFromInit(init, cacheDirective);
-    const initBody = fetchInit?.body;
+    let fetchInit: RequestInit | undefined;
+    ({ input, init: fetchInit } = snapshotFetchRequest(
+      input,
+      stripNextFromInit(init, cacheDirective),
+    ));
+    const initBody = fetchInit.body;
     if (initBody !== undefined && initBody !== null && !isKeyableInitBody(initBody)) {
       // Any other body (an async iterable, or an object the runtime converts
       // to a string) is built into a Request as fetch itself would, and that
       // Request's bytes are keyed and it is sent.
       input = new Request(input, fetchInit);
       builtBodyRequests.add(input);
-      fetchInit = undefined;
+      fetchInit = {};
     }
     let cacheKey: string;
     try {

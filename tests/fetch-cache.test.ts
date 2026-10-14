@@ -1325,11 +1325,11 @@ describe("fetch cache shim", () => {
 
   it("preserves Request bodies for stale background revalidation", async () => {
     const seenBodies: string[] = [];
-    fetchMock.mockImplementation(async (input: string | URL | Request, _init?: RequestInit) => {
+    fetchMock.mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
       requestCount++;
       const url =
         typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      const body = input instanceof Request ? await input.clone().text() : "";
+      const body = input instanceof Request ? await new Request(input, init).text() : "";
       seenBodies.push(body);
       return new Response(JSON.stringify({ url, count: requestCount, body }), {
         status: 200,
@@ -1822,7 +1822,7 @@ describe("fetch cache shim", () => {
     const init = call[1] as RequestInit;
     expect(init).toBeDefined();
     expect((init as any).next).toBeUndefined();
-    expect((init as any).headers).toEqual({ "X-Custom": "value" });
+    expect(new Headers(init.headers).get("x-custom")).toBe("value");
   });
 
   it("strips next property for no-store fetches too", async () => {
@@ -3341,12 +3341,10 @@ describe("fetch cache shim", () => {
         next: { revalidate: 60 },
       });
 
-      const body = (fetchMock.mock.calls[0][1] as RequestInit).body as ReadableStream;
-      const sent: number[] = [];
-      for await (const chunk of body as unknown as AsyncIterable<ArrayBufferView>) {
-        sent.push(...new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
-      }
-      expect(sent).toEqual([0x61, 0x62, 0x63]);
+      const body = (fetchMock.mock.calls[0][1] as RequestInit).body;
+      expect([...new Uint8Array(await new Response(body).arrayBuffer())]).toEqual([
+        0x61, 0x62, 0x63,
+      ]);
     });
 
     // Bodies such as async iterables are built into a Request as fetch would,
@@ -3363,7 +3361,11 @@ describe("fetch cache shim", () => {
         } as RequestInit);
         return (await res.json()).count as number;
       };
-      const sent = (callIndex: number) => fetchMock.mock.calls[callIndex][0] as Request;
+      // The request as fetch sends it, with any init body in place of its own.
+      const sent = (callIndex: number) => {
+        const [input, init] = fetchMock.mock.calls[callIndex];
+        return new Request(input, init);
+      };
       async function* iterable(...chunks: string[]) {
         for (const chunk of chunks) yield new TextEncoder().encode(chunk);
       }
@@ -3576,6 +3578,201 @@ describe("fetch cache shim", () => {
     });
   });
 
+  // ── Requests changed after fetch is called ──────────────────────────
+
+  // fetch copies its request when it is called. A cached fetch's key is built,
+  // and it is sent, only after awaits, so a request the caller changes in the
+  // meantime must be neither sent nor keyed with the change. Otherwise a key
+  // built for one request caches the response to another.
+  describe("a request changed after fetch is called", () => {
+    type WorkersInit = RequestInit & { cf?: Record<string, unknown> };
+    type ChangedRequest = { input: string | URL | Request; init?: WorkersInit; change(): void };
+
+    const url = "https://api.example.com/changed-request";
+    const encode = (value: string) => new TextEncoder().encode(value);
+    const stream = (chunk: Uint8Array) =>
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(chunk);
+          controller.close();
+        },
+      });
+
+    beforeEach(() => {
+      fetchMock.mockImplementation(async (input, init) => {
+        requestCount++;
+        const request = new Request(input, init);
+        const cf =
+          (init as WorkersInit | undefined)?.cf ?? (input as { cf?: Record<string, unknown> }).cf;
+        const sent = [
+          request.url,
+          ...request.headers.values(),
+          await request.text(),
+          JSON.stringify(cf),
+        ].join(" ");
+        return Response.json({ sent, count: requestCount });
+      });
+    });
+
+    it.each<[string, () => ChangedRequest]>([
+      [
+        "a URL",
+        () => {
+          const input = new URL(`${url}?user=alice`);
+          return { input, change: () => input.searchParams.set("user", "bobby") };
+        },
+      ],
+      [
+        "a Headers object",
+        () => {
+          const headers = new Headers({ "x-user": "alice" });
+          return { input: url, init: { headers }, change: () => headers.set("x-user", "bobby") };
+        },
+      ],
+      [
+        "a headers record",
+        () => {
+          const headers: Record<string, string> = { "x-user": "alice" };
+          return { input: url, init: { headers }, change: () => (headers["x-user"] = "bobby") };
+        },
+      ],
+      [
+        "a headers array",
+        () => {
+          const headers: [string, string][] = [["x-user", "alice"]];
+          return { input: url, init: { headers }, change: () => (headers[0][1] = "bobby") };
+        },
+      ],
+      [
+        "a Request's headers",
+        () => {
+          const input = new Request(url, { headers: { "x-user": "alice" } });
+          return { input, change: () => input.headers.set("x-user", "bobby") };
+        },
+      ],
+      [
+        "a RequestInit cf",
+        () => {
+          const cf = { resolveOverride: "alice.example.com" };
+          return { input: url, init: { cf }, change: () => (cf.resolveOverride = "bobby") };
+        },
+      ],
+      [
+        "a Request's cf",
+        () => {
+          const cf = { resolveOverride: "alice.example.com" };
+          // Node's Request drops `cf`; workerd's Request carries it.
+          const input = new Request(url);
+          Object.defineProperty(input, "cf", { value: cf, configurable: true });
+          return { input, change: () => (cf.resolveOverride = "bobby") };
+        },
+      ],
+      [
+        "a cf option's nested value",
+        () => {
+          const cf = { cacheTags: ["alice"] };
+          return { input: url, init: { cf }, change: () => (cf.cacheTags[0] = "bobby") };
+        },
+      ],
+      [
+        "a cf option's nested value beside one JSON can't hold",
+        () => {
+          const cf = { image: { format: "alice", ignored: () => {} } };
+          return { input: url, init: { cf }, change: () => (cf.image.format = "bobby") };
+        },
+      ],
+      [
+        "a Uint8Array body",
+        () => {
+          const body = encode("alice");
+          return {
+            input: url,
+            init: { method: "POST", body },
+            change: () => body.set(encode("bobby")),
+          };
+        },
+      ],
+      [
+        "a URLSearchParams body",
+        () => {
+          const body = new URLSearchParams({ user: "alice" });
+          return {
+            input: url,
+            init: { method: "POST", body },
+            change: () => body.set("user", "bobby"),
+          };
+        },
+      ],
+      [
+        "a FormData body",
+        () => {
+          const body = new FormData();
+          body.set("user", "alice");
+          return {
+            input: url,
+            init: { method: "POST", body },
+            change: () => body.set("user", "bobby"),
+          };
+        },
+      ],
+      [
+        "a FormData body's File name",
+        () => {
+          const file = new File(["data"], "alice.txt");
+          const body = new FormData();
+          body.set("file", file);
+          return {
+            input: url,
+            init: { method: "POST", body },
+            change: () => Object.defineProperty(file, "name", { value: "bobby.txt" }),
+          };
+        },
+      ],
+      [
+        "a ReadableStream body's chunk",
+        () => {
+          const chunk = encode("alice");
+          return {
+            input: url,
+            init: { method: "POST", body: stream(chunk), duplex: "half" } as WorkersInit,
+            change: () => chunk.set(encode("bobby")),
+          };
+        },
+      ],
+      [
+        "a Request body's chunk",
+        () => {
+          const chunk = encode("alice");
+          const input = new Request(url, {
+            method: "POST",
+            body: stream(chunk),
+            duplex: "half",
+          } as RequestInit);
+          return { input, change: () => chunk.set(encode("bobby")) };
+        },
+      ],
+    ])("%s isn't sent or keyed with the change", async (_, changedRequest) => {
+      const read = async ({ input, init }: ChangedRequest) =>
+        (await fetch(input, { ...init, next: { revalidate: 60 } })).json();
+
+      // Change the request while its cached response is read: after its key
+      // is built, and before it is sent.
+      const handler = getCacheHandler();
+      const get = handler.get.bind(handler);
+      const request = changedRequest();
+      vi.spyOn(handler, "get").mockImplementationOnce(async (...args) => {
+        request.change();
+        return get(...args);
+      });
+
+      const response = await read(request);
+      expect(response.sent).toContain("alice");
+      expect(response.sent).not.toContain("bobby");
+      // The same request, unchanged, reads that response from the cache.
+      expect(await read(changedRequest())).toEqual(response);
+    });
+  });
+
   // ── Workers cf.resolveOverride ──────────────────────────────────────
 
   describe("cf.resolveOverride in cache keys", () => {
@@ -3689,7 +3886,8 @@ describe("fetch cache shim", () => {
   // ── Body restoration after cache key generation ───────────────────
 
   describe("body restoration (_ogBody)", () => {
-    it("ReadableStream body is correctly passed to real fetch after cache key generation", async () => {
+    // Next.js sends a stream body as the bytes it was keyed by, too.
+    it("ReadableStream body is sent as the bytes its cache key was built from", async () => {
       const stream = new ReadableStream({
         start(controller) {
           controller.enqueue(new TextEncoder().encode("stream-body-content"));
@@ -3703,27 +3901,10 @@ describe("fetch cache shim", () => {
         next: { revalidate: 60 },
       });
 
-      // Verify the mock was called and the body was preserved as a stream
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      const call = fetchMock.mock.calls[0];
-      const init = call[1] as RequestInit;
-      expect(init.body).toBeInstanceOf(ReadableStream);
-      const reader = (init.body as ReadableStream<Uint8Array>).getReader();
-      const chunks: Uint8Array[] = [];
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-      }
-      const length = chunks.reduce((acc, chunk) => acc + chunk.byteLength, 0);
-      const full = new Uint8Array(length);
-      let offset = 0;
-      for (const chunk of chunks) {
-        full.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
-      const decoded = new TextDecoder().decode(full);
-      expect(decoded).toBe("stream-body-content");
+      const init = fetchMock.mock.calls[0][1] as RequestInit;
+      expect(init.body).toBeInstanceOf(Uint8Array);
+      expect(new TextDecoder().decode(init.body as Uint8Array)).toBe("stream-body-content");
     });
 
     it("Blob body is correctly passed to real fetch after cache key generation", async () => {
@@ -3784,10 +3965,11 @@ describe("fetch cache shim", () => {
       await fetch(request, { next: { revalidate: 60 } });
 
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      const call = fetchMock.mock.calls[0];
-      const forwardedRequest = call[0] as Request;
-      expect(forwardedRequest).toBeInstanceOf(Request);
-      expect(await forwardedRequest.text()).toBe("request-body-content");
+      const [forwardedRequest, forwardedInit] = fetchMock.mock.calls[0];
+      expect(forwardedRequest).toBe(request);
+      expect(await new Request(forwardedRequest, forwardedInit).text()).toBe(
+        "request-body-content",
+      );
     });
 
     it("already-consumed Request bodies bypass cache key generation and defer to the underlying fetch", async () => {
