@@ -4336,6 +4336,187 @@ describe("createAppRscHandler", () => {
     expect(defaultOnly.status).toBe(400);
   });
 
+  it.each([
+    {
+      name: "a middleware rewrite into basePath",
+      requestPath: "/docs/photo",
+      overrides: {
+        middlewareModule: {
+          default: (request: Request) =>
+            new Response(null, {
+              headers: {
+                "x-middleware-rewrite": new URL(
+                  "/docs/_next/image?url=%2Fimg.jpg&w=640&q=75",
+                  request.url,
+                ).toString(),
+              },
+            }),
+        },
+      },
+      served: true,
+    },
+    {
+      name: "a middleware rewrite outside basePath",
+      requestPath: "/docs/photo",
+      overrides: {
+        middlewareModule: {
+          default: (request: Request) =>
+            new Response(null, {
+              headers: {
+                "x-middleware-rewrite": new URL(
+                  "/_next/image?url=%2Fimg.jpg&w=640&q=75",
+                  request.url,
+                ).toString(),
+              },
+            }),
+        },
+      },
+      served: false,
+    },
+    {
+      name: "a default config rewrite",
+      requestPath: "/docs/photo",
+      overrides: {
+        configRewrites: {
+          beforeFiles: [
+            { source: "/photo", destination: "/_next/image?url=%2Fimg.jpg&w=640&q=75" },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+      },
+      served: true,
+    },
+    {
+      name: "a basePath: false config rewrite",
+      requestPath: "/photo",
+      overrides: {
+        configRewrites: {
+          beforeFiles: [
+            {
+              source: "/photo",
+              destination: "/_next/image?url=%2Fimg.jpg&w=640&q=75",
+              basePath: false as const,
+            },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+      },
+      served: false,
+    },
+    {
+      name: "a default config rewrite after a middleware rewrite outside basePath",
+      requestPath: "/docs/photo",
+      overrides: {
+        middlewareModule: {
+          default: (request: Request) =>
+            new Response(null, {
+              headers: { "x-middleware-rewrite": new URL("/outside", request.url).toString() },
+            }),
+        },
+        configRewrites: {
+          beforeFiles: [
+            { source: "/outside", destination: "/_next/image?url=%2Fimg.jpg&w=640&q=75" },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+      },
+      served: false,
+    },
+    {
+      name: "a default config rewrite after a middleware rewrite into basePath",
+      requestPath: "/photo",
+      overrides: {
+        middlewareModule: {
+          default: (request: Request) =>
+            new Response(null, {
+              headers: { "x-middleware-rewrite": new URL("/docs/legacy", request.url).toString() },
+            }),
+        },
+        configRewrites: {
+          beforeFiles: [
+            { source: "/legacy", destination: "/_next/image?url=%2Fimg.jpg&w=640&q=75" },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+      },
+      served: true,
+    },
+    {
+      name: "an afterFiles config rewrite",
+      requestPath: "/docs/photo",
+      overrides: {
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [{ source: "/photo", destination: "/_next/image?url=%2Fimg.jpg&w=640&q=75" }],
+          fallback: [],
+        },
+      },
+      served: true,
+    },
+    {
+      name: "a fallback config rewrite",
+      requestPath: "/docs/photo",
+      overrides: {
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [],
+          fallback: [{ source: "/photo", destination: "/_next/image?url=%2Fimg.jpg&w=640&q=75" }],
+        },
+      },
+      served: true,
+    },
+  ])(
+    "serves the App Router image endpoint only when $name keeps the basePath",
+    async ({ requestPath, overrides, served }) => {
+      // Next.js filesystem lookups return nothing for a path without the
+      // basePath, so a rewrite target must carry it to reach the endpoint.
+      const handler = createHandler({ configHeaders: [], ...overrides });
+      const response = await handler(new Request(`https://example.test${requestPath}`), null);
+      if (served) {
+        expect(response.status).toBe(302);
+        expect(response.headers.get("location")).toBe("https://example.test/img.jpg");
+      } else {
+        expect(response.status).toBe(404);
+      }
+    },
+  );
+
+  it.each([
+    { rewriteHadBasePath: true, served: true },
+    { rewriteHadBasePath: false, served: false },
+  ])(
+    "serves the App Router image endpoint for a forwarded middleware rewrite only when it kept the basePath ($rewriteHadBasePath)",
+    async ({ rewriteHadBasePath, served }) => {
+      // Hybrid app+pages dev runs middleware in the Pages pipeline and forwards
+      // the basePath-stripped rewrite, so the basePath state travels with it.
+      const handler = createHandler({
+        configHeaders: [],
+        middlewareModule: { default: () => new Response(null) },
+      });
+      const response = await handler(
+        new Request("https://example.test/docs/photo", {
+          headers: {
+            [VINEXT_MW_CTX_HEADER]: sealedForwardedContext({
+              r: "/_next/image?url=%2Fimg.jpg&w=640&q=75",
+              b: rewriteHadBasePath,
+            }),
+          },
+        }),
+        null,
+      );
+      if (served) {
+        expect(response.status).toBe(302);
+        expect(response.headers.get("location")).toBe("https://example.test/img.jpg");
+      } else {
+        expect(response.status).toBe(404);
+      }
+    },
+  );
+
   it("dispatches an RSC interception target with all dynamic descendant source params", async () => {
     const sourceRoute = createPageRoute({
       isDynamic: true,

@@ -2903,6 +2903,58 @@ describe("window.next debug global", () => {
       vi.resetModules();
     }
   });
+
+  // Next.js resets the shallow scroll through Router.set() -> client/index.tsx,
+  // which wraps window.scrollTo in disableSmoothScrollDuringRouteTransition.
+  it('shallow push scroll reset forces scroll-behavior: auto when <html data-scroll-behavior="smooth">', async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+    const documentElement = {
+      dataset: { scrollBehavior: "smooth" },
+      getClientRects: vi.fn(() => []),
+      style: { scrollBehavior: "smooth" },
+    };
+    const scrollBehaviorDuringScroll: string[] = [];
+    const win: any = {
+      location: {
+        pathname: "/",
+        search: "",
+        hash: "",
+        href: "http://localhost/",
+        origin: "http://localhost",
+      },
+      history: { state: null, pushState() {}, replaceState() {} },
+      addEventListener() {},
+      dispatchEvent() {},
+      scrollTo() {
+        scrollBehaviorDuringScroll.push(documentElement.style.scrollBehavior);
+      },
+    };
+    (globalThis as any).window = win;
+
+    try {
+      vi.resetModules();
+      await import("../packages/vinext/src/shims/router.js");
+      Object.defineProperty(globalThis, "document", {
+        configurable: true,
+        value: { documentElement },
+      });
+
+      const result = await win.next.router.push("/foo", undefined, { shallow: true });
+      expect(result).toBe(true);
+      expect(scrollBehaviorDuringScroll).toEqual(["auto"]);
+      expect(documentElement.getClientRects).toHaveBeenCalled();
+      expect(documentElement.style.scrollBehavior).toBe("smooth");
+    } finally {
+      (globalThis as any).window = previousWindow;
+      if (originalDocument) {
+        Object.defineProperty(globalThis, "document", originalDocument);
+      } else {
+        Reflect.deleteProperty(globalThis, "document");
+      }
+      vi.resetModules();
+    }
+  });
 });
 
 describe("window.next debug global", () => {
@@ -5845,6 +5897,48 @@ describe("next/cache shim", () => {
     }
   });
 
+  // Like Next.js, the callback gets the caller's arguments, which are keyed
+  // when the cached function is called but read only after the cache is.
+  // Source: https://github.com/vercel/next.js/blob/canary/packages/next/src/server/web/spec-extension/unstable-cache.ts
+  it("unstable_cache doesn't store a result under arguments changed before the callback ran", async () => {
+    const { unstable_cache, setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+
+    setCacheHandler(new MemoryCacheHandler());
+
+    try {
+      let callCount = 0;
+      const getUser = unstable_cache(
+        async (options: { id: number }) => {
+          callCount++;
+          return `user-${options.id}`;
+        },
+        ["changed-arguments-test"],
+      );
+
+      // One options object, changed between calls that run concurrently.
+      const options = { id: 0 };
+      const results = await Promise.all(
+        [1, 2].map((id) => {
+          options.id = id;
+          return getUser(options);
+        }),
+      );
+      // As in Next.js, both callbacks run with the arguments as they are then.
+      expect(results).toEqual(["user-2", "user-2"]);
+      expect(callCount).toBe(2);
+
+      // But user 2 isn't cached as user 1.
+      await expect(getUser({ id: 1 })).resolves.toBe("user-1");
+      expect(callCount).toBe(3);
+      await expect(getUser({ id: 1 })).resolves.toBe("user-1");
+      await expect(getUser({ id: 2 })).resolves.toBe("user-2");
+      expect(callCount).toBe(3);
+    } finally {
+      setCacheHandler(new MemoryCacheHandler());
+    }
+  });
+
   it("unstable_cache caches undefined results", async () => {
     const { unstable_cache, setCacheHandler, MemoryCacheHandler } =
       await import("../packages/vinext/src/shims/cache.js");
@@ -6638,6 +6732,72 @@ describe("next/cache shim", () => {
       await Promise.all(waitUntilPromises);
 
       expect(setBodies).toEqual([JSON.stringify({ v: "fresh-value" })]);
+    } finally {
+      setCacheHandler(new MemoryCacheHandler());
+    }
+  });
+
+  it("unstable_cache doesn't store a background refresh under arguments changed before it ran", async () => {
+    const { unstable_cache, setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+
+    const waitUntilPromises: Promise<unknown>[] = [];
+    const setBodies: string[] = [];
+    let releaseGet!: () => void;
+    const getReleased = new Promise<void>((resolve) => (releaseGet = resolve));
+
+    setCacheHandler({
+      async get(): Promise<CacheHandlerValue> {
+        await getReleased;
+        return {
+          lastModified: Date.now() - 2_000,
+          cacheState: "stale",
+          value: {
+            kind: "FETCH",
+            data: { headers: {}, body: JSON.stringify({ v: "user-1" }), url: "" },
+            tags: [],
+            revalidate: 1,
+          },
+        };
+      },
+      async set(_key: string, data: IncrementalCacheValue | null) {
+        if (data?.kind === "FETCH") setBodies.push(data.data.body);
+      },
+      async revalidateTag() {},
+    });
+
+    const refreshedIds: number[] = [];
+    const getUser = unstable_cache(
+      async (options: { id: number }) => {
+        refreshedIds.push(options.id);
+        return `user-${options.id}`;
+      },
+      ["changed-arguments-refresh-test"],
+      { revalidate: 1 },
+    );
+    const requestContext = createRequestContext({
+      unstableCacheRevalidation: "background",
+      executionContext: {
+        waitUntil(promise) {
+          waitUntilPromises.push(promise);
+        },
+      },
+    });
+
+    try {
+      const options = { id: 1 };
+      const result = runWithRequestContext(requestContext, () => getUser(options));
+      // Changed while the stale entry is read, so the refresh runs for user 2.
+      options.id = 2;
+      releaseGet();
+      await expect(result).resolves.toBe("user-1");
+      await Promise.all(waitUntilPromises);
+      expect(waitUntilPromises).toHaveLength(1);
+      // The refresh still runs, but its result isn't stored.
+      expect(refreshedIds).toEqual([2]);
+      expect(setBodies).toEqual([]);
     } finally {
       setCacheHandler(new MemoryCacheHandler());
     }
@@ -20258,7 +20418,7 @@ describe("Pages Router concurrent navigation", () => {
 
     render.mockImplementation(() => {});
     (globalThis as any).window = win;
-    (globalThis as any).document = { documentElement: {} };
+    (globalThis as any).document = { documentElement: { dataset: {} } };
     globalThis.fetch = async (_url: RequestInfo | URL, init?: RequestInit) => {
       fetchSignal = init?.signal instanceof AbortSignal ? init.signal : undefined;
       return new Response(buildNavHtml("/page-a", pageModuleUrl));

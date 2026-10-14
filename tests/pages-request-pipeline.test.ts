@@ -1744,6 +1744,7 @@ describe("serveFilesystemRoute", () => {
       "direct",
       "/robots.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -1765,6 +1766,74 @@ describe("serveFilesystemRoute", () => {
     expect(filesystemRequest.headers.get("if-none-match")).toBe('"override"');
     expect(filesystemRequest.headers.get("range")).toBeNull();
   });
+
+  // Next.js only serves filesystem items whose resolved pathname carries the
+  // basePath (filesystem.ts getItem), so adapters gate the image endpoint on it.
+  it.each([
+    [
+      "a middleware rewrite into basePath",
+      false,
+      { rewriteUrl: "/_next/image", rewriteHadBasePath: true },
+      [],
+      true,
+    ],
+    [
+      "a middleware rewrite outside basePath",
+      true,
+      { rewriteUrl: "/_next/image", rewriteHadBasePath: false },
+      [],
+      false,
+    ],
+    [
+      "a default beforeFiles rewrite",
+      true,
+      {},
+      [{ source: "/legacy", destination: "/_next/image" }],
+      true,
+    ],
+    [
+      "a basePath: false beforeFiles rewrite",
+      false,
+      {},
+      [{ source: "/legacy", destination: "/_next/image", basePath: false as const }],
+      false,
+    ],
+    [
+      "a default beforeFiles rewrite after a middleware rewrite outside basePath",
+      true,
+      { rewriteUrl: "/outside", rewriteHadBasePath: false },
+      [{ source: "/outside", destination: "/_next/image" }],
+      false,
+    ],
+    [
+      "a default beforeFiles rewrite after a middleware rewrite into basePath",
+      false,
+      { rewriteUrl: "/legacy", rewriteHadBasePath: true },
+      [{ source: "/legacy", destination: "/_next/image" }],
+      true,
+    ],
+  ])(
+    "reports whether %s keeps the basePath",
+    async (_name, hadBasePath, middlewareResult, beforeFiles, expected) => {
+      const serveFilesystemRoute = vi.fn(
+        async (..._args: Parameters<NonNullable<PagesPipelineDeps["serveFilesystemRoute"]>>) =>
+          true,
+      );
+      await runPagesRequest(
+        makeRequest("/legacy"),
+        baseDeps({
+          basePath: "/docs",
+          hadBasePath,
+          runMiddleware: makeMiddleware(middlewareResult),
+          configRewrites: { beforeFiles, afterFiles: [], fallback: [] },
+          serveFilesystemRoute,
+        }),
+      );
+      // Rules that don't match the current basePath state never reach the image endpoint.
+      const imageCall = serveFilesystemRoute.mock.calls.find((call) => call[0] === "/_next/image");
+      expect(imageCall?.[5] ?? false).toBe(expected);
+    },
+  );
 
   it.each([
     ["beforeFiles", null],
@@ -1796,6 +1865,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       destination,
       expect.any(Request),
+      true,
     );
   });
 
@@ -1849,6 +1919,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       "/file.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -1889,6 +1960,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       "/api/rewritten",
       expect.any(Request),
+      true,
     );
     expect(handleApi).toHaveBeenCalledWith(
       expect.any(Request),
@@ -1929,6 +2001,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       "/api/from-middleware",
       expect.any(Request),
+      true,
     );
     expect(handleApi).toHaveBeenCalledWith(
       expect.any(Request),
@@ -1963,6 +2036,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       "/asset.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -2074,6 +2148,7 @@ describe("afterFiles rewrites", () => {
       "afterFiles",
       "/file.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -2102,6 +2177,7 @@ describe("afterFiles rewrites", () => {
       "direct",
       "/after-control",
       expect.any(Request),
+      true,
     );
     expect(renderPage).toHaveBeenCalledWith(
       expect.any(Request),
@@ -2433,6 +2509,7 @@ describe("fallback rewrites on 404", () => {
       "fallback",
       "/file.txt",
       expect.any(Request),
+      true,
     );
   });
 

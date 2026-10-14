@@ -18,7 +18,6 @@
  */
 
 import { assetPrefixPathname, ASSET_PREFIX_URL_DIR } from "../utils/asset-prefix.js";
-import { hasBasePath } from "../utils/base-path.js";
 import { setCacheStateHeaders } from "./cache-headers.js";
 import { badRequestResponse } from "./http-error-responses.js";
 import { VINEXT_PRERENDER_SPECIAL_ERROR_HEADER } from "./headers.js";
@@ -267,25 +266,6 @@ export function invalidImageSourceResponse(): Response {
 }
 
 const RECURSIVE_IMAGE_URL_RE = /\/_(?:next|vinext)\/image(?:$|\/)/;
-
-/**
- * The URL of a local image source. vinext's next/image emits the endpoint
- * without the basePath, so a host that admits that form passes the basePath
- * as `sourceBasePath` and an unprefixed source resolves under it. Build output
- * under a path `assetPrefix` is already served at its emitted URL.
- */
-export function resolveImageSourceUrl(
-  imageUrl: string,
-  sourceBasePath: string,
-  assetPathPrefix: string,
-  requestUrl: string,
-): URL {
-  const servedAsEmitted =
-    !sourceBasePath ||
-    hasBasePath(imageUrl, sourceBasePath) ||
-    (assetPathPrefix !== "" && imageUrl.startsWith(`${assetPathPrefix}/${ASSET_PREFIX_URL_DIR}/`));
-  return new URL(servedAsEmitted ? imageUrl : sourceBasePath + imageUrl, requestUrl);
-}
 
 /**
  * Parse and validate image optimization query parameters.

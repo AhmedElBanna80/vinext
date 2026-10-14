@@ -1225,6 +1225,15 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     : undefined;
   let didMiddlewareRewrite = false;
   let didMiddlewareRewritePathname = false;
+  // Rewrites carry or drop the basePath: middleware by its target URL, config
+  // rules unless they set `basePath: false`. Like Next.js, post-middleware
+  // rules match against the current state and the image endpoint is served
+  // only under basePath.
+  let resolvedPathnameHasBasePath = hadBasePath;
+  const currentBasePathState = (): BasePathMatchState => ({
+    basePath: options.basePath,
+    hadBasePath: resolvedPathnameHasBasePath,
+  });
 
   if (runMiddleware) {
     const middlewareResult = await runMiddleware({
@@ -1263,6 +1272,9 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
 
     cleanPathname = middlewareResult.cleanPathname;
     didMiddlewareRewrite = middlewareResult.rewritten;
+    if (didMiddlewareRewrite) {
+      resolvedPathnameHasBasePath = middlewareResult.rewriteHadBasePath ?? true;
+    }
     // A rewrite destination is authoritative even when normalization makes it
     // textually equal to the incoming path (for example /%61dmin -> /admin).
     if (didMiddlewareRewrite || cleanPathname !== normalized.cleanPathname) {
@@ -1576,7 +1588,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   for (const rewrite of options.configRewrites.beforeFiles) {
     const beforeFilesRewrite = await applyRewrite(
       {
-        basePathState,
+        basePathState: currentBasePathState(),
         clearRequestContext: options.clearRequestContext,
         middlewareContext,
         // External RSC rewrites must forward the validated `_rsc` token so the
@@ -1602,6 +1614,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       cleanPathname = pathnameForResolvedUrl(resolvedUrl);
       cleanPathnameIsRequestPathname = false;
       filesystemRouteEligible = true;
+      resolvedPathnameHasBasePath = !options.basePath || rewrite.basePath !== false;
     }
   }
 
@@ -1620,7 +1633,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     for (const rewrite of options.configRewrites.afterFiles) {
       const rewritten = await applyRewrite(
         {
-          basePathState,
+          basePathState: currentBasePathState(),
           clearRequestContext: options.clearRequestContext,
           middlewareContext,
           request: normalizedUserlandRequest,
@@ -1644,6 +1657,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       cleanPathname = pathnameForResolvedUrl(resolvedUrl);
       cleanPathnameIsRequestPathname = false;
       filesystemRouteEligible = true;
+      resolvedPathnameHasBasePath = !options.basePath || rewrite.basePath !== false;
       actionMatch = matchCleanPathname();
       if (actionMatch) break;
     }
@@ -1651,7 +1665,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       for (const rewrite of options.configRewrites.fallback) {
         const rewritten = await applyRewrite(
           {
-            basePathState,
+            basePathState: currentBasePathState(),
             clearRequestContext: options.clearRequestContext,
             middlewareContext,
             request: normalizedUserlandRequest,
@@ -1675,6 +1689,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
         cleanPathname = pathnameForResolvedUrl(resolvedUrl);
         cleanPathnameIsRequestPathname = false;
         filesystemRouteEligible = true;
+        resolvedPathnameHasBasePath = !options.basePath || rewrite.basePath !== false;
         actionMatch = matchCleanPathname();
         if (actionMatch) break;
       }
@@ -1685,7 +1700,16 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   const lateActionRscCacheBustingRedirect = await validateClaimedOutsideBasePathRsc();
   if (lateActionRscCacheBustingRedirect) return lateActionRscCacheBustingRedirect;
 
-  if (filesystemRouteEligible && isImageOptimizationPath(cleanPathname)) {
+  // Next.js checks the filesystem after each rewrite phase, so late rewrites
+  // to the endpoint are served as well.
+  const serveImageEndpointIfMatched = async (): Promise<Response | null> => {
+    if (
+      !filesystemRouteEligible ||
+      !resolvedPathnameHasBasePath ||
+      !isImageOptimizationPath(cleanPathname)
+    ) {
+      return null;
+    }
     // Rewrites to or of the endpoint replace the query in `resolvedUrl`.
     const imageUrl = new URL(resolvedUrl, url);
     const imageRedirect = resolveDevImageRedirect(
@@ -1742,7 +1766,9 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       requestHeaders: imageRequestHeaders,
       search: imageUrl.search,
     });
-  }
+  };
+  const imageEndpointResponse = await serveImageEndpointIfMatched();
+  if (imageEndpointResponse) return imageEndpointResponse;
 
   const metadataRouteResponse = await renderMetadataRouteIfMatched();
   if (metadataRouteResponse) {
@@ -2432,7 +2458,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     for (const rewrite of options.configRewrites.afterFiles) {
       const afterFilesRewrite = await applyRewrite(
         {
-          basePathState,
+          basePathState: currentBasePathState(),
           clearRequestContext: options.clearRequestContext,
           middlewareContext,
           // External RSC rewrites must forward the validated `_rsc` token.
@@ -2461,8 +2487,11 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       cleanPathnameIsRequestPathname = false;
       invalidateInterceptionCacheProof();
       filesystemRouteEligible = true;
+      resolvedPathnameHasBasePath = !options.basePath || rewrite.basePath !== false;
       const claimedRscCacheBustingRedirect = await validateClaimedOutsideBasePathRsc();
       if (claimedRscCacheBustingRedirect) return claimedRscCacheBustingRedirect;
+      const rewrittenImageEndpointResponse = await serveImageEndpointIfMatched();
+      if (rewrittenImageEndpointResponse) return rewrittenImageEndpointResponse;
       const rewrittenMetadataResponse = await renderMetadataRouteIfMatched();
       if (rewrittenMetadataResponse) {
         return composeResponseStageResponse(rewrittenMetadataResponse);
@@ -2492,7 +2521,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     for (const rewrite of options.configRewrites.fallback) {
       const fallbackRewrite = await applyRewrite(
         {
-          basePathState,
+          basePathState: currentBasePathState(),
           clearRequestContext: options.clearRequestContext,
           middlewareContext,
           // External RSC rewrites must forward the validated `_rsc` token.
@@ -2521,8 +2550,11 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       cleanPathnameIsRequestPathname = false;
       invalidateInterceptionCacheProof();
       filesystemRouteEligible = true;
+      resolvedPathnameHasBasePath = !options.basePath || rewrite.basePath !== false;
       const claimedRscCacheBustingRedirect = await validateClaimedOutsideBasePathRsc();
       if (claimedRscCacheBustingRedirect) return claimedRscCacheBustingRedirect;
+      const rewrittenImageEndpointResponse = await serveImageEndpointIfMatched();
+      if (rewrittenImageEndpointResponse) return rewrittenImageEndpointResponse;
       const rewrittenMetadataResponse = await renderMetadataRouteIfMatched();
       if (rewrittenMetadataResponse) {
         return composeResponseStageResponse(rewrittenMetadataResponse);
