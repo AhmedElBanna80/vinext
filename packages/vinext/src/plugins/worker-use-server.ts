@@ -3,9 +3,16 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import path, { toSlash } from "pathslash";
 import type { RscPluginManager } from "@vitejs/plugin-rsc";
-import { parseAstAsync, transformWithOxc, type Plugin, type ResolvedConfig } from "vite";
+import {
+  isCSSRequest,
+  parseAstAsync,
+  transformWithOxc,
+  type Plugin,
+  type ResolvedConfig,
+} from "vite";
 import { escapeRegExp } from "../utils/regex.js";
 import { magicStringTransformResult } from "./transform-result.js";
+import { USE_CACHE_PLUGIN_NAME, type UseCacheCallableApi } from "./use-cache-callable.js";
 
 type RscPluginModule = typeof import("@vitejs/plugin-rsc");
 type RscTransforms = typeof import("@vitejs/plugin-rsc/transforms");
@@ -84,6 +91,7 @@ export async function createWorkerUseServerPlugins(options: {
     importRscModule("@vitejs/plugin-rsc/core/plugin"),
   ]);
   let manager: RscPluginManager | undefined;
+  let useCacheApi: UseCacheCallableApi | undefined;
 
   const useServerPlugin: Plugin = {
     name: "vinext:worker-use-server",
@@ -92,6 +100,11 @@ export async function createWorkerUseServerPlugins(options: {
       // @vitejs/plugin-rsc's plugin API (and its reference manager) lives.
       const mainConfig = (config as ResolvedConfig & { mainConfig?: ResolvedConfig }).mainConfig;
       manager = (await options.rscPluginModule).getPluginApi(mainConfig ?? config)?.manager;
+      useCacheApi = (
+        (mainConfig ?? config).plugins.find((plugin) => plugin.name === USE_CACHE_PLUGIN_NAME) as
+          | Plugin<UseCacheCallableApi>
+          | undefined
+      )?.api;
     },
     resolveId: {
       filter: { id: WORKER_REFERENCE_RUNTIME_ID_RE },
@@ -165,6 +178,41 @@ export async function createWorkerUseServerPlugins(options: {
     },
   };
 
+  // `"use cache"` modules get the client environment's transform: their
+  // exports become references with the same ids, and inline cache functions
+  // are rejected as they are in Client Components. Unlike the main graphs'
+  // transform, match every module id so no worker module ships a cache body.
+  // CSS requests still hold stylesheet text at this point, so skip them.
+  const useCachePlugin: Plugin = {
+    name: "vinext:worker-use-cache",
+    transform: {
+      filter: { code: "use cache" },
+      async handler(code, id) {
+        if (isCSSRequest(id)) return null;
+        const api = useCacheApi;
+        if (!api) {
+          throw new Error(
+            'vinext: cannot compile a "use cache" module in a Web Worker without vinext\'s "use cache" plugin.',
+          );
+        }
+        const runtime = uniqueBinding(code, "$$vinextWorkerReference");
+        const output = await withPositionedError(this, () =>
+          api.transformWorkerModule(
+            code,
+            id,
+            (referenceId, name) =>
+              `${runtime}(${JSON.stringify(referenceId)}, ${JSON.stringify(name)})`,
+          ),
+        );
+        if (!output) return null;
+        output.prepend(
+          `import { createWorkerServerReference as ${runtime} } from ${JSON.stringify(WORKER_REFERENCE_RUNTIME_ID)};\n`,
+        );
+        return magicStringTransformResult(output);
+      },
+    },
+  };
+
   // The proxies import React's Flight client, which needs the
   // `__webpack_require__` patch plugin-rsc applies to the main graphs. Scope
   // it to the vendored client so other worker modules stay untouched.
@@ -187,5 +235,5 @@ export async function createWorkerUseServerPlugins(options: {
       handler: patchHook.handler,
     },
   };
-  return [patchPlugin, useServerPlugin];
+  return [patchPlugin, useCachePlugin, useServerPlugin];
 }
