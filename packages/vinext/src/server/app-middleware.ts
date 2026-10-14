@@ -59,6 +59,8 @@ export type ApplyAppMiddlewareResult =
       /** True when this pathname can match middleware for some request context. */
       pathnameEligible?: boolean;
       rewritten: boolean;
+      /** False when a same-origin rewrite target was outside the basePath. */
+      rewriteHadBasePath?: boolean;
       search: string | null;
     }
   | {
@@ -71,6 +73,7 @@ export type ApplyAppMiddlewareResult =
     };
 
 type ForwardedMiddlewareContext = {
+  b?: unknown;
   h?: unknown;
   q?: unknown;
   r?: unknown;
@@ -254,7 +257,7 @@ function validationResponseWithMiddlewareHeaders(
 function applyForwardedMiddlewareContext(
   request: Request,
   context: AppMiddlewareContext,
-): { applied: boolean; rewriteUrl?: string } {
+): { applied: boolean; rewriteHadBasePath?: boolean; rewriteUrl?: string } {
   if (process.env.NODE_ENV === "production") {
     return { applied: false };
   }
@@ -282,7 +285,11 @@ function applyForwardedMiddlewareContext(
       context.status = data.s;
     }
     if (typeof data.r === "string" && data.r.length > 0) {
-      return { applied: true, rewriteUrl: data.r };
+      return {
+        applied: true,
+        rewriteHadBasePath: typeof data.b === "boolean" ? data.b : undefined,
+        rewriteUrl: data.r,
+      };
     }
     return { applied: true };
   } catch (e) {
@@ -299,6 +306,7 @@ export async function applyAppMiddleware(
   let pathnameEligible = forwarded.applied;
   let cleanPathname = options.cleanPathname;
   let rewritten = false;
+  let rewriteHadBasePath: boolean | undefined;
   let search: string | null = null;
 
   if (forwarded.rewriteUrl) {
@@ -330,6 +338,7 @@ export async function applyAppMiddleware(
       const rewriteParsed = new URL(forwarded.rewriteUrl, options.request.url);
       cleanPathname = rewriteParsed.pathname;
       rewritten = true;
+      rewriteHadBasePath = forwarded.rewriteHadBasePath;
       search = rewriteParsed.search;
     } catch (e) {
       console.error("[vinext] Failed to apply forwarded middleware rewrite:", e);
@@ -432,6 +441,7 @@ export async function applyAppMiddleware(
       const rewriteParsed = new URL(result.rewriteUrl, middlewareRequest.url);
       cleanPathname = rewriteParsed.pathname;
       rewritten = true;
+      rewriteHadBasePath = result.rewriteHadBasePath;
       search = rewriteParsed.search;
     }
   }
@@ -454,6 +464,7 @@ export async function applyAppMiddleware(
     matched,
     pathnameEligible,
     rewritten,
+    rewriteHadBasePath,
     search,
   };
 }
