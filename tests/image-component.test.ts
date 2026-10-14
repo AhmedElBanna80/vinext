@@ -205,6 +205,47 @@ describe("images.loader config validation", () => {
   });
 });
 
+// Ported from getWidths() in Next.js's client/legacy/image.tsx: a responsive
+// legacy image gets every device width with `w` descriptors and sizes=100vw,
+// while fixed/intrinsic images keep 1x/2x candidates even when given `sizes`.
+describe("next/legacy/image layout semantics with a loader prop", () => {
+  const loader = ({ src, width }: { src: string; width: number }) => `${src}?w=${width}`;
+
+  async function renderLegacy(props: Record<string, unknown>): Promise<string> {
+    const { default: LegacyImage } = await import("../packages/vinext/src/shims/legacy-image.js");
+    return ReactDOMServer.renderToString(
+      React.createElement(LegacyImage, {
+        alt: "a",
+        src: "/photo.jpg",
+        width: 100,
+        height: 100,
+        loader,
+        ...props,
+      }),
+    );
+  }
+
+  it('uses every device width and sizes="100vw" for layout="responsive"', async () => {
+    const html = await renderLegacy({ layout: "responsive" });
+    expect(html).toContain(
+      'srcSet="/photo.jpg?w=640 640w, /photo.jpg?w=750 750w, /photo.jpg?w=828 828w, ' +
+        "/photo.jpg?w=1080 1080w, /photo.jpg?w=1200 1200w, /photo.jpg?w=1920 1920w, " +
+        '/photo.jpg?w=2048 2048w, /photo.jpg?w=3840 3840w"',
+    );
+    expect(html).toContain('sizes="100vw"');
+    expect(html).toContain('src="/photo.jpg?w=3840"');
+  });
+
+  it("keeps 1x/2x candidates for fixed and intrinsic layouts given sizes", async () => {
+    for (const layout of ["fixed", "intrinsic"]) {
+      const html = await renderLegacy({ layout, sizes: "50vw" });
+      expect(html).toContain('srcSet="/photo.jpg?w=128 1x, /photo.jpg?w=256 2x"');
+      expect(html).toContain('sizes="50vw"');
+      expect(html).toContain('src="/photo.jpg?w=256"');
+    }
+  });
+});
+
 // ─── SSR rendering ──────────────────────────────────────────────────────
 
 describe("Image SSR rendering", () => {

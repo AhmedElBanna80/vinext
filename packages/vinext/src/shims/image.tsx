@@ -351,8 +351,13 @@ function generateImageAttributes(
   width: number | undefined,
   quality: number | undefined,
   sizes?: string,
+  legacyLayout?: string,
 ): { src: string; srcSet: string; sizes?: string } {
-  if (sizes) {
+  // next/legacy/image (client/legacy/image.tsx getWidths): "responsive" and
+  // "fill" layouts always get `w` candidates, while "fixed" and "intrinsic"
+  // keep 1x/2x candidates and ignore `sizes` when choosing widths.
+  const legacyFluid = legacyLayout === "responsive" || legacyLayout === "fill";
+  if (sizes && (!legacyLayout || legacyFluid)) {
     const viewportWidthPattern = /(^|\s)(1?\d?\d)vw/g;
     const viewportPercentages = Array.from(sizes.matchAll(viewportWidthPattern), (match) =>
       Number.parseInt(match[2], 10),
@@ -373,7 +378,7 @@ function generateImageAttributes(
 
   // No intrinsic width (e.g. `fill`): Next.js's getWidths() offers every
   // device size and defaults `sizes` to 100vw.
-  if (width === undefined) {
+  if (width === undefined || legacyFluid) {
     return {
       src: resolveUrl(src, RESPONSIVE_WIDTHS[RESPONSIVE_WIDTHS.length - 1], quality),
       srcSet: RESPONSIVE_WIDTHS.map(
@@ -389,6 +394,7 @@ function generateImageAttributes(
     srcSet: widths
       .map((candidateWidth, index) => `${resolveUrl(src, candidateWidth, quality)} ${index + 1}x`)
       .join(", "),
+    sizes,
   };
 }
 
@@ -406,6 +412,7 @@ function generateLoaderAttributes(
   width: number | undefined,
   quality: number | undefined,
   sizes?: string,
+  legacyLayout?: string,
 ): { src: string; srcSet: string; sizes?: string } {
   return generateImageAttributes(
     (loaderSrc, loaderWidth, loaderQuality) =>
@@ -414,8 +421,15 @@ function generateLoaderAttributes(
     width,
     quality,
     sizes,
+    legacyLayout,
   );
 }
+
+/**
+ * Internal prop set only by shims/legacy-image.tsx so custom-loader srcSet
+ * candidates follow next/legacy/image's layout rules instead of next/image's.
+ */
+export type LegacyLayoutProp = { __vinextLegacyLayout?: string };
 
 /** Internal: also thrown by shims/image-external.tsx for next/image. */
 export function missingLoaderError(src: string): Error {
@@ -459,6 +473,8 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
   // Next.js drops a caller-provided srcSet (`delete rest.srcSet` in getImgProps)
   // so it can't override the generated candidates.
   delete (rest as { srcSet?: unknown }).srcSet;
+  const legacyLayout = (rest as LegacyLayoutProp).__vinextLegacyLayout;
+  delete (rest as LegacyLayoutProp).__vinextLegacyLayout;
   // Dedup refs: ensure onLoad and onError fire at most once per src per mount.
   // Matches Next.js behavior — prevents double-firing from React re-renders,
   // strict-mode double-invocation, or state updates inside the handler itself.
@@ -621,6 +637,7 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
             fill ? undefined : imgWidth,
             typeof quality === "string" ? Number(quality) : quality,
             sizes,
+            legacyLayout,
           )
         : undefined;
     const resolvedSrc = overrideSrc || (loaderAttributes ? loaderAttributes.src : src);
