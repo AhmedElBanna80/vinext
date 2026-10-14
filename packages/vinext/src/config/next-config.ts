@@ -281,6 +281,12 @@ export type NextConfig = {
   /** Whether to add trailing slashes */
   trailingSlash?: boolean;
   /**
+   * Skip the automatic trailing-slash redirects and keep `<Link>`/router
+   * hrefs exactly as written.
+   * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/skipTrailingSlashRedirect
+   */
+  skipTrailingSlashRedirect?: boolean;
+  /**
    * Compress responses from the Node production server. Defaults to true.
    * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/compress
    */
@@ -515,6 +521,7 @@ export type ResolvedNextConfig = {
    */
   assetPrefix: string;
   trailingSlash: boolean;
+  skipTrailingSlashRedirect: boolean;
   /** Whether the Node production server compresses responses (`compress`, default true). */
   compress: boolean;
   skipProxyUrlNormalize: boolean;
@@ -1073,6 +1080,12 @@ function warnDeprecatedConfigOptions(config: NextConfig, root: string): void {
 
   for (const [propertyPath, warning] of warnings) {
     if (hasConfigProperty(config, propertyPath)) warnConfigOnce(warning);
+  }
+  // Next.js drops nullish nested values before warning about the moved key.
+  if (readOptionalRecord(config.experimental)?.skipTrailingSlashRedirect != null) {
+    warnConfigOnce(
+      `\`experimental.skipTrailingSlashRedirect\` has been moved to \`skipTrailingSlashRedirect\`. Please update your ${configFileName} file accordingly.`,
+    );
   }
 }
 
@@ -1716,6 +1729,7 @@ export async function resolveNextConfig(
       basePath: "",
       assetPrefix: "",
       trailingSlash: false,
+      skipTrailingSlashRedirect: false,
       compress: true,
       skipProxyUrlNormalize: false,
       typescript: {},
@@ -2076,6 +2090,11 @@ export async function resolveNextConfig(
     basePath: config.basePath ?? "",
     assetPrefix: normalizeAssetPrefix(config.assetPrefix),
     trailingSlash: config.trailingSlash ?? false,
+    // Next.js copies the legacy `experimental.skipTrailingSlashRedirect` over
+    // the top-level key (warnOptionHasBeenMovedOutOfExperimental), after
+    // dropping nullish nested values, so only a set legacy value overrides it.
+    skipTrailingSlashRedirect:
+      (experimental?.skipTrailingSlashRedirect ?? config.skipTrailingSlashRedirect) === true,
     // Next.js disables compression only for an explicit `compress: false`.
     compress: config.compress !== false,
     skipProxyUrlNormalize:
