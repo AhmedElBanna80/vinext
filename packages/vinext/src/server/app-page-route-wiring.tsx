@@ -24,6 +24,7 @@ import DefaultGlobalError from "vinext/shims/default-global-error";
 import DefaultNotFound from "vinext/shims/default-not-found";
 import type { AppRouteSemanticIds } from "../routing/app-route-graph.js";
 import { LayoutSegmentProvider } from "vinext/shims/layout-segment-context";
+import { withUseCacheLayoutMarker } from "vinext/shims/internal/app-page-props-cache-key";
 import {
   MetadataHead,
   ViewportHead,
@@ -386,10 +387,12 @@ export function probeAppPageLayoutWithTracking<TModule extends AppPageModule>(op
     );
     return probeReactServerSubtree(
       <LayoutComponent
-        params={options.makeThenableParams(
-          layoutParams,
-          options.layoutParamAccess?.createThenableParamsObserver(layoutId),
-        )}
+        {...withUseCacheLayoutMarker(LayoutComponent, {
+          params: options.makeThenableParams(
+            layoutParams,
+            options.layoutParamAccess?.createThenableParamsObserver(layoutId),
+          ),
+        })}
       >
         {APP_PAGE_LAYOUT_PROBE_CHILD}
       </LayoutComponent>,
@@ -805,7 +808,8 @@ export function createAppPageRouteBodyMetadata(
   const metadataHtml = streamedIconKey
     ? renderedMetadataHtml.replaceAll(
         `<link data-vinext-streamed-icon="${STREAMED_ICON_KEY_PLACEHOLDER}:`,
-        `<link data-vinext-streamed-icon="${escapeHtmlAttr(metadataKey)}:`,
+        // A replacer function keeps `$` sequences in the key literal.
+        () => `<link data-vinext-streamed-icon="${escapeHtmlAttr(metadataKey)}:`,
       )
     : renderedMetadataHtml;
   const parserInsertedMetadataHtml =
@@ -1261,11 +1265,11 @@ export function buildAppPageElements<
     let layoutElement: ReactNode = layoutDependency ? (
       renderAppComponentWithDependencyBarrier(
         LayoutComponent,
-        { ...layoutProps, children: <Children /> },
+        withUseCacheLayoutMarker(LayoutComponent, { ...layoutProps, children: <Children /> }),
         layoutDependency,
       )
     ) : (
-      <LayoutComponent {...layoutProps}>
+      <LayoutComponent {...withUseCacheLayoutMarker(LayoutComponent, layoutProps)}>
         <Children />
       </LayoutComponent>
     );
@@ -1381,6 +1385,9 @@ export function buildAppPageElements<
         // layouts keep their state, matching Next.js segment ownership.
         slotElement = <Fragment key={slotResetKey}>{slotElement}</Fragment>;
       }
+      // Next.js gives each slot segment its own RedirectBoundary, so a slot
+      // page's redirect() keeps the route's layouts mounted.
+      slotElement = <RedirectBoundary resetKey={slotResetKey}>{slotElement}</RedirectBoundary>;
     }
     const branchLayouts = new Map<
       number,
@@ -1512,7 +1519,11 @@ export function buildAppPageElements<
         const layoutEntry = layoutEntriesAtPosition[layoutIndex];
         const LayoutComponent = layoutEntry.component;
         slotElement = (
-          <LayoutComponent params={options.makeThenableParams(layoutEntry.params)}>
+          <LayoutComponent
+            {...withUseCacheLayoutMarker(LayoutComponent, {
+              params: options.makeThenableParams(layoutEntry.params),
+            })}
+          >
             {slotElement}
           </LayoutComponent>
         );
@@ -1606,7 +1617,7 @@ export function buildAppPageElements<
     // is a pre-existing nesting divergence tracked separately.)
     // This keeps the loading fallback visible during redirect-driven
     // transitions rather than unmounting it.
-    routeChildren = <RedirectBoundary>{routeChildren}</RedirectBoundary>;
+    routeChildren = <RedirectBoundary resetKey={routeResetKey}>{routeChildren}</RedirectBoundary>;
 
     if (routeLoadingComponent) {
       const RouteLoadingComponent = routeLoadingComponent;

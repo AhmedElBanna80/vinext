@@ -199,6 +199,60 @@ describe("deprecated config warnings", () => {
     }
   });
 
+  it("resolves skipTrailingSlashRedirect", async () => {
+    await expect(resolveNextConfig({})).resolves.toMatchObject({
+      skipTrailingSlashRedirect: false,
+    });
+    await expect(resolveNextConfig(null)).resolves.toMatchObject({
+      skipTrailingSlashRedirect: false,
+    });
+    await expect(resolveNextConfig({ skipTrailingSlashRedirect: true })).resolves.toMatchObject({
+      skipTrailingSlashRedirect: true,
+    });
+  });
+
+  it("moves the legacy experimental.skipTrailingSlashRedirect over the top-level key", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(
+      resolveNextConfig({
+        skipTrailingSlashRedirect: false,
+        experimental: { skipTrailingSlashRedirect: true },
+      }),
+    ).resolves.toMatchObject({ skipTrailingSlashRedirect: true });
+
+    expect(warn.mock.calls.map(([message]) => message)).toEqual([
+      "`experimental.skipTrailingSlashRedirect` has been moved to `skipTrailingSlashRedirect`. Please update your next.config.js file accordingly.",
+    ]);
+  });
+
+  it("keeps the top-level skipTrailingSlashRedirect when the legacy key is nullish", async () => {
+    // A config file name no other test warns for, so warn-once cannot hide a warning.
+    const root = makeTempDir();
+    fs.writeFileSync(path.join(root, "next.config.ts"), "export default {}\n");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      // Next.js drops undefined/null nested config values before moving the
+      // legacy key (assignDefaults in packages/next/src/server/config.ts).
+      for (const legacy of [undefined, null]) {
+        await expect(
+          resolveNextConfig(
+            {
+              skipTrailingSlashRedirect: true,
+              experimental: { skipTrailingSlashRedirect: legacy } as never,
+            },
+            root,
+          ),
+        ).resolves.toMatchObject({ skipTrailingSlashRedirect: true });
+      }
+
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("resolves both URL-normalization option names", async () => {
     await expect(resolveNextConfig({ skipProxyUrlNormalize: true })).resolves.toMatchObject({
       skipProxyUrlNormalize: true,
@@ -430,6 +484,20 @@ describe("loadNextConfig function-form defaultConfig argument", () => {
 
     const config = await loadNextConfig(tmpDir, PHASE_PRODUCTION_BUILD);
     expect(config?.pageExtensions).toEqual(["tsx", "ts", "jsx", "js", "page.ts"]);
+  });
+
+  it("passes the real compress default to a function-form config", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.js"),
+      `module.exports = (phase, { defaultConfig }) => ({\n` +
+        `  compress: defaultConfig.compress && false,\n` +
+        `});\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir, PHASE_PRODUCTION_BUILD);
+    expect(config?.compress).toBe(false);
+    expect((await resolveNextConfig(config)).compress).toBe(false);
   });
 });
 
@@ -2172,6 +2240,17 @@ describe("resolveNextConfig serverActionsBodySizeLimit", () => {
   });
 });
 
+describe("resolveNextConfig compress", () => {
+  // Next.js installs its compression middleware unless `compress` is exactly
+  // false (packages/next/src/server/lib/router-server.ts).
+  it("defaults to true and is disabled only by compress: false", async () => {
+    expect((await resolveNextConfig(null)).compress).toBe(true);
+    expect((await resolveNextConfig({})).compress).toBe(true);
+    expect((await resolveNextConfig({ compress: true })).compress).toBe(true);
+    expect((await resolveNextConfig({ compress: false })).compress).toBe(false);
+  });
+});
+
 describe("resolveNextConfig disableOptimizedLoading", () => {
   // Regression for #1519: `experimental.disableOptimizedLoading` defaults to
   // `false` and is read into the resolved config. The default drives the
@@ -2648,6 +2727,8 @@ describe("detectNextIntlConfig", () => {
       assetPrefix: "",
       basePath: "",
       trailingSlash: false,
+      skipTrailingSlashRedirect: false,
+      compress: true,
       skipProxyUrlNormalize: false,
       typescript: {},
       output: "",

@@ -97,6 +97,8 @@ import {
 import {
   beginAppRouterScrollIntent,
   clearAppRouterScrollIntent,
+  getPendingAppRouterScrollIntent,
+  isLatestAppRouterScrollIntent,
 } from "../packages/vinext/src/shims/app-router-scroll-state.js";
 import * as navigationShim from "../packages/vinext/src/shims/navigation.js";
 import {
@@ -985,6 +987,20 @@ describe("app browser entry navigation scheduling", () => {
     ).toBe("/rewrite?_rsc=prefetch-digest");
   });
 
+  it("keeps same-origin prefetch response pathnames that start with // on the app origin", () => {
+    const responseUrl = resolvePrefetchNavigationResponseUrl({
+      additionalRscUrls: [],
+      origin: "https://example.com",
+      responseUrl: "https://example.com//a//attacker.example/z?_rsc=prefetch-digest",
+      visibleRscUrl: "/.//a//attacker.example/z",
+    });
+
+    expect(responseUrl).toBe("/.//a//attacker.example/z?_rsc=prefetch-digest");
+    expect(new URL(responseUrl, "https://example.com/current").href).toBe(
+      "https://example.com//a//attacker.example/z?_rsc=prefetch-digest",
+    );
+  });
+
   it("preserves cross-origin prefetch response URLs for navigation validation", () => {
     expect(
       resolvePrefetchNavigationResponseUrl({
@@ -1156,10 +1172,10 @@ describe("app browser entry navigation scheduling", () => {
     expect(resolveServerActionOperationLane("staticAndDynamic")).toBe("refresh");
   });
 
-  it("restores action HTTP fallback errors from response status", () => {
+  it("restores action HTTP fallback errors from response status", async () => {
     // Ported from Next.js: test/e2e/app-dir/actions/app-action.test.ts
     // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/actions/app-action.test.ts
-    const fallback = normalizeServerActionThrownValue(new Error("sanitized"), 404);
+    const fallback = await normalizeServerActionThrownValue(new Error("sanitized"), 404);
 
     expect(fallback).toBeInstanceOf(Error);
     if (fallback instanceof Error && "digest" in fallback) {
@@ -1186,10 +1202,17 @@ describe("app browser entry navigation scheduling", () => {
     ).toBe(false);
   });
 
-  it("preserves ordinary server action errors for 500 responses", () => {
+  it("preserves ordinary server action errors for 500 responses", async () => {
     const error = new Error("sanitized action failure");
 
-    expect(normalizeServerActionThrownValue(error, 500)).toBe(error);
+    await expect(normalizeServerActionThrownValue(error, 500)).resolves.toBe(error);
+  });
+
+  it("returns the rejection of a failed action result as the thrown value", async () => {
+    // Next.js sends a failed action's result as a rejected promise.
+    const error = Object.assign(new Error("sanitized action failure"), { digest: "123" });
+
+    await expect(normalizeServerActionThrownValue(Promise.reject(error), 500)).resolves.toBe(error);
   });
 
   it("uses text/plain action response bodies as boundary errors", async () => {
@@ -4230,6 +4253,258 @@ describe("app browser navigation controller", () => {
     }
   });
 
+  it("discardPendingNavigation drops an uncommitted render and restores the visible tree", async () => {
+    // Next.js: a raw history.pushState/replaceState dispatches ACTION_RESTORE,
+    // which marks the pending navigation discarded so it never commits.
+    const commitClientNavigationState = vi.fn();
+    const visibleState = createState();
+    const { controller, detach, setBrowserRouterState, stateRef } = createControllerHarness(
+      visibleState,
+      { commitClientNavigationState },
+    );
+    const commitEffect = vi.fn();
+
+    try {
+      expect(controller.discardPendingNavigation(visibleState)).toBe(false);
+
+      const scrollIntent = beginAppRouterScrollIntent("#section");
+      const navId = controller.beginNavigation();
+      const renderPromise = renderCurrentStateNavigationPayload(controller, {
+        payloadOrigin: FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
+        actionType: "navigate",
+        createNavigationCommitEffect: () => commitEffect,
+        historyUpdateMode: "push",
+        navigationSnapshot: stateRef.current.navigationSnapshot,
+        nextElements: Promise.resolve(
+          createResolvedElements("route:/dashboard", "/", null, {
+            "page:/dashboard": React.createElement("main", null, "dashboard"),
+          }),
+        ),
+        operationLane: "navigation",
+        params: {},
+        pendingRouterState: null,
+        previousNextUrl: null,
+        scrollIntent,
+        targetHref: "https://example.com/dashboard#section",
+        navId,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(stateRef.current).not.toBe(visibleState);
+      expect(getPendingAppRouterScrollIntent()?.id).toBe(scrollIntent.id);
+
+      expect(controller.discardPendingNavigation(visibleState)).toBe(true);
+      await expect(renderPromise).resolves.toBe("no-commit");
+      expect(controller.isCurrentNavigation(navId)).toBe(false);
+      expect(setBrowserRouterState).toHaveBeenLastCalledWith(visibleState);
+      // The discarded render's snapshot is released without running its URL
+      // commit, and nothing is left to drain if a later render commits.
+      expect(commitEffect).not.toHaveBeenCalled();
+      expect(commitClientNavigationState).toHaveBeenCalledExactlyOnceWith(undefined, {
+        releaseSnapshot: true,
+      });
+      controller.drainPrePaintEffects(Number.MAX_SAFE_INTEGER);
+      expect(commitClientNavigationState).toHaveBeenCalledOnce();
+      // navigateClientSide's post-navigation scroll fallback must not scroll
+      // to the discarded destination's hash or to the top of the page.
+      expect(getPendingAppRouterScrollIntent()).toBeNull();
+      expect(isLatestAppRouterScrollIntent(scrollIntent)).toBe(false);
+
+      expect(controller.discardPendingNavigation(visibleState)).toBe(false);
+    } finally {
+      clearAppRouterScrollIntent();
+      detach();
+    }
+  });
+
+  describe("history write after an optimistic shell commits", () => {
+    // Next.js treats the shell's commit as the navigation's: a raw
+    // history.pushState lands on top of it and the content still fills in
+    // under the shallow URL.
+    function createShellHarness() {
+      const commitClientNavigationState = vi.fn();
+      const initialState = createState();
+      const harness = createControllerHarness(initialState, { commitClientNavigationState });
+      const targetHref = "https://example.com/dashboard";
+      const render = (
+        navId: number,
+        navigationCommitKind: "authoritative" | "detached",
+        href = targetHref,
+        navigationInitiationState = initialState,
+      ) => {
+        const commitEffect = vi.fn();
+        const dispatched = harness.waitForNextVisibleCommitDispatch();
+        const outcome = harness.controller.renderNavigationPayload({
+          actionType: "navigate",
+          createNavigationCommitEffect: () => commitEffect,
+          historyUpdateMode: "push",
+          navigationCommitKind,
+          navigationInitiationState,
+          navigationSnapshot: createClientNavigationRenderSnapshot(href, {}),
+          navId,
+          nextElements: Promise.resolve(
+            createResolvedElements("route:/dashboard", "/", null, {
+              "page:/dashboard": React.createElement("main", null, navigationCommitKind),
+            }),
+          ),
+          operationLane: "navigation",
+          params: {},
+          payloadOrigin: FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
+          pendingRouterState: null,
+          previousNextUrl: null,
+          targetHref: href,
+        });
+        return { commitEffect, dispatched, outcome };
+      };
+      const commit = (renderId: number) => {
+        harness.controller.beginNavigationRenderCommit(renderId);
+        harness.controller.commitNavigationRender(renderId);
+      };
+      const commitShell = async (navId: number) => {
+        const shell = render(navId, "detached");
+        await shell.dispatched;
+        commit(harness.stateRef.current.renderId);
+        await expect(shell.outcome).resolves.toBe("committed");
+        expect(shell.commitEffect).toHaveBeenCalledExactlyOnceWith({
+          keepCurrentUrl: false,
+          releaseSnapshot: true,
+        });
+      };
+      return { ...harness, commit, commitClientNavigationState, commitShell, render };
+    }
+
+    it("keeps the navigation and commits its content under the current URL", async () => {
+      const { controller, detach, commit, commitClientNavigationState, commitShell, render } =
+        createShellHarness();
+      const stateRef = () => controller.getBrowserRouterState();
+
+      try {
+        const navId = controller.beginNavigation();
+        await commitShell(navId);
+
+        expect(controller.discardPendingNavigation(stateRef())).toBe(false);
+        expect(controller.isCurrentNavigation(navId)).toBe(true);
+        expect(commitClientNavigationState).not.toHaveBeenCalled();
+
+        const authoritative = render(navId, "authoritative");
+        await authoritative.dispatched;
+        commit(stateRef().renderId);
+        await expect(authoritative.outcome).resolves.toBe("committed");
+        // The retired URL never became visible, so this render took no
+        // snapshot and keeps the URL the history write set.
+        expect(authoritative.commitEffect).toHaveBeenCalledExactlyOnceWith({
+          keepCurrentUrl: true,
+          releaseSnapshot: false,
+        });
+        expect(controller.discardPendingNavigation(stateRef())).toBe(false);
+      } finally {
+        detach();
+      }
+    });
+
+    it("releases the snapshot of an authoritative render that is already rendering", async () => {
+      const { controller, detach, commit, commitClientNavigationState, commitShell, render } =
+        createShellHarness();
+      const stateRef = () => controller.getBrowserRouterState();
+
+      try {
+        const navId = controller.beginNavigation();
+        await commitShell(navId);
+        const authoritative = render(navId, "authoritative");
+        await authoritative.dispatched;
+
+        expect(controller.discardPendingNavigation(stateRef())).toBe(false);
+        // Hooks read the URL the history write set while the content renders.
+        expect(commitClientNavigationState).toHaveBeenCalledExactlyOnceWith(undefined, {
+          releaseSnapshot: true,
+        });
+
+        commit(stateRef().renderId);
+        await expect(authoritative.outcome).resolves.toBe("committed");
+        expect(authoritative.commitEffect).toHaveBeenCalledExactlyOnceWith({
+          keepCurrentUrl: true,
+          releaseSnapshot: false,
+        });
+      } finally {
+        detach();
+      }
+    });
+
+    it("still writes the URL of a redirect the navigation follows", async () => {
+      const { controller, detach, commit, commitShell, render } = createShellHarness();
+      const stateRef = () => controller.getBrowserRouterState();
+
+      try {
+        const navId = controller.beginNavigation();
+        await commitShell(navId);
+        expect(controller.discardPendingNavigation(stateRef())).toBe(false);
+
+        const redirected = render(navId, "authoritative", "https://example.com/login");
+        await redirected.dispatched;
+        commit(stateRef().renderId);
+        await expect(redirected.outcome).resolves.toBe("committed");
+        expect(redirected.commitEffect).toHaveBeenCalledExactlyOnceWith({
+          keepCurrentUrl: false,
+          releaseSnapshot: true,
+        });
+      } finally {
+        detach();
+      }
+    });
+
+    it("still writes the URL of a redirect that only adds a hash", async () => {
+      const { controller, detach, commit, commitShell, render } = createShellHarness();
+      const stateRef = () => controller.getBrowserRouterState();
+
+      try {
+        const navId = controller.beginNavigation();
+        await commitShell(navId);
+        expect(controller.discardPendingNavigation(stateRef())).toBe(false);
+
+        const redirected = render(navId, "authoritative", "https://example.com/dashboard#done");
+        await redirected.dispatched;
+        commit(stateRef().renderId);
+        await expect(redirected.outcome).resolves.toBe("committed");
+        expect(redirected.commitEffect).toHaveBeenCalledExactlyOnceWith({
+          keepCurrentUrl: false,
+          releaseSnapshot: true,
+        });
+      } finally {
+        detach();
+      }
+    });
+
+    it("forgets the retired URL once the navigation finalizes", async () => {
+      const { controller, detach, commit, commitShell, render } = createShellHarness();
+      const stateRef = () => controller.getBrowserRouterState();
+
+      try {
+        const navId = controller.beginNavigation();
+        await commitShell(navId);
+        expect(controller.discardPendingNavigation(stateRef())).toBe(false);
+        const authoritative = render(navId, "authoritative");
+        await authoritative.dispatched;
+        commit(stateRef().renderId);
+        await expect(authoritative.outcome).resolves.toBe("committed");
+        controller.finalizeNavigation(navId, null);
+
+        // A server action redirect reuses the navigation id without
+        // beginNavigation(); landing back on the shell's URL still writes it.
+        const actionRedirect = render(navId, "authoritative", undefined, stateRef());
+        await actionRedirect.dispatched;
+        commit(stateRef().renderId);
+        await expect(actionRedirect.outcome).resolves.toBe("committed");
+        expect(actionRedirect.commitEffect).toHaveBeenCalledExactlyOnceWith({
+          keepCurrentUrl: false,
+          releaseSnapshot: true,
+        });
+      } finally {
+        detach();
+      }
+    });
+  });
+
   it("does not clear a newer navigation failure target when an older render commits", async () => {
     const { controller, detach, stateRef } = createControllerHarness();
     vi.stubEnv("__NEXT_APP_NAV_FAIL_HANDLING", "true");
@@ -4304,6 +4579,43 @@ describe("app browser navigation controller", () => {
       detach();
       vi.unstubAllEnvs();
       vi.unstubAllGlobals();
+    }
+  });
+
+  it("commits a failed same-URL server action's tree before its thrown value settles", async () => {
+    const initialState = createState({
+      rootLayoutTreePath: "/",
+      routeId: "route:/settings",
+      navigationSnapshot: createClientNavigationRenderSnapshot("https://example.com/settings", {}),
+    });
+    const { controller, detach, stateRef } = createControllerHarness(initialState);
+    stubWindow("https://example.com/settings");
+    const nextElements = Promise.resolve(
+      createResolvedElements("route:/settings/account", "/", null, {
+        "page:/settings/account": React.createElement("main", null, "account"),
+      }),
+    );
+    const thrown = new Error("action failed");
+    let settleThrownValue: (value: unknown) => void = () => {};
+    const thrownValue = new Promise<unknown>((resolve) => {
+      settleThrownValue = resolve;
+    });
+
+    try {
+      const result = controller.commitSameUrlNavigatePayload(
+        nextElements,
+        stateRef.current.navigationSnapshot,
+        { data: thrownValue, ok: false },
+      );
+      const rejection = expect(result).rejects.toBe(thrown);
+
+      await vi.waitFor(() => {
+        expect(stateRef.current.routeId).toBe("route:/settings/account");
+      });
+      settleThrownValue(thrown);
+      await rejection;
+    } finally {
+      detach();
     }
   });
 

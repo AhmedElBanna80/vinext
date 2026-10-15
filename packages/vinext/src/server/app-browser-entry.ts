@@ -194,6 +194,7 @@ import { createClientReuseManifestHeaderFromVisibleAppState } from "./app-browse
 import {
   createRscRequestHeaders,
   createRscRequestUrl,
+  formatRscRequestPath,
   getVinextRscCompatibilityId,
   VINEXT_RSC_COMPATIBILITY_ID_HEADER,
   VINEXT_RSC_CONTENT_TYPE,
@@ -755,7 +756,7 @@ function createNavigationCommitEffect(options: {
   params: Record<string, string | string[]>;
   previousNextUrl: string | null;
   targetHistoryIndex?: number | null;
-}): () => void {
+}): (commit: { keepCurrentUrl: boolean; releaseSnapshot: boolean }) => void {
   const {
     activeRoutePaths,
     bfcacheIds,
@@ -767,13 +768,13 @@ function createNavigationCommitEffect(options: {
     targetHistoryIndex,
   } = options;
 
-  return () => {
+  return ({ keepCurrentUrl, releaseSnapshot }) => {
     // Only update URL if this is still the active navigation.
     // A newer navigation would have superseded this navigation id.
     if (!browserNavigationController.isCurrentNavigation(navId)) {
       // This transition was superseded before commit; balance the active
       // snapshot counter without clearing pendingPathname ownership.
-      commitClientNavigationState(undefined, { releaseSnapshot: true });
+      commitClientNavigationState(undefined, { releaseSnapshot });
       return;
     }
 
@@ -781,7 +782,9 @@ function createNavigationCommitEffect(options: {
       activeRoutePaths,
       bfcacheIds,
       href,
-      historyUpdateMode,
+      // Without an update mode the current entry keeps its URL and only
+      // records this render's metadata, as for a refresh.
+      historyUpdateMode: keepCurrentUrl ? undefined : historyUpdateMode,
       previousNextUrl,
       stageClientParams: () => stageClientParams(params),
       targetHistoryIndex,
@@ -789,7 +792,7 @@ function createNavigationCommitEffect(options: {
 
     // URL has been updated; the recovery hard-nav target is no longer needed.
     clearAppNavigationFailureTarget(href);
-    commitClientNavigationState(navId);
+    commitClientNavigationState(navId, { releaseSnapshot });
   };
 }
 
@@ -2209,7 +2212,7 @@ function bootstrapHydration(
           navigationKind === "navigate" && HAS_CLIENT_REWRITES
             ? resolveLoadedHybridClientRewriteHref(currentHref, __basePath)
             : null;
-        const targetPathAndSearch = url.pathname + url.search;
+        const targetPathAndSearch = formatRscRequestPath(url);
         const additionalPrefetchPathAndSearch =
           rewrittenNavigationHref && rewrittenNavigationHref !== currentHref
             ? [rewrittenNavigationHref]
@@ -2947,6 +2950,18 @@ function bootstrapHydration(
       historyController.claimCurrentHistoryTreeSnapshot(historyUpdateMode, previousHistoryState),
     commitAppOwnedHistoryStateWrite: (historyUpdateMode, previousHistoryState) =>
       historyController.commitAppOwnedHistoryStateWrite(historyUpdateMode, previousHistoryState),
+    discardPendingNavigation: () => {
+      if (
+        browserNavigationController.discardPendingNavigation(
+          historyController.readCurrentTreeSnapshot(),
+        )
+      ) {
+        // Only cancels a request still waiting for its response; a Flight body
+        // React is already decoding has released its abort handle.
+        navigationAbortCoordinator.abortActive();
+      }
+    },
+    flushCommittingNavigationUrl: () => browserNavigationController.flushCommittingNavigationUrl(),
   });
 
   // Note: This popstate handler runs for App Router (RSC navigation available).
