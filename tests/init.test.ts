@@ -593,21 +593,25 @@ describe("getInitDeps", () => {
   });
 });
 
-/** Helper: create a fake resolvable react package in node_modules */
-function setupFakeReact(dir: string, version: string): void {
-  const reactDir = path.join(dir, "node_modules", "react");
-  fs.mkdirSync(reactDir, { recursive: true });
+/** Helper: create a fake resolvable package in node_modules */
+function setupFakePackage(dir: string, name: string, version: string): void {
+  const packageDir = path.join(dir, "node_modules", name);
+  fs.mkdirSync(packageDir, { recursive: true });
   fs.writeFileSync(
-    path.join(reactDir, "package.json"),
-    JSON.stringify({ name: "react", version, main: "index.js" }),
+    path.join(packageDir, "package.json"),
+    JSON.stringify({ name, version, main: "index.js" }),
   );
-  fs.writeFileSync(path.join(reactDir, "index.js"), "");
+  fs.writeFileSync(path.join(packageDir, "index.js"), "");
+}
+
+function setupFakeReact(dir: string, version: string): void {
+  setupFakePackage(dir, "react", version);
 }
 
 describe("getReactUpgradeDeps", () => {
   it("returns react@latest + react-dom@latest when React is below the RSDW security floor", () => {
     setupProject(tmpDir, { router: "app" });
-    setupFakeReact(tmpDir, "19.2.5");
+    setupFakeReact(tmpDir, "19.3.0");
 
     const deps = getReactUpgradeDeps(tmpDir);
     expect(deps).toEqual(["react@latest", "react-dom@latest"]);
@@ -615,7 +619,7 @@ describe("getReactUpgradeDeps", () => {
 
   it("returns empty array when React is new enough", () => {
     setupProject(tmpDir, { router: "app" });
-    setupFakeReact(tmpDir, "19.2.6");
+    setupFakeReact(tmpDir, "19.3.1");
 
     const deps = getReactUpgradeDeps(tmpDir);
     expect(deps).toEqual([]);
@@ -623,22 +627,50 @@ describe("getReactUpgradeDeps", () => {
 
   it("returns empty array when React is a newer minor version", () => {
     setupProject(tmpDir, { router: "app" });
-    setupFakeReact(tmpDir, "19.3.0");
+    setupFakeReact(tmpDir, "19.4.0");
 
     const deps = getReactUpgradeDeps(tmpDir);
     expect(deps).toEqual([]);
   });
 
-  it("does not replace an installed React canary during a normal build", () => {
+  it("does not replace an installed React canary above the floor during a normal build", () => {
     setupProject(tmpDir, { router: "app" });
-    setupFakeReact(tmpDir, "19.3.0-canary-a1b2c3d4-20260901");
+    setupFakeReact(tmpDir, "19.4.0-canary-a1b2c3d4-20261101");
 
     expect(getReactUpgradeDeps(tmpDir)).toEqual([]);
   });
 
   it("still upgrades installed canaries below the RSDW security floor", () => {
     setupProject(tmpDir, { router: "app" });
-    setupFakeReact(tmpDir, "19.2.5-canary-a1b2c3d4-20260901");
+    setupFakeReact(tmpDir, "19.3.0-canary-07dde64d-20261013");
+
+    expect(getReactUpgradeDeps(tmpDir)).toEqual(["react@latest", "react-dom@latest"]);
+  });
+
+  it("upgrades an installed RSDW below the floor together with React", () => {
+    setupProject(tmpDir, { router: "app" });
+    setupFakeReact(tmpDir, "19.3.1");
+    setupFakePackage(tmpDir, "react-server-dom-webpack", "19.3.0");
+
+    expect(getReactUpgradeDeps(tmpDir)).toEqual([
+      "react@latest",
+      "react-dom@latest",
+      "react-server-dom-webpack@latest",
+    ]);
+  });
+
+  it("leaves an installed RSDW at the floor alone", () => {
+    setupProject(tmpDir, { router: "app" });
+    setupFakeReact(tmpDir, "19.3.1");
+    setupFakePackage(tmpDir, "react-server-dom-webpack", "19.3.1");
+
+    expect(getReactUpgradeDeps(tmpDir)).toEqual([]);
+  });
+
+  it("upgrades an installed React DOM below the floor", () => {
+    setupProject(tmpDir, { router: "app" });
+    setupFakeReact(tmpDir, "19.3.1");
+    setupFakePackage(tmpDir, "react-dom", "19.3.0");
 
     expect(getReactUpgradeDeps(tmpDir)).toEqual(["react@latest", "react-dom@latest"]);
   });
@@ -2316,13 +2348,81 @@ describe("init — dependency installation", () => {
 
   it("does not upgrade React when version is already compatible", async () => {
     setupProject(tmpDir, { router: "app" });
-    setupFakeReact(tmpDir, "19.2.6");
+    setupFakeReact(tmpDir, "19.3.1");
 
     const { execCalls } = await runInit(tmpDir);
 
     // No React upgrade call
     const reactUpgradeCall = execCalls.find((c) => c.cmd.includes("react@latest"));
     expect(reactUpgradeCall).toBeUndefined();
+  });
+
+  it("upgrades an already declared RSDW below the floor (App Router)", async () => {
+    setupProject(tmpDir, {
+      router: "app",
+      extraPkg: {
+        dependencies: {
+          react: "^19.3.1",
+          "react-dom": "^19.3.1",
+          "react-server-dom-webpack": "19.3.0",
+          next: "^15.0.0",
+        },
+      },
+    });
+    setupFakeReact(tmpDir, "19.3.1");
+    setupFakePackage(tmpDir, "react-dom", "19.3.1");
+    setupFakePackage(tmpDir, "react-server-dom-webpack", "19.3.0");
+
+    const { execCalls } = await runInit(tmpDir);
+
+    const upgradeCall = execCalls.find((c) => c.cmd.includes("react-server-dom-webpack@latest"));
+    expect(upgradeCall).toBeDefined();
+    expect(upgradeCall!.cmd).toContain("react@latest");
+    expect(upgradeCall!.cmd).toContain("react-dom@latest");
+    expect(upgradeCall!.cmd).not.toContain("-D");
+  });
+
+  it("upgrades a declared RSDW pin below the floor before node_modules exists (App Router)", async () => {
+    setupProject(tmpDir, {
+      router: "app",
+      extraPkg: {
+        dependencies: {
+          react: "^19.3.1",
+          "react-dom": "^19.3.1",
+          "react-server-dom-webpack": "19.3.0",
+          next: "^15.0.0",
+        },
+      },
+    });
+
+    const { execCalls } = await runInit(tmpDir);
+
+    const upgradeCall = execCalls.find((c) => c.cmd.includes("react-server-dom-webpack@latest"));
+    expect(upgradeCall).toBeDefined();
+    expect(upgradeCall!.cmd).toContain("react@latest");
+    expect(upgradeCall!.cmd).toContain("react-dom@latest");
+  });
+
+  it("keeps a declared React canary above the floor when installing (App Router)", async () => {
+    const canary = "19.4.0-canary-a1b2c3d4-20261101";
+    setupProject(tmpDir, {
+      router: "app",
+      extraPkg: {
+        dependencies: {
+          react: canary,
+          "react-dom": canary,
+          "react-server-dom-webpack": canary,
+          next: "^15.0.0",
+        },
+      },
+    });
+    setupFakeReact(tmpDir, canary);
+    setupFakePackage(tmpDir, "react-dom", canary);
+    setupFakePackage(tmpDir, "react-server-dom-webpack", canary);
+
+    const { execCalls } = await runInit(tmpDir);
+
+    expect(execCalls.find((c) => c.cmd.includes("react@latest"))).toBeUndefined();
   });
 
   function withUserAgent<T>(value: string | undefined, run: () => Promise<T>): Promise<T> {
@@ -2467,6 +2567,29 @@ describe("init — dependency installation", () => {
           react: "19.2.3",
           "react-dom": "19.2.3",
           "react-server-dom-webpack": "latest",
+          next: "^15.0.0",
+        },
+      },
+    });
+
+    const { execCalls } = await runInit(tmpDir, { install: false });
+    const pkg = readPkg(tmpDir) as { dependencies: Record<string, string> };
+    expect(execCalls).toEqual([]);
+    expect(pkg.dependencies).toMatchObject({
+      react: "latest",
+      "react-dom": "latest",
+      "react-server-dom-webpack": "latest",
+    });
+  });
+
+  it("updates a declared RSDW pin below the floor without installing", async () => {
+    setupProject(tmpDir, {
+      router: "app",
+      extraPkg: {
+        dependencies: {
+          react: "^19.3.1",
+          "react-dom": "^19.3.1",
+          "react-server-dom-webpack": "19.3.0",
           next: "^15.0.0",
         },
       },

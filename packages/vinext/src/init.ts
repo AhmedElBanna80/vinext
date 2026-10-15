@@ -430,7 +430,7 @@ function addDependencyEntries(root: string, deps: string[], { dev }: { dev: bool
  * Check if react/react-dom need upgrading for react-server-dom-webpack compatibility.
  *
  * react-server-dom-webpack versions are pinned to match their React version
- * (e.g. rsdw@19.2.6 requires react@^19.2.6). When a project has an older
+ * (e.g. rsdw@19.3.1 requires react@^19.3.1). When a project has an older
  * React (e.g. create-next-app ships react@19.2.3), we need to upgrade
  * react/react-dom BEFORE installing rsdw to avoid peer-dep conflicts.
  *
@@ -851,11 +851,20 @@ export async function init(options: InitOptions): Promise<InitResult> {
   const devDependencyEntriesAdded: string[] = [];
 
   // For App Router: react-server-dom-webpack requires react/react-dom versions
-  // to match exactly (e.g. rsdw@19.2.6 needs react@^19.2.6). If the installed
+  // to match exactly (e.g. rsdw@19.3.1 needs react@^19.3.1). If the installed
   // React is too old (common with create-next-app), upgrade it first as a
-  // regular dependency to avoid ERESOLVE peer-dep conflicts.
-  if (isApp && (!shouldInstall || missingDependencies.includes("react-server-dom-webpack"))) {
-    const reactUpgrade = getReactUpgradeDeps(root, { fromManifest: !shouldInstall });
+  // regular dependency to avoid ERESOLVE peer-dep conflicts. An already
+  // declared RSDW below the floor is upgraded here too. Installing also checks
+  // declared pins, which a clean install would resolve below the floor.
+  if (isApp) {
+    const reactUpgrade = shouldInstall
+      ? [
+          ...new Set([
+            ...getReactUpgradeDeps(root),
+            ...getReactUpgradeDeps(root, { fromManifest: true, installing: true }),
+          ]),
+        ]
+      : getReactUpgradeDeps(root, { fromManifest: true });
     if (reactUpgrade.length > 0) {
       console.log(`  ${terminalStyle.cyan(terminalStyle.bold("Upgrading dependencies:"))}`);
       console.log(

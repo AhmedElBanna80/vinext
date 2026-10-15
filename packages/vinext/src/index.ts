@@ -247,7 +247,6 @@ import { createDynamicPreloadMetadataPlugin } from "./plugins/dynamic-preload-me
 import { createOgInlineFetchAssetsPlugin, createOgAssetsPlugin } from "./plugins/og-assets.js";
 import { createOgHarfbuzzPlugin } from "./plugins/og-harfbuzz.js";
 import { createUseCacheCallablePlugin } from "./plugins/use-cache-callable.js";
-import { cacheFlightCodecPlugin } from "./plugins/cache-flight-codec.js";
 import { generateRouteTypes } from "./typegen.js";
 import {
   mergeOptimizeDepsExclude,
@@ -365,7 +364,6 @@ import MagicString from "magic-string";
 import path, { toSlash } from "pathslash";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { getPagesPreviewModeId } from "./server/pages-preview.js";
@@ -379,8 +377,8 @@ import {
   getViteCliInvocation,
   isViteCliConfigFile,
 } from "./utils/vite-cli-invocation.js";
-import { assertPluginRscVersion } from "./utils/plugin-rsc-version.js";
-import { getReactUpgradeDeps } from "./utils/react-version.js";
+import { assertPluginRscVersion, needsAppReactServerDom } from "./utils/plugin-rsc-version.js";
+import { getReactUpgradeDeps, reactUpgradeRequiredMessage } from "./utils/react-version.js";
 import {
   isPathInside,
   isPathInsideOrEqual,
@@ -1752,7 +1750,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let hasPlainPagesBuildEnvironments = false;
   let originalPlainPagesEnvironments: UserConfig["environments"] | undefined;
   let buildLifecycleInvocation: BuildLifecycleInvocation | undefined;
-  let reactUpgradeChecked = false;
+  let reactVersionChecked = false;
   let pagesOptimizeEntries: string[] = [];
   const importMetaUrlCapability = createImportMetaUrlPlugin({
     getRoot: () => root,
@@ -2012,7 +2010,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         if (useServerIndex === -1) {
           throw new Error("vinext: Failed to locate @vitejs/plugin-rsc use-server plugin.");
         }
-        plugins.splice(useServerIndex, 0, cacheFlightCodecPlugin(), useCachePlugin);
+        plugins.splice(useServerIndex, 0, useCachePlugin);
         return plugins.map(scopeRscPlugin);
       })
       .catch((cause) => {
@@ -2347,18 +2345,24 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           !config.build?.ssr &&
           getBuildBundlerOptions(config.build)?.input === undefined)),
     onPrepare: () => {
-      if (!hasAppDir || reactUpgradeChecked) return;
-      reactUpgradeChecked = true;
+      if (!hasAppDir || reactVersionChecked) return;
+      reactVersionChecked = true;
+      // Never install during a build: fail with the command to run instead.
       const reactUpgrade = getReactUpgradeDeps(root);
+      // plugin-rsc looks for the app's RSDW from the working directory, not
+      // the Vite root.
+      const needsAppRsdw = rscVersion !== null && needsAppReactServerDom(process.cwd(), rscVersion);
+      if (needsAppRsdw && !reactUpgrade.includes("react-server-dom-webpack@latest")) {
+        reactUpgrade.push("react-server-dom-webpack@latest");
+      }
       if (reactUpgrade.length === 0) return;
-      const installCommand = detectPackageManager(root).replace(/ -D$/, "");
-      const [packageManager, ...packageManagerArgs] = installCommand.split(" ");
-      console.log("  Upgrading React for RSC compatibility...");
-      execFileSync(packageManager, [...packageManagerArgs, ...reactUpgrade], {
-        cwd: root,
-        stdio: "inherit",
-        shell: process.platform === "win32",
-      });
+      throw new Error(
+        reactUpgradeRequiredMessage(
+          detectPackageManager(root).replace(/ -D$/, ""),
+          reactUpgrade,
+          needsAppRsdw ? rscVersion : undefined,
+        ),
+      );
     },
     shouldBuildPlainPages: () => !hasAppDir && !hasCloudflarePlugin && !hasNitroPlugin,
     createContext: () => ({
@@ -8656,7 +8660,7 @@ export const loadServerActionClient = ${
     plugins.push(createRscReferenceValidationNormalizerPlugin());
     plugins.push(createRscClientReferenceLoadersPlugin());
   } else if (manualUseCachePluginPromise) {
-    plugins.push(cacheFlightCodecPlugin(), manualUseCachePluginPromise);
+    plugins.push(manualUseCachePluginPromise);
   }
   plugins.push({
     name: "vinext:plain-pages-build-config",
