@@ -868,3 +868,29 @@ describe('handling of foreign characters', () => {
     await expect(page.getByTestId('UnlocalizedPathname')).toHaveText('/nested');
   });
 });
+
+// vinext: not in upstream. The request config reads the locale from
+// `next/root-params`, so the background regeneration of a stale page must see
+// the request's `[locale]`. Without it, the request config calls `notFound()`,
+// the regeneration fails, and the stale page is never replaced.
+it('regenerates a stale static page for its locale', async ({request}) => {
+  async function readPage() {
+    const response = await request.get('/de/isr');
+    const html = await response.text();
+    return {
+      status: response.status(),
+      locale: html.match(/data-testid="isr-locale">([^<]*)</)?.[1],
+      renderedAt: html.match(/data-testid="isr-rendered-at">(\d+)</)?.[1]
+    };
+  }
+
+  const initial = await readPage();
+  expect(initial).toMatchObject({status: 200, locale: 'de'});
+
+  // The page revalidates after 1 second. A regenerated entry has a new render
+  // time.
+  await expect
+    .poll(async () => (await readPage()).renderedAt, {timeout: 15_000})
+    .not.toBe(initial.renderedAt);
+  expect(await readPage()).toMatchObject({status: 200, locale: 'de'});
+});

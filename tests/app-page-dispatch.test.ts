@@ -33,6 +33,7 @@ import {
 import { APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL } from "../packages/vinext/src/server/app-rsc-render-mode.js";
 import { makeThenableParams } from "../packages/vinext/src/shims/thenable-params.js";
 import { after } from "../packages/vinext/src/shims/server.js";
+import { getRootParam } from "../packages/vinext/src/shims/root-params.js";
 import type { AppPageMiddlewareContext } from "../packages/vinext/src/server/app-page-response.js";
 import type { ISRCacheEntry } from "../packages/vinext/src/server/isr-cache.js";
 import type { CachedAppPageValue } from "../packages/vinext/src/shims/cache.js";
@@ -405,6 +406,7 @@ type CreateDispatchOptionsOverrides = {
   renderToReadableStream?: DispatchOptions["renderToReadableStream"];
   request?: Request;
   revalidateSeconds?: number | null;
+  rootParams?: DispatchOptions["rootParams"];
   resolveRouteFetchCacheMode?: DispatchOptions["resolveRouteFetchCacheMode"];
   resolveRouteRevalidateSeconds?: DispatchOptions["resolveRouteRevalidateSeconds"];
   resolveRouteDynamicConfig?: DispatchOptions["resolveRouteDynamicConfig"];
@@ -510,6 +512,7 @@ function createDispatchOptions(overrides: CreateDispatchOptionsOverrides = {}) {
     renderToReadableStream,
     request: overrides.request ?? new Request("https://example.test/posts/hello"),
     revalidateSeconds: overrides.revalidateSeconds ?? null,
+    rootParams: overrides.rootParams,
     renderWholeDocument: overrides.renderWholeDocument,
     resolveRouteFetchCacheMode: overrides.resolveRouteFetchCacheMode,
     resolveRouteRevalidateSeconds: overrides.resolveRouteRevalidateSeconds,
@@ -3722,6 +3725,61 @@ describe("app page dispatch", () => {
     });
     expect(isrSet).toHaveBeenCalled();
     expect(afterRan).toBe(true);
+  });
+
+  it("exposes the request's root params to a stale HTML regeneration", async () => {
+    // Background regeneration runs in its own request context. Without the
+    // request's root params, `next/root-params` getters resolve to undefined
+    // and the regenerated entry is rendered for the wrong root segment.
+    const route = createRoute({ pattern: "/[lang]/posts", routeSegments: ["[lang]", "posts"] });
+    let scheduledRender: unknown = null;
+    let renderedLang: unknown = "unset";
+    const isrSet = vi.fn(async () => {});
+    const { options } = createDispatchOptions({
+      buildPageElement: async () => {
+        renderedLang = await getRootParam("lang");
+        return React.createElement("main", null, "fresh");
+      },
+      cleanPathname: "/en/posts",
+      isProduction: true,
+      isrGet: vi.fn(async () =>
+        buildISRCacheEntry(buildCachedAppPageValue("<html>stale</html>"), true),
+      ),
+      isrSet,
+      loadSsrHandler: async () => ({
+        async handleSsr(_rscStream, _navigationContext, _fontData, captureOptions) {
+          if (captureOptions?.capturedRscDataRef) {
+            captureOptions.capturedRscDataRef.value = Promise.resolve(
+              new TextEncoder().encode("fresh-flight").buffer,
+            );
+          }
+          void captureOptions?.sideStream?.cancel().catch(() => {});
+          return createStream(["<html>fresh</html>"]);
+        },
+      }),
+      renderToReadableStream() {
+        return createStream(["flight"]);
+      },
+      revalidateSeconds: 60,
+      rootParams: { lang: "en" },
+      route,
+      scheduleBackgroundRegeneration: (_key, renderFn) => {
+        scheduledRender = renderFn;
+      },
+    });
+
+    const response = await dispatchAppPage(options);
+
+    expect(response.headers.get("x-vinext-cache")).toBe("STALE");
+    await response.text();
+    if (typeof scheduledRender !== "function") {
+      throw new Error("expected stale HTML response to schedule regeneration");
+    }
+
+    await scheduledRender();
+
+    expect(renderedLang).toBe("en");
+    expect(isrSet).toHaveBeenCalled();
   });
 
   it("regenerates stale HTML-captured RSC data under the plain key without interception context", async () => {

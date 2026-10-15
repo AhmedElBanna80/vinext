@@ -604,6 +604,7 @@ async function runAppPageRevalidationContext<
     draftModeSecret: string;
     dynamicConfig?: string;
     params: AppPageParams;
+    rootParams?: RootParams;
     routePattern: string;
     routeSegments: readonly string[];
     setNavigationContext: DispatchAppPageOptions<AppPageDispatchRoute>["setNavigationContext"];
@@ -624,6 +625,7 @@ async function runAppPageRevalidationContext<
     currentFetchRevalidate: options.currentFetchRevalidate ?? null,
     currentForceDynamicFetchDefault: options.dynamicConfig === "force-dynamic",
     executionContext: getRequestExecutionContext(),
+    rootParams: options.rootParams ?? null,
     unstableCacheRevalidation: "foreground",
   });
 
@@ -995,6 +997,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
             draftModeSecret: options.draftModeSecret,
             dynamicConfig: revalidationDynamicConfig,
             params: revalidationTarget.navigationParams,
+            rootParams: options.rootParams,
             routePattern: revalidationTarget.route.pattern,
             routeSegments: revalidationTarget.route.routeSegments,
             setNavigationContext: options.setNavigationContext,
