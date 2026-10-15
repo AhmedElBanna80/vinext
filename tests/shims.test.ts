@@ -4678,6 +4678,45 @@ describe("next/headers phase-aware cookies", () => {
       setHeadersContext(null);
     }
   });
+
+  // In dev, Vite's dep optimizer can prebundle `next/headers` while vinext's
+  // runtime keeps loading the unbundled shim, so two headers module instances
+  // share one request context. https://github.com/cloudflare/vinext/issues/3966
+  it("mutable cookies created by one headers module instance survive phase changes in another", async () => {
+    type HeadersShim = typeof import("../packages/vinext/src/shims/headers.js");
+    const userPath = "../packages/vinext/src/shims/headers.js?headers-instance=user";
+    const runtimePath = "../packages/vinext/src/shims/headers.js?headers-instance=runtime";
+    const [userHeaders, runtimeHeaders]: [HeadersShim, HeadersShim] = await Promise.all([
+      import(userPath),
+      import(runtimePath),
+    ]);
+    expect(userHeaders.cookies).not.toBe(runtimeHeaders.cookies);
+
+    runtimeHeaders.setHeadersContext({
+      headers: new Headers(),
+      cookies: new Map([["flavor", "vanilla"]]),
+      draftModeSecret: "draft-secret",
+    });
+    const previousPhase = runtimeHeaders.setHeadersAccessPhase("action");
+    try {
+      (await userHeaders.cookies()).set("flavor", "chocolate");
+      (await runtimeHeaders.draftMode()).enable();
+
+      runtimeHeaders.setHeadersAccessPhase("render");
+
+      const renderCookies = await userHeaders.cookies();
+      expect(renderCookies.get("flavor")?.value).toBe("chocolate");
+      expect(renderCookies.get("__prerender_bypass")?.value).toBe("draft-secret");
+      expect(runtimeHeaders.getAndClearPendingCookies()).toEqual([
+        expect.stringContaining("flavor=chocolate"),
+      ]);
+    } finally {
+      // Clear the context first so a regression reports the failing line
+      // instead of re-throwing from the phase restore.
+      runtimeHeaders.setHeadersContext(null);
+      runtimeHeaders.setHeadersAccessPhase(previousPhase);
+    }
+  });
 });
 
 describe("next/server shim", () => {
