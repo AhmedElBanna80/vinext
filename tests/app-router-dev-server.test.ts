@@ -2017,6 +2017,30 @@ describe("App Router integration", () => {
     expect(unknown.status).toBe(404);
   });
 
+  // https://github.com/cloudflare/vinext/issues/3919
+  it("completes a dynamic = 'error' page whose server component imports CSS", async () => {
+    // The RSC plugin wraps a CSS-importing page so its props, searchParams
+    // included, go through React's dev-only debug serialization. The headers
+    // arrive either way; only the body hung, so time the body alone.
+    const readBody = (res: Response) =>
+      Promise.race([
+        res.text(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("response body did not finish")), 15_000),
+        ),
+      ]);
+    const pathname = "/nextjs-compat/dynamic-error-css-module";
+    const res = await fetch(`${baseUrl}${pathname}`);
+    expect(res.status).toBe(200);
+    const html = await readBody(res);
+    expect(html).toContain('data-testid="dynamic-error-css-module"');
+    expect(html).toContain("</html>");
+
+    const rsc = await fetch(`${baseUrl}${pathname}.rsc`, { headers: { RSC: "1" } });
+    expect(rsc.status).toBe(200);
+    expect(await readBody(rsc)).toContain('"data-testid":"dynamic-error-css-module"');
+  });
+
   it("applies dynamic = 'error' as only-cache fetch policy", async () => {
     const res = await fetch(`${baseUrl}/layout-segment-config/dynamic-error-fetch`);
     expect(res.status).toBe(500);

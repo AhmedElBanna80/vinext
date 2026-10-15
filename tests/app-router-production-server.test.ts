@@ -655,6 +655,28 @@ describe("App Router Production server (startProdServer)", () => {
     expect(forcedRange.body).toEqual(full.body.subarray(0, 3));
   });
 
+  // https://github.com/cloudflare/vinext/issues/3919
+  it("fails a dynamic = 'error' page that passes searchParams to a client component", async () => {
+    // Like Next.js, React's read of the prop's `then` fails the render, so the
+    // response must finish as an error instead of leaving the stream open.
+    const readBody = (res: Response) =>
+      Promise.race([
+        res.text(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("response body did not finish")), 5_000),
+        ),
+      ]);
+    const pathname = "/nextjs-compat/dynamic-error-client-search-params/client-prop";
+    const rsc = await fetch(`${baseUrl}${pathname}.rsc?foo=bar`, { headers: { RSC: "1" } });
+    await expect(readBody(rsc)).resolves.toBeTypeOf("string");
+
+    const res = await fetch(`${baseUrl}${pathname}?foo=bar`);
+    expect(res.status).toBe(500);
+    const html = await readBody(res);
+    expect(html).toContain("</html>");
+    expect(html).not.toContain('data-testid="search-params-label"');
+  });
+
   // Ported from Next.js: test/e2e/app-dir/app-static/app-static.test.ts
   // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/app-static/app-static.test.ts
   it("contains dynamic = 'error' failures without terminating later App Router requests", async () => {
