@@ -23,9 +23,10 @@ import { startCandidateSearchParamsGate } from "./app-ssr-search-params-gate.js"
 import { onRenderDynamicLatched } from "vinext/shims/internal/headers-state";
 import { createClientPageSsrSearchParamsSource } from "./app-page-search-params-observation.js";
 import { runWithRootParamsScope, type RootParams } from "vinext/shims/root-params";
-import { isOpenRedirectShaped } from "./open-redirect.js";
+import { isOpenRedirectShaped, repeatedSlashRedirectResponse } from "./open-redirect.js";
 import { notFoundResponse } from "./http-error-responses.js";
 import { withScriptNonce } from "vinext/shims/script-nonce-context";
+import { withAppRouterTree } from "vinext/shims/app-router-tree-context";
 import {
   BeforeInteractiveContext,
   type BeforeInteractiveInlineScript,
@@ -63,7 +64,7 @@ import { isPprFallbackShellAbortError } from "vinext/shims/ppr-fallback-shell";
 import DefaultGlobalError from "vinext/shims/default-global-error";
 import { appendAssetDeploymentIdQuery } from "../utils/deployment-id.js";
 import { ssrAppRouterInstance } from "./app-ssr-router-instance.js";
-import { isAppRenderAbortError } from "./app-render-abort-error.js";
+import { createRenderStreamCancellation, isAppRenderAbortError } from "./app-render-abort-error.js";
 import { getNextErrorDigest } from "./next-error-digest.js";
 // @ts-expect-error — resolved by the vinext Vite plugin in SSR environments.
 import pagesClientAssets from "virtual:vinext-pages-client-assets";
@@ -587,7 +588,10 @@ export async function handleSsr(
           { value: registerBeforeInteractiveInlineScript },
           ssrTree,
         );
-        const ssrRoot = withScriptNonce(treeWithBeforeInteractive, options?.scriptNonce);
+        const ssrRoot = withScriptNonce(
+          withAppRouterTree(treeWithBeforeInteractive),
+          options?.scriptNonce,
+        );
 
         // plugin-rsc returns the bootstrap as `import("<url>")` so callers can
         // inject it via `bootstrapScriptContent`. We hand the URL to React's
@@ -621,6 +625,7 @@ export async function handleSsr(
         });
 
         const pprFallbackShellSignal = options?.pprFallbackShellSignal;
+        const htmlCancellation = createRenderStreamCancellation();
         // React emits a preload `Link` header (capped to `maxHeadersLength`)
         // via `onHeaders`. It fires before the shell resolves, so `linkHeader`
         // is populated by the time `renderToReadableStream` resolves below.
@@ -666,7 +671,9 @@ export async function handleSsr(
             if (pprFallbackShellSignal && isPprFallbackShellAbortError(error)) {
               return undefined;
             }
-            if (isAppRenderAbortError(error)) return undefined;
+            if (isAppRenderAbortError(error) || htmlCancellation.isReason(error)) {
+              return undefined;
+            }
 
             errorMetaRenderer.capture(error);
 
@@ -699,6 +706,10 @@ export async function handleSsr(
             ...renderOptions,
             signal: htmlAbortController.signal,
           });
+          // Known limitation: unlike Next.js, nothing waits for modules that are
+          // still loading. A next/dynamic() without `loading` whose import is
+          // pending here has no Suspense boundary of its own, so it suspends to
+          // the nearest one; with no loading.js above it, the shell is empty.
           setTimeout(() => htmlAbortController.abort(), 0);
           htmlStream = (await pendingHtml).prelude;
         } else {
@@ -834,6 +845,8 @@ export async function handleSsr(
             ),
           ),
           cleanup,
+          undefined,
+          htmlCancellation.record,
         );
 
         return {
@@ -863,8 +876,11 @@ export async function handleSsr(
 export default {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    // Block protocol-relative URL open redirects (including percent-encoded
-    // variants like /%5Cevil.com/). See request-pipeline.ts for details.
+    // Redirect repeated slashes / backslashes like Next.js and block encoded
+    // protocol-relative shapes (/%5Cevil.com/). See
+    // `guardProtocolRelativeUrl` in request-pipeline.ts for details.
+    const slashRedirect = repeatedSlashRedirectResponse(url.pathname + url.search);
+    if (slashRedirect) return slashRedirect;
     if (isOpenRedirectShaped(url.pathname)) {
       return notFoundResponse();
     }
