@@ -2,6 +2,7 @@ import type {
   Alias,
   CSSModulesOptions,
   DevEnvironment,
+  ESTree,
   HotUpdateOptions,
   Logger,
   Plugin,
@@ -12,13 +13,15 @@ import type {
   UserConfig,
   ViteDevServer,
 } from "vite";
+import { createIdResolver, createLogger, isRunnableDevEnvironment, transformWithOxc } from "vite";
 import {
-  createIdResolver,
-  createLogger,
-  isRunnableDevEnvironment,
-  parseAst,
-  transformWithOxc,
-} from "vite";
+  hasImportAttributes,
+  isTypeOnlyImport,
+  parseModuleRecord,
+  parseProgram,
+  TRIVIA_PATTERN,
+  type ModuleRecord,
+} from "./plugins/ast-utils.js";
 import {
   pagesRouter,
   apiRouter,
@@ -40,7 +43,6 @@ import {
   invalidateAppRouteCache,
   matchAppRoute,
 } from "./routing/app-router.js";
-import type { NitroRouteRuleConfig } from "./build/nitro-route-rules.js";
 import {
   buildViteResolveExtensions,
   normalizeViteResolveExtensions,
@@ -61,6 +63,7 @@ import {
   CACHEABILITY_REQUEST_PROJECTION_MODULE,
 } from "./server/cacheability-manifest.js";
 import { PREGENERATED_CONCRETE_PATHS_MODULE } from "./server/pregenerated-concrete-paths.js";
+import { rewriteOutputRootExternals } from "./build/output-root-externals.js";
 
 import { installSocketErrorBackstop } from "./server/socket-error-backstop.js";
 import { shouldInvalidateAppRouteFile } from "./server/dev-route-files.js";
@@ -239,13 +242,13 @@ import {
 } from "./client/instrumentation-client-inject.js";
 import { createMiddlewareServerOnlyPlugin } from "./plugins/middleware-server-only.js";
 import { createPagesNodeExternalsPlugin } from "./plugins/pages-node-externals.js";
+import { createCloudflareDevModuleUrlsPlugin } from "./plugins/cloudflare-dev-module-urls.js";
 import { validateMiddlewareModuleExports } from "./plugins/middleware-export-validation.js";
 import { createOptimizeImportsPlugin } from "./plugins/optimize-imports.js";
 import { createDynamicPreloadMetadataPlugin } from "./plugins/dynamic-preload-metadata.js";
 import { createOgInlineFetchAssetsPlugin, createOgAssetsPlugin } from "./plugins/og-assets.js";
 import { createOgHarfbuzzPlugin } from "./plugins/og-harfbuzz.js";
 import { createUseCacheCallablePlugin } from "./plugins/use-cache-callable.js";
-import { cacheFlightCodecPlugin } from "./plugins/cache-flight-codec.js";
 import { generateRouteTypes } from "./typegen.js";
 import {
   mergeOptimizeDepsExclude,
@@ -363,7 +366,6 @@ import MagicString from "magic-string";
 import path, { toSlash } from "pathslash";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { getPagesPreviewModeId } from "./server/pages-preview.js";
@@ -377,8 +379,8 @@ import {
   getViteCliInvocation,
   isViteCliConfigFile,
 } from "./utils/vite-cli-invocation.js";
-import { assertPluginRscVersion } from "./utils/plugin-rsc-version.js";
-import { getReactUpgradeDeps } from "./utils/react-version.js";
+import { assertPluginRscVersion, needsAppReactServerDom } from "./utils/plugin-rsc-version.js";
+import { getReactUpgradeDeps, reactUpgradeRequiredMessage } from "./utils/react-version.js";
 import {
   isPathInside,
   isPathInsideOrEqual,
@@ -408,6 +410,16 @@ const PAGES_CLOUDFLARE_WORKER_OPTIMIZE_DEPS_INCLUDE = Object.freeze([
   "react-dom/server.edge",
   "react/jsx-runtime",
   "react/jsx-dev-runtime",
+]);
+
+// vinext's cache runtime lazily imports plugin-rsc's React serializer. The
+// Worker scan never crawls vinext's own server modules, so without this the
+// optimizer discovers it while the Worker entry is loading and rewrites the
+// deps directory mid-import. Nested through vinext because plugin-rsc is an
+// optional peer that apps need not depend on directly.
+const PAGES_CLOUDFLARE_WORKER_OPTIONAL_OPTIMIZE_DEPS_INCLUDE = Object.freeze([
+  "use-sync-external-store/with-selector",
+  "vinext > @vitejs/plugin-rsc/react/rsc",
 ]);
 
 // In dev, @vitejs/plugin-rsc can serve "use client" modules nested inside a
@@ -493,7 +505,7 @@ if (earlyViteCliInvocation) {
 // VINEXT_PRERENDER check. See socket-error-backstop.ts.
 installSocketErrorBackstop();
 
-type ASTNode = ReturnType<typeof parseAst>["body"][number]["parent"];
+type ASTNode = ESTree.Program["body"][number]["parent"];
 
 // In dev, `server-only` imports that only Vite's dependency scan reaches
 // resolve to this virtual module, which fails when loaded. The importer path
@@ -510,9 +522,19 @@ function createServerOnlyClientImportError(importer: string | undefined): Error 
 function hasServerOnlyMarkerImport(code: string): boolean {
   if (!code.includes("server-only")) return false;
 
-  let ast: ReturnType<typeof parseAst>;
+  const record = parseModuleRecord(code, "js");
+  if (!record) return false;
+  if (record.staticImports.some((statement) => statement.moduleRequest.value === "server-only")) {
+    return true;
+  }
+
+  // The module record only lists ESM imports, so `require("server-only")`
+  // still needs the full AST.
+  if (!code.includes("require")) return false;
+
+  let ast: ESTree.Program;
   try {
-    ast = parseAst(code);
+    ast = parseProgram(code);
   } catch {
     return false;
   }
@@ -521,11 +543,6 @@ function hasServerOnlyMarkerImport(code: string): boolean {
     if (!node) return false;
     if (Array.isArray(node)) return node.some((child) => walk(child));
     if (typeof node !== "object") return false;
-
-    if (node.type === "ImportDeclaration") {
-      const source = (node as ASTNode & { source?: { value?: unknown } }).source?.value;
-      if (source === "server-only") return true;
-    }
 
     if (node.type === "CallExpression") {
       const call = node as ASTNode & {
@@ -631,15 +648,6 @@ type ResolveFromImporter = (
   options?: { skipSelf?: boolean },
 ) => Promise<{ id: string } | null | undefined>;
 
-type AstStaticDependencyDeclaration = ASTNode & {
-  type?: string;
-  importKind?: string;
-  exportKind?: string;
-  source?: { value?: unknown };
-  specifiers?: Array<{ importKind?: string; exportKind?: string }>;
-  attributes?: unknown[];
-};
-
 type MagicStringTransformResult = {
   code: string;
   map: ReturnType<MagicString["generateMap"]>;
@@ -691,31 +699,21 @@ function isolateGlobalNotFoundStylesheetImports(
     return isolateMdxStylesheetImports(code);
   }
 
-  let ast: ReturnType<typeof parseAst>;
-  try {
-    ast = parseAst(code, { lang: parserLanguageForScript(id) });
-  } catch {
-    return null;
-  }
+  const record = parseModuleRecord(code, parserLanguageForScript(id));
+  if (!record) return null;
 
   let output: MagicString | null = null;
-  for (const statement of ast.body as AstStaticDependencyDeclaration[]) {
-    if (statement.type !== "ImportDeclaration" || statement.importKind === "type") continue;
-    if (statement.specifiers && statement.specifiers.length > 0) continue;
-    if (statement.attributes && statement.attributes.length > 0) continue;
-
-    const source = statement.source;
-    const specifier = source?.value;
-    if (typeof specifier !== "string" || !isStylesheetSpecifier(specifier)) continue;
-
-    const range = source as typeof source & { start?: number; end?: number };
-    if (typeof range.start !== "number" || typeof range.end !== "number") continue;
+  for (const statement of record.staticImports) {
+    if (statement.entries.length > 0 || isTypeOnlyImport(code, statement)) continue;
+    const source = statement.moduleRequest;
+    if (hasImportAttributes(code, source.end, statement.end)) continue;
+    if (!isStylesheetSpecifier(source.value)) continue;
 
     output ??= new MagicString(code);
     output.overwrite(
-      range.start,
-      range.end,
-      JSON.stringify(specifier + GLOBAL_NOT_FOUND_CSS_QUERY),
+      source.start,
+      source.end,
+      JSON.stringify(source.value + GLOBAL_NOT_FOUND_CSS_QUERY),
     );
   }
 
@@ -741,14 +739,46 @@ function commonjsTransformFilter(
   return undefined;
 }
 
-function hasOnlyTypeSpecifiers(statement: AstStaticDependencyDeclaration): boolean {
-  return (
-    statement.specifiers !== undefined &&
-    statement.specifiers.length > 0 &&
-    statement.specifiers.every(
-      (specifier) => specifier.importKind === "type" || specifier.exportKind === "type",
-    )
-  );
+// Matches `export {}`, which may be an `export {} from "x"` re-export. oxc's
+// module record omits those, but they still load `x`.
+const EMPTY_EXPORT_PRESCAN = new RegExp(
+  String.raw`\bexport${TRIVIA_PATTERN}*\{${TRIVIA_PATTERN}*\}`,
+);
+
+/**
+ * Sources of a module's static imports and re-exports, in source order.
+ * Type-only declarations and declarations with import attributes are skipped.
+ */
+function runtimeStaticDependencySpecifiers(
+  code: string,
+  record: ModuleRecord,
+  lang: ReturnType<typeof parserLanguageForScript>,
+): string[] {
+  const dependencies: Array<{ start: number; specifier: string }> = [];
+  for (const statement of record.staticImports) {
+    if (isTypeOnlyImport(code, statement)) continue;
+    if (hasImportAttributes(code, statement.moduleRequest.end, statement.end)) continue;
+    dependencies.push({ start: statement.start, specifier: statement.moduleRequest.value });
+  }
+  for (const statement of record.staticExports) {
+    const source = statement.entries[0]?.moduleRequest;
+    if (!source || statement.entries.every((entry) => entry.isType)) continue;
+    if (hasImportAttributes(code, source.end, statement.end)) continue;
+    dependencies.push({ start: statement.start, specifier: source.value });
+  }
+  if (EMPTY_EXPORT_PRESCAN.test(code)) {
+    let program: ESTree.Program | null = null;
+    try {
+      program = parseProgram(code, { lang });
+    } catch {}
+    for (const statement of program?.body ?? []) {
+      if (statement.type !== "ExportNamedDeclaration" || !statement.source) continue;
+      if (statement.specifiers.length > 0 || statement.exportKind === "type") continue;
+      if (statement.attributes.length > 0) continue;
+      dependencies.push({ start: statement.start, specifier: statement.source.value });
+    }
+  }
+  return dependencies.sort((a, b) => a.start - b.start).map(({ specifier }) => specifier);
 }
 
 function resolvedStylesheetToDevManifestAsset(root: string, resolvedId: string): string | null {
@@ -806,33 +836,26 @@ function createDevPagesModuleDependencyReader(root: string, resolve: ResolveFrom
     const cleanModulePath = stripViteModuleQuery(modulePath);
     if (!path.isAbsolute(cleanModulePath) || !fs.existsSync(cleanModulePath)) return [];
 
-    let ast: ReturnType<typeof parseAst>;
+    let code: string;
     try {
-      ast = parseAst(fs.readFileSync(cleanModulePath, "utf-8"), {
-        lang: parserLanguageForScript(cleanModulePath),
-      });
+      code = fs.readFileSync(cleanModulePath, "utf-8");
     } catch {
       return [];
     }
+    const record = parseModuleRecord(code, parserLanguageForScript(cleanModulePath));
+    if (!record) return [];
 
     const dependencies: DevPagesModuleDependency[] = [];
-    for (const statement of ast.body as AstStaticDependencyDeclaration[]) {
-      if (
-        statement.type !== "ImportDeclaration" &&
-        statement.type !== "ExportNamedDeclaration" &&
-        statement.type !== "ExportAllDeclaration"
-      ) {
-        continue;
-      }
-      if (statement.importKind === "type") continue;
-      if (statement.exportKind === "type") continue;
-      if (hasOnlyTypeSpecifiers(statement)) continue;
-      if (statement.attributes && statement.attributes.length > 0) continue;
-
-      const specifier = statement.source?.value;
-      if (typeof specifier !== "string") continue;
-
-      const resolved = await resolve(specifier, cleanModulePath, { skipSelf: true });
+    for (const specifier of runtimeStaticDependencySpecifiers(
+      code,
+      record,
+      parserLanguageForScript(cleanModulePath),
+    )) {
+      // The reader runs inside vinext:config's load hook. Keep vinext's own
+      // resolveId in the chain so shimmed specifiers such as next/navigation
+      // resolve to the shim instead of real Next.js, which the Worker dep
+      // optimizer would otherwise discover and re-bundle during startup.
+      const resolved = await resolve(specifier, cleanModulePath, { skipSelf: false });
       if (!resolved?.id) continue;
 
       if (isStylesheetSpecifier(specifier) || isStylesheetSpecifier(resolved.id)) {
@@ -1304,6 +1327,13 @@ const RESOLVED_CACHEABILITY_REQUEST_PROJECTION =
   VIRTUAL_PREFIX + VIRTUAL_CACHEABILITY_REQUEST_PROJECTION;
 const VIRTUAL_PREGENERATED_CONCRETE_PATHS = "virtual:vinext-pregenerated-concrete-paths";
 const RESOLVED_PREGENERATED_CONCRETE_PATHS = VIRTUAL_PREFIX + VIRTUAL_PREGENERATED_CONCRETE_PATHS;
+// Worker builds keep these virtual ids external; renderChunk points each import
+// at the module vinext emits (and deploy steps fill) at the output root.
+const OUTPUT_ROOT_SERVER_EXTERNALS: ReadonlyMap<string, string> = new Map([
+  [VIRTUAL_CACHEABILITY_MANIFEST, CACHEABILITY_MANIFEST_MODULE],
+  [VIRTUAL_CACHEABILITY_REQUEST_PROJECTION, CACHEABILITY_REQUEST_PROJECTION_MODULE],
+  [VIRTUAL_PREGENERATED_CONCRETE_PATHS, PREGENERATED_CONCRETE_PATHS_MODULE],
+]);
 const VIRTUAL_APP_REQUEST_ENTRY = "virtual:vinext-app-request-entry";
 const RESOLVED_APP_REQUEST_ENTRY = VIRTUAL_PREFIX + VIRTUAL_APP_REQUEST_ENTRY;
 const VIRTUAL_APP_RESPONSE_ENTRY = "virtual:vinext-app-response-entry";
@@ -1661,13 +1691,9 @@ type NitroSetupContext = {
     buildDir?: string;
     dev?: boolean;
     exportConditions?: string[];
-    routeRules?: Record<string, NitroRouteRuleConfig>;
     traceDeps?: string[];
     plugins?: string[];
     virtual?: Record<string, string | (() => string | Promise<string>)>;
-  };
-  logger?: {
-    warn?: (message: string) => void;
   };
 };
 
@@ -1753,7 +1779,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let hasPlainPagesBuildEnvironments = false;
   let originalPlainPagesEnvironments: UserConfig["environments"] | undefined;
   let buildLifecycleInvocation: BuildLifecycleInvocation | undefined;
-  let reactUpgradeChecked = false;
+  let reactVersionChecked = false;
   let pagesOptimizeEntries: string[] = [];
   const importMetaUrlCapability = createImportMetaUrlPlugin({
     getRoot: () => root,
@@ -1769,6 +1795,8 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     },
   });
   const pagesClientAssetsOutputDirs = new Set<string>();
+  // Output-root-relative path of each build environment's client assets module.
+  const pagesClientAssetsExternalTargets = new Map<string, ReadonlyMap<string, string>>();
   // Workers must keep this module inside their deployable output directory.
   const resolvePagesClientAssetsOutputDir = (environmentName: string, outputDir: string): string =>
     !selectedMultiStageOutput && !hasAppDir && !hasCloudflarePlugin && environmentName === "ssr"
@@ -2013,7 +2041,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         if (useServerIndex === -1) {
           throw new Error("vinext: Failed to locate @vitejs/plugin-rsc use-server plugin.");
         }
-        plugins.splice(useServerIndex, 0, cacheFlightCodecPlugin(), useCachePlugin);
+        plugins.splice(useServerIndex, 0, useCachePlugin);
         return plugins.map(scopeRscPlugin);
       })
       .catch((cause) => {
@@ -2348,18 +2376,24 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           !config.build?.ssr &&
           getBuildBundlerOptions(config.build)?.input === undefined)),
     onPrepare: () => {
-      if (!hasAppDir || reactUpgradeChecked) return;
-      reactUpgradeChecked = true;
+      if (!hasAppDir || reactVersionChecked) return;
+      reactVersionChecked = true;
+      // Never install during a build: fail with the command to run instead.
       const reactUpgrade = getReactUpgradeDeps(root);
+      // plugin-rsc looks for the app's RSDW from the working directory, not
+      // the Vite root.
+      const needsAppRsdw = rscVersion !== null && needsAppReactServerDom(process.cwd(), rscVersion);
+      if (needsAppRsdw && !reactUpgrade.includes("react-server-dom-webpack@latest")) {
+        reactUpgrade.push("react-server-dom-webpack@latest");
+      }
       if (reactUpgrade.length === 0) return;
-      const installCommand = detectPackageManager(root).replace(/ -D$/, "");
-      const [packageManager, ...packageManagerArgs] = installCommand.split(" ");
-      console.log("  Upgrading React for RSC compatibility...");
-      execFileSync(packageManager, [...packageManagerArgs, ...reactUpgrade], {
-        cwd: root,
-        stdio: "inherit",
-        shell: process.platform === "win32",
-      });
+      throw new Error(
+        reactUpgradeRequiredMessage(
+          detectPackageManager(root).replace(/ -D$/, ""),
+          reactUpgrade,
+          needsAppRsdw ? rscVersion : undefined,
+        ),
+      );
     },
     shouldBuildPlainPages: () => !hasAppDir && !hasCloudflarePlugin && !hasNitroPlugin,
     createContext: () => ({
@@ -4428,13 +4462,15 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 ? APP_CLIENT_OPTIONAL_OPTIMIZE_DEPS_INCLUDE
                 : []
               : name !== "client"
-                ? ["use-sync-external-store/with-selector"]
+                ? PAGES_CLOUDFLARE_WORKER_OPTIONAL_OPTIMIZE_DEPS_INCLUDE
                 : [];
             for (const id of optionalIncludes) {
+              const depId = id.slice(id.lastIndexOf(">") + 1).trim();
               if (
                 optimizer.include?.includes(id) ||
+                optimizer.include?.includes(depId) ||
                 optimizer.exclude?.some(
-                  (excluded) => id === excluded || id.startsWith(`${excluded}/`),
+                  (excluded) => depId === excluded || depId.startsWith(`${excluded}/`),
                 )
               ) {
                 continue;
@@ -4763,7 +4799,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               ? this.environment?.name === "rsc"
               : this.environment !== undefined && isServerEnvironment(this.environment);
             if (isWorkerBuildEnvironment && this.environment.config?.command === "build") {
-              return { id: `./${CACHEABILITY_MANIFEST_MODULE}`, external: true };
+              return { id: VIRTUAL_CACHEABILITY_MANIFEST, external: true };
             }
             return RESOLVED_CACHEABILITY_MANIFEST;
           }
@@ -4773,7 +4809,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               this.environment?.name === "rsc" &&
               this.environment.config?.command === "build"
             ) {
-              return { id: `./${CACHEABILITY_REQUEST_PROJECTION_MODULE}`, external: true };
+              return { id: VIRTUAL_CACHEABILITY_REQUEST_PROJECTION, external: true };
             }
             return RESOLVED_CACHEABILITY_REQUEST_PROJECTION;
           }
@@ -4782,7 +4818,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               ? this.environment?.name === "rsc"
               : this.environment !== undefined && isServerEnvironment(this.environment);
             if (isWorkerBuildEnvironment && this.environment.config?.command === "build") {
-              return { id: `./${PREGENERATED_CONCRETE_PATHS_MODULE}`, external: true };
+              return { id: VIRTUAL_PREGENERATED_CONCRETE_PATHS, external: true };
             }
             return RESOLVED_PREGENERATED_CONCRETE_PATHS;
           }
@@ -5292,14 +5328,24 @@ export const loadServerActionClient = ${
             this.environment.name,
             environmentOutDir,
           );
-          let externalId = path.relative(
-            environmentOutDir,
-            path.join(sidecarDir, PAGES_CLIENT_ASSETS_MODULE),
+          pagesClientAssetsExternalTargets.set(
+            this.environment.name,
+            new Map([
+              [
+                VIRTUAL_PAGES_CLIENT_ASSETS,
+                path.relative(environmentOutDir, path.join(sidecarDir, PAGES_CLIENT_ASSETS_MODULE)),
+              ],
+            ]),
           );
-          if (!externalId.startsWith(".")) externalId = `./${externalId}`;
           pagesClientAssetsOutputDirs.add(sidecarDir);
-          return { id: externalId, external: true };
+          return { id: VIRTUAL_PAGES_CLIENT_ASSETS, external: true };
         },
+      },
+
+      renderChunk(code, chunk) {
+        const targets = pagesClientAssetsExternalTargets.get(this.environment.name);
+        if (!targets) return null;
+        return rewriteOutputRootExternals(code, chunk.fileName, targets);
       },
 
       outputOptions(output) {
@@ -5502,6 +5548,10 @@ export const loadServerActionClient = ${
     {
       name: "vinext:cacheability-manifest-asset",
       apply: "build",
+
+      renderChunk(code, chunk) {
+        return rewriteOutputRootExternals(code, chunk.fileName, OUTPUT_ROOT_SERVER_EXTERNALS);
+      },
 
       generateBundle() {
         const isWorkerBuildEnvironment = hasAppDir
@@ -5759,9 +5809,7 @@ export const loadServerActionClient = ${
           }
           const address = server.httpServer?.address();
           const port =
-            typeof address === "object" && address
-              ? address.port
-              : (server.config.server.port ?? 3000);
+            typeof address === "object" && address ? address.port : server.config.server.port;
           return `http://localhost:${port}`;
         };
         // Reuse the Pages SSR handler across requests. Every createSSRHandler
@@ -7407,7 +7455,7 @@ export const loadServerActionClient = ${
     // getStaticPaths) from page modules in the client bundle. These functions
     // often import server-only modules (database drivers, fs, etc.) that would
     // break or bloat the client bundle. Next.js does this via an SWC transform
-    // (next-ssg-transform); we use Vite's parseAst + MagicString.
+    // (next-ssg-transform); we use Vite's oxc parser + MagicString.
     //
     // Only applies to client builds (not SSR) and only to files under the
     // pages/ directory.
@@ -7815,15 +7863,15 @@ export const loadServerActionClient = ${
         async handler(code, id) {
           // The `code` filter above (a regex) only decides whether to invoke
           // this handler; it can fire on text inside comments, strings, or
-          // template literals. Scanning must therefore be AST-based so we only
+          // template literals. Scanning must therefore use the parser so we only
           // rewrite real `import X from '...'` declarations, not text that
           // merely looks like one. Regex-based scanning generated phantom
           // variables for commented-out imports, crashing SSR with
           // `__vinext_img_url_X is not defined`.
 
           // This plugin uses `enforce: "pre"`, so the handler runs on RAW
-          // source — before the JSX/TS transform. `parseAst` defaults to plain
-          // JavaScript and would throw on JSX or TS type annotations, which
+          // source — before the JSX/TS transform. Parsing it as plain
+          // JavaScript would fail on JSX or TS type annotations, which
           // would silently skip image transforms for every `.tsx`/`.jsx`/typed
           // `.ts` file. (The adjacent `use-cache` plugin avoids this by running
           // after the JSX transform; we can't, since the import must be
@@ -7833,45 +7881,29 @@ export const loadServerActionClient = ${
           // can contain JSX, so parse those as `tsx`. Plain `.ts` files must be
           // parsed as `ts`: the `tsx` grammar treats `<T>` as the start of a JSX
           // element, so legitimate TS-only syntax such as angle-bracket casts
-          // (`<Foo>bar`) and non-comma generic arrows (`<T>(x) => x`) would throw
-          // — which the `catch` below would swallow, silently leaving image
-          // imports in those files untransformed.
+          // (`<Foo>bar`) and non-comma generic arrows (`<T>(x) => x`) would fail
+          // to parse, silently leaving image imports in those files
+          // untransformed.
           const lang = id.endsWith(".ts") ? "ts" : "tsx";
-          let ast: ReturnType<typeof parseAst>;
-          try {
-            ast = parseAst(code, { lang });
-          } catch {
-            // Unparseable input (e.g. unsupported syntax) — leave untouched.
-            return null;
-          }
+          const record = parseModuleRecord(code, lang);
+          // Unparseable input (e.g. unsupported syntax) — leave untouched.
+          if (!record) return null;
 
           const s = new MagicString(code);
           let hasChanges = false;
           const imageImports = new Set<string>();
 
-          for (const node of ast.body) {
-            if (node.type !== "ImportDeclaration") continue;
-
-            const importNode = node as ASTNode & {
-              start: number;
-              end: number;
-              source?: { value?: unknown };
-              specifiers?: Array<{ type?: string; local?: { name?: string } }>;
-            };
-
-            const importPath = importNode.source?.value;
-            if (typeof importPath !== "string") continue;
+          for (const importNode of record.staticImports) {
+            const importPath = importNode.moduleRequest.value;
             if (!IMAGE_EXT_RE.test(importPath)) continue;
 
             // Only handle a single default import (`import X from '...'`),
             // matching the original behavior. Skip named/namespace imports and
             // side-effect-only imports (`import '...'`).
-            const specifiers = importNode.specifiers ?? [];
-            if (specifiers.length !== 1) continue;
-            const specifier = specifiers[0];
-            if (specifier.type !== "ImportDefaultSpecifier") continue;
-            const varName = specifier.local?.name;
-            if (!varName) continue;
+            if (importNode.entries.length !== 1) continue;
+            const [entry] = importNode.entries;
+            if (entry.importName.kind !== "Default") continue;
+            const varName = entry.localName.value;
 
             // Resolve the absolute path of the image. Normalize separators
             // since the path is embedded in the ESM module specifier below,
@@ -8123,8 +8155,13 @@ export const loadServerActionClient = ${
         },
       },
     },
+    // No Nitro `swr`/`cache` routeRules are generated for `revalidate` routes.
+    // vinext's own ISR cache already serves them, and only it can see
+    // request-time dynamic usage (cookies(), headers(), draft mode) and
+    // on-demand revalidation. A Nitro response cache keyed by path would
+    // replay per-user responses to other users.
     {
-      name: "vinext:nitro-route-rules",
+      name: "vinext:nitro-setup",
       configResolved(config) {
         nitroPublicDir = config.publicDir === "" ? false : config.publicDir;
       },
@@ -8171,30 +8208,6 @@ export const loadServerActionClient = ${
             if (!nitro.options.plugins.includes(NITRO_MIDDLEWARE_PUBLIC_FILES_PLUGIN_ID)) {
               nitro.options.plugins.push(NITRO_MIDDLEWARE_PUBLIC_FILES_PLUGIN_ID);
             }
-          }
-
-          const { collectNitroRouteRules, mergeNitroRouteRules } =
-            await import("./build/nitro-route-rules.js");
-          const generatedRouteRules = await collectNitroRouteRules({
-            appDir: hasAppDir ? appDir : null,
-            pagesDir: hasPagesDir ? pagesDir : null,
-            pageExtensions: nextConfig.pageExtensions,
-          });
-
-          if (Object.keys(generatedRouteRules).length === 0) return;
-
-          const { routeRules, skippedRoutes } = mergeNitroRouteRules(
-            nitro.options.routeRules,
-            generatedRouteRules,
-          );
-
-          nitro.options.routeRules = routeRules;
-
-          if (skippedRoutes.length > 0) {
-            const warn = nitro.logger?.warn ?? console.warn;
-            warn(
-              `[vinext] Skipping generated Nitro routeRules for routes with existing exact cache config: ${skippedRoutes.join(", ")}`,
-            );
           }
         },
       },
@@ -8739,7 +8752,7 @@ export const loadServerActionClient = ${
     plugins.push(createRscReferenceValidationNormalizerPlugin());
     plugins.push(createRscClientReferenceLoadersPlugin());
   } else if (manualUseCachePluginPromise) {
-    plugins.push(cacheFlightCodecPlugin(), manualUseCachePluginPromise);
+    plugins.push(manualUseCachePluginPromise);
   }
   plugins.push({
     name: "vinext:plain-pages-build-config",
@@ -8772,6 +8785,7 @@ export const loadServerActionClient = ${
       },
     },
   });
+  plugins.push(createCloudflareDevModuleUrlsPlugin({ isEnabled: () => hasCloudflarePlugin }));
   plugins.push(buildLifecyclePlugins[1]);
 
   return plugins;

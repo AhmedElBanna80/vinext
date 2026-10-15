@@ -208,6 +208,10 @@ function writePagesAppGlobalCssFixture(rootDir: string): PagesAppGlobalCssFixtur
   );
   fs.writeFileSync(path.join(stylesDir, "page.module.css"), ".pageText { margin-left: 29px; }\n");
   fs.writeFileSync(
+    path.join(stylesDir, "side-effect.css"),
+    ".side-effect-text { margin-bottom: 37px; }\n",
+  );
+  fs.writeFileSync(
     path.join(stylesDir, "type-only.module.css"),
     ".typeOnlyText { margin-right: 31px; }\n",
   );
@@ -232,6 +236,7 @@ function writePagesAppGlobalCssFixture(rootDir: string): PagesAppGlobalCssFixtur
     path.join(libDir, "reexport.ts"),
     'export { transitiveClassName } from "./transitive";\n',
   );
+  fs.writeFileSync(path.join(libDir, "side-effect.ts"), 'import "../styles/side-effect.css";\n');
   fs.writeFileSync(
     path.join(libDir, "type-only.ts"),
     'import "../styles/type-only.module.css";\n' +
@@ -255,6 +260,8 @@ function writePagesAppGlobalCssFixture(rootDir: string): PagesAppGlobalCssFixtur
     pagePath,
     'import Head from "next/head";\n' +
       'import pageStyles from "@/styles/page.module.css";\n' +
+      'export {} from "@/lib/side-effect";\n' +
+      'import type {} from "@/lib/type-only";\n' +
       "export default function Home() {\n" +
       "  return <>\n" +
       '    <Head><style>{".global-css-pages-text { border-top-width: 0px; }"}</style></Head>\n' +
@@ -290,6 +297,7 @@ function writePagesAppGlobalCssFixture(rootDir: string): PagesAppGlobalCssFixtur
       "/styles/app.module.css",
       "/styles/transitive.module.css",
       "/styles/page.module.css",
+      "/styles/side-effect.css",
     ],
     isrDevStylesheetHrefs: [
       "/styles/global%20style.css",
@@ -308,7 +316,7 @@ function writePagesAppGlobalCssFixture(rootDir: string): PagesAppGlobalCssFixtur
       "styles/app.module.css",
       "styles/transitive.module.css",
     ],
-    pageManifestAssets: ["styles/page.module.css"],
+    pageManifestAssets: ["styles/page.module.css", "styles/side-effect.css"],
     isrManifestAssets: ["styles/isr.module.css"],
     errorManifestAssets: ["styles/error.module.css"],
     cssMarkers: [
@@ -316,6 +324,7 @@ function writePagesAppGlobalCssFixture(rootDir: string): PagesAppGlobalCssFixtur
       "padding-left: 17px",
       "margin-top: 19px",
       "margin-left: 29px",
+      "margin-bottom: 37px",
     ],
   };
 }
@@ -3890,6 +3899,22 @@ describe("Pages Router dev server origin check", () => {
     );
     expect(res.status).toBe(400);
   });
+
+  it("never redirects the image endpoint off-site for a source that resolves to //", async () => {
+    for (const source of [
+      "/a/..//evil.com",
+      "/..//evil.com",
+      "/a/%2e%2e//evil.com",
+      "/a/..\\/evil.com",
+    ]) {
+      const res = await fetch(
+        `${baseUrl}/_next/image?url=${encodeURIComponent(source)}&w=640&q=75`,
+        { redirect: "manual" },
+      );
+      expect(res.status, source).toBe(400);
+      expect(res.headers.get("location"), source).toBeNull();
+    }
+  });
 });
 
 // Ported from Next.js: test/development/basic/allowed-dev-origins.test.ts
@@ -4618,6 +4643,47 @@ describe("Virtual server entry generation", () => {
       };
       expect(assets.ssrManifest?.[appPath.split(path.sep).join("/")]).toBeUndefined();
       expect(Object.values(assets.ssrManifest ?? {}).flat()).not.toContain("styles/site.less");
+    } finally {
+      await testServer.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("dev Pages client assets resolve shimmed next/* imports through vinext", async () => {
+    // The stylesheet walker resolves from vinext's own load hook. Skipping
+    // vinext's resolveId there resolved next/navigation to real Next.js, which
+    // a server dep optimizer with discovery (the Cloudflare Worker) then
+    // registered and re-bundled mid-startup.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-pages-shim-assets-"));
+    fs.mkdirSync(path.join(tmpDir, "pages"), { recursive: true });
+    fs.symlinkSync(path.join(process.cwd(), "node_modules"), path.join(tmpDir, "node_modules"));
+    fs.writeFileSync(
+      path.join(tmpDir, "pages", "_app.tsx"),
+      'import { usePathname } from "next/navigation";\n' +
+        "export default function App({ Component, pageProps }: any) {\n" +
+        "  usePathname();\n" +
+        "  return <Component {...pageProps} />;\n" +
+        "}\n",
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "pages", "index.tsx"),
+      "export default function Home() { return <div>Home</div>; }\n",
+    );
+    const testServer = await createServer({
+      root: tmpDir,
+      configFile: false,
+      plugins: [vinext({ appDir: tmpDir })],
+      environments: { ssr: { optimizeDeps: { noDiscovery: false } } },
+      server: { port: 0, cors: false },
+      logLevel: "silent",
+    });
+
+    try {
+      await testServer.ssrLoadModule("virtual:vinext-pages-client-assets");
+      const depsOptimizer = testServer.environments.ssr.depsOptimizer;
+      expect(depsOptimizer).toBeDefined();
+      expect(Object.keys(depsOptimizer!.metadata.discovered)).not.toContain("next/navigation");
+      expect(Object.keys(depsOptimizer!.metadata.optimized)).not.toContain("next/navigation");
     } finally {
       await testServer.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
