@@ -83,7 +83,7 @@ function getInlineStyleText(html: string): string {
 
 async function rawHttpRequest(
   url: URL,
-  options: { method?: string; headers?: Record<string, string> } = {},
+  options: { method?: string; path?: string; headers?: Record<string, string> } = {},
 ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> {
   return new Promise((resolve, reject) => {
     const request = http.request(url, options, (response) => {
@@ -430,6 +430,36 @@ describe("App Router Production server (startProdServer)", () => {
   // the collapsed path (base-server.ts / resolve-routes.ts).
   it("redirects repeated slashes and backslashes like Next.js", async () => {
     await expectRepeatedSlashRedirects(baseUrl);
+  });
+
+  // Without VINEXT_TRUST_PROXY / VINEXT_TRUSTED_HOSTS, any client can send
+  // these headers to the Node server, so NextRequest.ip / .geo must not
+  // report them.
+  it("ignores client-supplied IP and geo headers without proxy trust", async () => {
+    const res = await fetch(`${baseUrl}/api/request-ip-geo`, {
+      headers: {
+        "cf-connecting-ip": "10.0.0.1",
+        "x-real-ip": "10.0.0.2",
+        "x-forwarded-for": "10.0.0.3, 10.0.0.4",
+        "cf-ipcountry": "US",
+        "cf-ipcity": "San Francisco",
+        "x-vercel-ip-country": "US",
+      },
+    });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ ip: null, geo: null });
+  });
+
+  it("never lets an absolute-form request target choose the request origin", async () => {
+    // `/middleware-redirect` answers `NextResponse.redirect(new URL("/about",
+    // request.url))`, so routing this request would echo the target's origin.
+    const res = await rawHttpRequest(new URL(baseUrl), {
+      path: "http://evil.example/middleware-redirect",
+      headers: { host: "app.example" },
+    });
+    expect(res.status).toBe(404);
+    expect(res.headers.location).toBeUndefined();
+    expect(res.body.toString()).not.toContain("evil.example");
   });
 
   it("never turns a same-origin double-slash middleware redirect protocol-relative", async () => {

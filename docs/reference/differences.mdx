@@ -15,6 +15,16 @@ export const metadata = {
 
 Development, bundling, and production builds run on Vite 8 instead of the Next.js compiler toolchain. Vite plugins can extend the build, while webpack plugins and framework-specific build internals do not carry over automatically.
 
+## React
+
+The Next.js App Router runs on a copy of React bundled inside the `next` package, so React updates reach your app when a new Next.js release ships. vinext uses the `react`, `react-dom`, and `react-server-dom-webpack` installed in your project instead. When React ships a fix, including a security fix, you can upgrade right away without waiting for a vinext release:
+
+```bash
+npm install react@latest react-dom@latest react-server-dom-webpack@latest
+```
+
+Keep `react-server-dom-webpack` in your own `package.json`, as `vinext init` sets it up. Without it, the App Router falls back to the copy bundled with `@vitejs/plugin-rsc`.
+
 ## Deployment
 
 Cloudflare Workers is the primary native target. Standalone Node output and Nitro adapters cover other hosts. Next.js route config values such as `runtime` and `preferredRegion` don't choose where code runs, because runtime placement belongs to the selected deployment adapter. Outside `cacheComponents`, `runtime = "edge"` still opts an App Router page out of ISR, as it does in Next.js.
