@@ -4678,6 +4678,45 @@ describe("next/headers phase-aware cookies", () => {
       setHeadersContext(null);
     }
   });
+
+  // In dev, Vite's dep optimizer can prebundle `next/headers` while vinext's
+  // runtime keeps loading the unbundled shim, so two headers module instances
+  // share one request context. https://github.com/cloudflare/vinext/issues/3966
+  it("mutable cookies created by one headers module instance survive phase changes in another", async () => {
+    type HeadersShim = typeof import("../packages/vinext/src/shims/headers.js");
+    const userPath = "../packages/vinext/src/shims/headers.js?headers-instance=user";
+    const runtimePath = "../packages/vinext/src/shims/headers.js?headers-instance=runtime";
+    const [userHeaders, runtimeHeaders]: [HeadersShim, HeadersShim] = await Promise.all([
+      import(userPath),
+      import(runtimePath),
+    ]);
+    expect(userHeaders.cookies).not.toBe(runtimeHeaders.cookies);
+
+    runtimeHeaders.setHeadersContext({
+      headers: new Headers(),
+      cookies: new Map([["flavor", "vanilla"]]),
+      draftModeSecret: "draft-secret",
+    });
+    const previousPhase = runtimeHeaders.setHeadersAccessPhase("action");
+    try {
+      (await userHeaders.cookies()).set("flavor", "chocolate");
+      (await runtimeHeaders.draftMode()).enable();
+
+      runtimeHeaders.setHeadersAccessPhase("render");
+
+      const renderCookies = await userHeaders.cookies();
+      expect(renderCookies.get("flavor")?.value).toBe("chocolate");
+      expect(renderCookies.get("__prerender_bypass")?.value).toBe("draft-secret");
+      expect(runtimeHeaders.getAndClearPendingCookies()).toEqual([
+        expect.stringContaining("flavor=chocolate"),
+      ]);
+    } finally {
+      // Clear the context first so a regression reports the failing line
+      // instead of re-throwing from the phase restore.
+      runtimeHeaders.setHeadersContext(null);
+      runtimeHeaders.setHeadersAccessPhase(previousPhase);
+    }
+  });
 });
 
 describe("next/server shim", () => {
@@ -9564,7 +9603,9 @@ describe("middleware matcher patterns", () => {
 
       const compiled = compileMiddlewareMatcherPattern(pattern);
       expect(compiled.regexp?.source, pattern).toBe(nextRegexp.source);
-      expect(compiled.regexp?.flags, pattern).toBe(nextRegexp.flags);
+      // Next.js keeps only `.source` and recompiles it without path-to-regexp's
+      // case-insensitive flag, so middleware matchers are case-sensitive.
+      expect(compiled.regexp?.flags, pattern).toBe("");
     }
   });
 
@@ -12243,38 +12284,6 @@ describe("NextRequest API", () => {
     expect(req.nextUrl.port).toBe("8080");
   });
 
-  it("ip reads x-forwarded-for header", async () => {
-    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-    const req = new NextRequest("http://localhost/", {
-      headers: { "x-forwarded-for": "1.2.3.4, 5.6.7.8" },
-    });
-    expect(req.ip).toBe("1.2.3.4");
-  });
-
-  it("ip returns undefined when no header", async () => {
-    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-    const req = new NextRequest("http://localhost/");
-    expect(req.ip).toBeUndefined();
-  });
-
-  it("geo reads Cloudflare headers", async () => {
-    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-    const req = new NextRequest("http://localhost/", {
-      headers: {
-        "cf-ipcountry": "US",
-        "cf-ipcity": "San Francisco",
-      },
-    });
-    expect(req.geo?.country).toBe("US");
-    expect(req.geo?.city).toBe("San Francisco");
-  });
-
-  it("geo returns undefined when no geo headers", async () => {
-    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-    const req = new NextRequest("http://localhost/");
-    expect(req.geo).toBeUndefined();
-  });
-
   it("nextUrl.buildId returns process.env.__VINEXT_BUILD_ID when set", async () => {
     const original = process.env.__VINEXT_BUILD_ID;
     try {
@@ -13125,6 +13134,33 @@ describe("middleware request header overrides", () => {
     expect(nextRequest.headers.get("x-added")).toBe("1");
     expect(Object.keys(postMwReqCtx.cookies)).toEqual([]);
     expect(middlewareHeaders).toEqual({});
+  });
+
+  it("config-matchers applyMiddlewareRequestHeaders keeps Workers cf metadata", async () => {
+    const { applyMiddlewareRequestHeaders } =
+      await import("../packages/vinext/src/config/config-matchers.js");
+    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
+
+    const cf = { country: "AU" };
+    const request = new Request("http://localhost/api/edge", {
+      headers: { "cf-connecting-ip": "203.0.113.10" },
+    });
+    Object.defineProperty(request, "cf", { value: cf, enumerable: true, configurable: true });
+
+    const { request: nextRequest } = applyMiddlewareRequestHeaders(
+      {
+        "x-middleware-override-headers": "cf-connecting-ip,x-added",
+        "x-middleware-request-cf-connecting-ip": "203.0.113.10",
+        "x-middleware-request-x-added": "1",
+      },
+      request,
+    );
+
+    expect(nextRequest.headers.get("x-added")).toBe("1");
+    expect(Reflect.get(nextRequest, "cf")).toBe(cf);
+    const edgeRequest = new NextRequest(nextRequest);
+    expect(edgeRequest.ip).toBe("203.0.113.10");
+    expect(edgeRequest.geo?.country).toBe("AU");
   });
 
   it("config-matchers applyMiddlewareRequestHeaders preserves existing headers in add-only overrides", async () => {
@@ -19332,6 +19368,91 @@ describe("Pages Router concurrent navigation", () => {
   });
 
   it.each([
+    { href: "@evil.com", expected: "http://example.fr/posts/@evil.com" },
+    { href: ".evil.com/x", expected: "http://example.fr/posts/.evil.com/x" },
+    { href: "2?tab=x", expected: "http://example.fr/posts/2?tab=x" },
+  ])(
+    "resolves relative href $href against the current route before domain-locale routing",
+    async ({ href, expected }) => {
+      const previousWindow = (globalThis as any).window;
+      const { win } = createNavWindow();
+      Object.assign(win.location, {
+        pathname: "/posts/1",
+        href: "https://example.com/posts/1",
+        hostname: "example.com",
+        origin: "https://example.com",
+      });
+      Object.assign(win, {
+        __VINEXT_LOCALE__: "en",
+        __VINEXT_LOCALES__: ["en", "fr"],
+        __VINEXT_DEFAULT_LOCALE__: "en",
+        __NEXT_DATA__: {
+          ...win.__NEXT_DATA__,
+          page: "/posts/[id]",
+          query: { id: "1" },
+          domainLocales: [
+            { domain: "example.com", defaultLocale: "en" },
+            { domain: "example.fr", defaultLocale: "fr", http: true },
+          ],
+        },
+      });
+      (globalThis as any).window = win;
+
+      try {
+        vi.resetModules();
+        const { default: Router } = await import("../packages/vinext/src/shims/router.js");
+
+        await expect(Router.push(href, undefined, { locale: "fr" })).resolves.toBe(false);
+
+        // Next.js prepareUrlAs() resolves the href against the current route,
+        // so the configured domain is always followed by a `/` path.
+        expect(win.location.href).toBe(expected);
+        expect(new URL(win.location.href).hostname).toBe("example.fr");
+        expect(win.history.pushState).not.toHaveBeenCalled();
+      } finally {
+        vi.resetModules();
+        if (previousWindow === undefined) delete (globalThis as any).window;
+        else (globalThis as any).window = previousWindow;
+      }
+    },
+  );
+
+  it("resolves a relative as against the current route before adding the locale", async () => {
+    const previousWindow = (globalThis as any).window;
+    const { win } = createNavWindow();
+    Object.assign(win.location, {
+      pathname: "/posts/1",
+      href: "http://localhost/posts/1",
+    });
+    Object.assign(win, {
+      __VINEXT_LOCALE__: "en",
+      __VINEXT_LOCALES__: ["en", "fr"],
+      __VINEXT_DEFAULT_LOCALE__: "en",
+      __NEXT_DATA__: { ...win.__NEXT_DATA__, page: "/posts/[id]", query: { id: "1" } },
+    });
+    (globalThis as any).window = win;
+
+    try {
+      vi.resetModules();
+      const { default: Router } = await import("../packages/vinext/src/shims/router.js");
+
+      await expect(Router.push("/posts/[id]", "2", { locale: "fr", shallow: true })).resolves.toBe(
+        true,
+      );
+
+      expect(win.history.pushState).toHaveBeenCalledWith(
+        expect.objectContaining({ as: "/fr/posts/2" }),
+        "",
+        "/fr/posts/2",
+      );
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) delete (globalThis as any).window;
+      else (globalThis as any).window = previousWindow;
+    }
+  });
+
+  it.each([
     { href: "?id=2", as: "/pretty", expectedUrl: "/posts/[id]?id=2" },
     { href: "?tab=x", as: "/posts/2", expectedUrl: "/posts/[id]?tab=x" },
   ])("keeps dynamic route identity when $href has explicit as $as", async (testCase) => {
@@ -21999,12 +22120,14 @@ describe("Pages Router concurrent navigation", () => {
     }
   });
 
-  it("preserves the origin for same-host double-slash middleware data redirects", async () => {
+  it("collapses the leading slashes of same-host double-slash middleware data redirects", async () => {
     const previousWindow = (globalThis as any).window;
     const originalFetch = globalThis.fetch;
     const { win, pushState, render } = createNavWindow();
     const pageModuleUrl = fixtureModuleUrl("fixtures/client-navigation-page.tsx");
+    // As a local path, "//evil.example/steal" would point at evil.example.
     const target = "http://localhost//evil.example/steal?token=secret#fragment";
+    const collapsed = "/evil.example/steal?token=secret#fragment";
     Object.assign(win.location, { origin: "http://localhost" });
     Object.assign(win.__NEXT_DATA__, {
       buildId: "build-1",
@@ -22020,8 +22143,11 @@ describe("Pages Router concurrent navigation", () => {
           status: 200,
         });
       }
-      if (href === target) {
-        return new Response(buildNavHtml("//evil.example/steal", pageModuleUrl));
+      if (href === "/_next/data/build-1/evil.example/steal.json?token=secret") {
+        return new Response("{}", { status: 200 });
+      }
+      if (href === collapsed) {
+        return new Response(buildNavHtml("/evil.example/steal", pageModuleUrl));
       }
       throw new Error(`Unexpected fetch: ${href}`);
     });
@@ -22035,15 +22161,10 @@ describe("Pages Router concurrent navigation", () => {
       const result = await Router.push("/old-home", undefined, { scroll: false });
 
       expect(result).toBe(true);
-      expect(fetch.mock.calls.at(-1)?.[0]).toBe(target);
+      expect(fetch.mock.calls.at(-1)?.[0]).toBe(collapsed);
       expect(pushState).toHaveBeenCalledTimes(1);
-      expect(win.history.state).toMatchObject({
-        url: "//evil.example/steal?token=secret#fragment",
-        as: "//evil.example/steal?token=secret#fragment",
-        __N: true,
-      });
-      expect(pushState).toHaveBeenCalledWith(expect.any(Object), "", target);
-      expect(win.location.href).toBe(target);
+      expect(win.history.state).toMatchObject({ url: collapsed, as: collapsed, __N: true });
+      expect(pushState).toHaveBeenCalledWith(expect.any(Object), "", collapsed);
       expect(win.location.assign).not.toHaveBeenCalled();
       expect(render).toHaveBeenCalled();
     } finally {
@@ -22057,14 +22178,14 @@ describe("Pages Router concurrent navigation", () => {
     }
   });
 
-  it("normalizes basePath-prefixed double-slash middleware redirects", async () => {
+  it("collapses basePath-prefixed double-slash middleware redirects", async () => {
     const previousWindow = (globalThis as any).window;
     const originalFetch = globalThis.fetch;
     const previousBasePath = process.env.__NEXT_ROUTER_BASEPATH;
     const { win, pushState, render } = createNavWindow();
     const pageModuleUrl = fixtureModuleUrl("fixtures/client-navigation-page.tsx");
     const redirectHeader = "/docs//evil.example/steal?token=secret#fragment";
-    const target = `http://localhost${redirectHeader}`;
+    const collapsed = "/docs/evil.example/steal?token=secret#fragment";
     Object.assign(win.location, {
       origin: "http://localhost",
       pathname: "/docs",
@@ -22085,8 +22206,11 @@ describe("Pages Router concurrent navigation", () => {
           status: 200,
         });
       }
-      if (href === target) {
-        return new Response(buildNavHtml("//evil.example/steal", pageModuleUrl));
+      if (href === "/docs/_next/data/build-1/evil.example/steal.json?token=secret") {
+        return new Response("{}", { status: 200 });
+      }
+      if (href === collapsed) {
+        return new Response(buildNavHtml("/evil.example/steal", pageModuleUrl));
       }
       throw new Error(`Unexpected fetch: ${href}`);
     });
@@ -22117,25 +22241,16 @@ describe("Pages Router concurrent navigation", () => {
         "/docs/_next/data/build-1/old-home.json",
         expect.any(Object),
       );
-      expect(fetch).toHaveBeenNthCalledWith(2, target, expect.any(Object));
-      expect(fetch).not.toHaveBeenCalledWith(
-        "http://localhost/docs/docs//evil.example/steal?token=secret#fragment",
-        expect.any(Object),
-      );
+      expect(fetch).toHaveBeenLastCalledWith(collapsed, expect.any(Object));
       expect(pushState).toHaveBeenCalledTimes(1);
-      expect(pushState).toHaveBeenCalledWith(expect.any(Object), "", target);
-      expect(win.history.state).toMatchObject({
-        url: "//evil.example/steal?token=secret#fragment",
-        as: "//evil.example/steal?token=secret#fragment",
-        __N: true,
-      });
+      expect(pushState).toHaveBeenCalledWith(expect.any(Object), "", collapsed);
+      expect(win.history.state).toMatchObject({ url: collapsed, as: collapsed, __N: true });
       expect(events).toEqual([
         ["routeChangeStart", "/docs/old-home"],
-        ["routeChangeStart", redirectHeader],
-        ["beforeHistoryChange", redirectHeader],
-        ["routeChangeComplete", redirectHeader],
+        ["routeChangeStart", collapsed],
+        ["beforeHistoryChange", collapsed],
+        ["routeChangeComplete", collapsed],
       ]);
-      expect(win.location.href).toBe(target);
       expect(win.location.assign).not.toHaveBeenCalled();
       expect(render).toHaveBeenCalled();
 
@@ -22158,7 +22273,67 @@ describe("Pages Router concurrent navigation", () => {
     }
   });
 
-  it("keeps same-origin absolute middleware redirects safe when reached by popstate", async () => {
+  it("hard-navigates middleware redirects whose dot segments leave basePath", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+    const previousBasePath = process.env.__NEXT_ROUTER_BASEPATH;
+    const { win, pushState, render } = createNavWindow();
+    // "/docs/..//outside" normalizes to "//outside", outside the basePath.
+    const redirectHeader = "/docs/..//outside?token=secret";
+    Object.assign(win.location, {
+      origin: "http://localhost",
+      pathname: "/docs",
+      href: "http://localhost/docs",
+    });
+    Object.assign(win.__NEXT_DATA__, {
+      buildId: "build-1",
+      __vinext: { ...win.__NEXT_DATA__.__vinext, hasMiddleware: true },
+    });
+    process.env.__NEXT_ROUTER_BASEPATH = "/docs";
+    (globalThis as any).window = win;
+
+    const fetch = vi.fn(async (url: RequestInfo | URL) => {
+      const href = getFetchHref(url);
+      if (href === "/docs/_next/data/build-1/old-home.json") {
+        return new Response("{}", {
+          headers: { "x-nextjs-redirect": redirectHeader },
+          status: 200,
+        });
+      }
+      throw new Error(`Unexpected fetch: ${href}`);
+    });
+    globalThis.fetch = fetch;
+
+    try {
+      vi.resetModules();
+      const routerModule = await import("../packages/vinext/src/shims/router.js");
+      const Router = routerModule.default;
+
+      const result = await Router.push("/old-home", undefined, { scroll: false });
+
+      expect(result).toBe(false);
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(pushState).not.toHaveBeenCalled();
+      expect(render).not.toHaveBeenCalled();
+      // The browser resolves this on the app origin; it is not "/docs/outside".
+      expect(win.location.href).toBe(redirectHeader);
+    } finally {
+      vi.resetModules();
+      if (previousBasePath === undefined) {
+        delete process.env.__NEXT_ROUTER_BASEPATH;
+      } else {
+        process.env.__NEXT_ROUTER_BASEPATH = previousBasePath;
+      }
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("collapses double-slash middleware redirects reached by popstate", async () => {
     const previousWindow = (globalThis as any).window;
     const previousDocument = (globalThis as any).document;
     const originalFetch = globalThis.fetch;
@@ -22168,7 +22343,7 @@ describe("Pages Router concurrent navigation", () => {
     const { win, pushState, replaceState, render } = createNavWindow();
     const pageModuleUrl = fixtureModuleUrl("fixtures/client-navigation-page.tsx");
     const redirectHeader = "/docs//evil.example/steal?token=secret#fragment";
-    const target = `http://localhost${redirectHeader}`;
+    const collapsed = "/docs/evil.example/steal?token=secret#fragment";
     Object.assign(win.location, {
       origin: "http://localhost",
       pathname: "/docs/start",
@@ -22199,8 +22374,11 @@ describe("Pages Router concurrent navigation", () => {
           status: 200,
         });
       }
-      if (href === target) {
-        return new Response(buildNavHtml("//evil.example/steal", pageModuleUrl));
+      if (href === "/docs/_next/data/build-1/evil.example/steal.json?token=secret") {
+        return new Response("{}", { status: 200 });
+      }
+      if (href === collapsed) {
+        return new Response(buildNavHtml("/evil.example/steal", pageModuleUrl));
       }
       throw new Error(`Unexpected fetch: ${href}`);
     });
@@ -22242,9 +22420,7 @@ describe("Pages Router concurrent navigation", () => {
       (win.history as { state: unknown }).state = state;
       popstateHandler!({ state });
 
-      await vi.waitFor(() =>
-        expect(events).toContainEqual(["routeChangeComplete", redirectHeader]),
-      );
+      await vi.waitFor(() => expect(events).toContainEqual(["routeChangeComplete", collapsed]));
       await vi.waitFor(() => expect(win.scrollTo).toHaveBeenCalled());
 
       expect(fetch).toHaveBeenNthCalledWith(
@@ -22252,26 +22428,17 @@ describe("Pages Router concurrent navigation", () => {
         "/docs/_next/data/build-1/old-home.json",
         expect.any(Object),
       );
-      expect(fetch).toHaveBeenNthCalledWith(2, target, expect.any(Object));
-      expect(fetch).not.toHaveBeenCalledWith(
-        "http://localhost/docs/docs//evil.example/steal?token=secret#fragment",
-        expect.any(Object),
-      );
+      expect(fetch).toHaveBeenLastCalledWith(collapsed, expect.any(Object));
       expect(events).toEqual([
         ["routeChangeStart", "/docs/old-home"],
-        ["routeChangeStart", redirectHeader],
-        ["beforeHistoryChange", redirectHeader],
-        ["routeChangeComplete", redirectHeader],
+        ["routeChangeStart", collapsed],
+        ["beforeHistoryChange", collapsed],
+        ["routeChangeComplete", collapsed],
       ]);
       expect(pushState).not.toHaveBeenCalled();
       expect(replaceState).toHaveBeenCalledTimes(1);
-      expect(replaceState).toHaveBeenCalledWith(expect.any(Object), "", target);
-      expect(win.history.state).toMatchObject({
-        url: "//evil.example/steal?token=secret#fragment",
-        as: "//evil.example/steal?token=secret#fragment",
-        __N: true,
-      });
-      expect(win.location.href).toBe(target);
+      expect(replaceState).toHaveBeenCalledWith(expect.any(Object), "", collapsed);
+      expect(win.history.state).toMatchObject({ url: collapsed, as: collapsed, __N: true });
       expect(win.location.assign).not.toHaveBeenCalled();
       expect(render).toHaveBeenCalledTimes(1);
     } finally {
@@ -22708,13 +22875,14 @@ describe("Pages Router concurrent navigation", () => {
     }
   });
 
-  it("preserves the origin for followed HTML redirects with double-slash paths", async () => {
+  it("collapses followed HTML redirects with double-slash paths", async () => {
     const previousWindow = (globalThis as any).window;
     const originalFetch = globalThis.fetch;
     const previousBasePath = process.env.__NEXT_ROUTER_BASEPATH;
     const { win, pushState, render } = createNavWindow();
     const pageModuleUrl = fixtureModuleUrl("fixtures/client-navigation-page.tsx");
     const target = "http://localhost/docs//evil.example/steal?token=secret#fragment";
+    const collapsed = "/docs/evil.example/steal?token=secret#fragment";
     Object.assign(win.location, {
       origin: "http://localhost",
       pathname: "/docs",
@@ -22731,8 +22899,8 @@ describe("Pages Router concurrent navigation", () => {
     const fetch = vi.fn(async (url: RequestInfo | URL) => {
       const href = getFetchHref(url);
       if (href === "/docs/old-home") return followedRedirect;
-      if (href === target) {
-        return new Response(buildNavHtml("//evil.example/steal", pageModuleUrl));
+      if (href === collapsed) {
+        return new Response(buildNavHtml("/evil.example/steal", pageModuleUrl));
       }
       throw new Error(`Unexpected fetch: ${href}`);
     });
@@ -22747,15 +22915,10 @@ describe("Pages Router concurrent navigation", () => {
 
       expect(result).toBe(true);
       expect(fetch).toHaveBeenNthCalledWith(1, "/docs/old-home", expect.any(Object));
-      expect(fetch).toHaveBeenNthCalledWith(2, target, expect.any(Object));
+      expect(fetch).toHaveBeenNthCalledWith(2, collapsed, expect.any(Object));
       expect(pushState).toHaveBeenCalledTimes(1);
-      expect(pushState).toHaveBeenCalledWith(expect.any(Object), "", target);
-      expect(win.history.state).toMatchObject({
-        url: "//evil.example/steal?token=secret#fragment",
-        as: "//evil.example/steal?token=secret#fragment",
-        __N: true,
-      });
-      expect(win.location.href).toBe(target);
+      expect(pushState).toHaveBeenCalledWith(expect.any(Object), "", collapsed);
+      expect(win.history.state).toMatchObject({ url: collapsed, as: collapsed, __N: true });
       expect(win.location.assign).not.toHaveBeenCalled();
       expect(render).toHaveBeenCalled();
     } finally {
@@ -27062,38 +27225,109 @@ describe("Pages Router _next/data client navigation", () => {
 });
 
 describe("next/server enhancements", () => {
-  it("NextRequest.ip extracts from x-forwarded-for header", async () => {
-    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-    const req = new NextRequest("https://example.com", {
-      headers: { "x-forwarded-for": "1.2.3.4, 5.6.7.8" },
+  describe("NextRequest.ip / NextRequest.geo trust", () => {
+    const spoofedHeaders = {
+      "cf-connecting-ip": "10.0.0.1",
+      "x-real-ip": "10.0.0.2",
+      "x-forwarded-for": "10.0.0.3, 10.0.0.4",
+      "cf-ipcountry": "US",
+      "cf-ipcity": "San Francisco",
+      "x-vercel-ip-country": "US",
+    };
+
+    // proxy-trust reads the trust policy at module load, so re-import the
+    // shim after stubbing the environment.
+    async function importServerShim(env: Record<string, string> = {}) {
+      vi.stubEnv("VINEXT_TRUST_PROXY", "");
+      vi.stubEnv("VINEXT_TRUSTED_HOSTS", "");
+      for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+      vi.resetModules();
+      return import("../packages/vinext/src/shims/server.js");
+    }
+
+    function withCf(request: Request, cf: Record<string, unknown>): Request {
+      Object.defineProperty(request, "cf", { value: cf, enumerable: true, configurable: true });
+      return request;
+    }
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      vi.resetModules();
     });
-    expect(req.ip).toBe("1.2.3.4");
-  });
 
-  it("NextRequest.ip returns undefined without forwarded header", async () => {
-    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-    const req = new NextRequest("https://example.com");
-    expect(req.ip).toBeUndefined();
-  });
-
-  it("NextRequest.geo extracts from Cloudflare/Vercel headers", async () => {
-    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-    const req = new NextRequest("https://example.com", {
-      headers: {
-        "cf-ipcountry": "US",
-        "cf-ipcity": "San Francisco",
-      },
+    it("ignores client-supplied IP and geo headers without proxy trust", async () => {
+      const { NextRequest } = await importServerShim();
+      const req = new NextRequest("https://example.com", { headers: spoofedHeaders });
+      expect(req.ip).toBeUndefined();
+      expect(req.geo).toBeUndefined();
     });
-    const geo = req.geo;
-    expect(geo).toBeDefined();
-    expect(geo!.country).toBe("US");
-    expect(geo!.city).toBe("San Francisco");
-  });
 
-  it("NextRequest.geo returns undefined without geo headers", async () => {
-    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-    const req = new NextRequest("https://example.com");
-    expect(req.geo).toBeUndefined();
+    it("reads IP and geo headers when VINEXT_TRUST_PROXY=1", async () => {
+      const { NextRequest } = await importServerShim({ VINEXT_TRUST_PROXY: "1" });
+      const req = new NextRequest("https://example.com", { headers: spoofedHeaders });
+      expect(req.ip).toBe("10.0.0.1");
+      expect(req.geo).toEqual({
+        country: "US",
+        city: "San Francisco",
+        region: undefined,
+        latitude: undefined,
+        longitude: undefined,
+      });
+
+      const forwarded = new NextRequest("https://example.com", {
+        headers: { "x-forwarded-for": "1.2.3.4, 5.6.7.8", "x-vercel-ip-country": "AU" },
+      });
+      expect(forwarded.ip).toBe("1.2.3.4");
+      expect(forwarded.geo?.country).toBe("AU");
+
+      const empty = new NextRequest("https://example.com");
+      expect(empty.ip).toBeUndefined();
+      expect(empty.geo).toBeUndefined();
+    });
+
+    it("reads IP and geo headers when VINEXT_TRUSTED_HOSTS is set", async () => {
+      const { NextRequest } = await importServerShim({ VINEXT_TRUSTED_HOSTS: "example.com" });
+      const req = new NextRequest("https://example.com", {
+        headers: { "x-real-ip": "1.2.3.4", "cf-ipcountry": "DE" },
+      });
+      expect(req.ip).toBe("1.2.3.4");
+      expect(req.geo?.country).toBe("DE");
+    });
+
+    it("uses Cloudflare's CF-Connecting-IP and request.cf geo on Workers", async () => {
+      const { NextRequest } = await importServerShim();
+      const req = new NextRequest(
+        withCf(new Request("https://example.com", { headers: spoofedHeaders }), {
+          country: "AU",
+          city: "Sydney",
+          region: "New South Wales",
+          latitude: "-33.86",
+          longitude: "151.20",
+        }),
+      );
+      expect(req.ip).toBe("10.0.0.1");
+      expect(req.geo).toEqual({
+        country: "AU",
+        city: "Sydney",
+        region: "New South Wales",
+        latitude: "-33.86",
+        longitude: "151.20",
+      });
+    });
+
+    it("never falls back to spoofable headers on Workers", async () => {
+      const { NextRequest } = await importServerShim({ VINEXT_TRUST_PROXY: "1" });
+      const req = new NextRequest(
+        withCf(
+          new Request("https://example.com", {
+            headers: { "x-real-ip": "10.0.0.2", "cf-ipcountry": "US" },
+          }),
+          {},
+        ),
+      );
+      expect(req.ip).toBeUndefined();
+      expect(req.geo).toBeUndefined();
+    });
   });
 
   it("ResponseCookies.getAll returns all set cookies", async () => {
@@ -31202,6 +31436,16 @@ describe("isSafeAttrName", () => {
     expect(isSafeAttrName("onerror")).toBe(false);
     expect(isSafeAttrName("onload")).toBe(false);
     expect(isSafeAttrName("onmouseover")).toBe(false);
+  });
+
+  it("rejects inline event handler attributes in any case", () => {
+    // HTML attribute names are case-insensitive. React's server renderer drops
+    // every name longer than two characters that starts with "on" in any case.
+    expect(isSafeAttrName("ONERROR")).toBe(false);
+    expect(isSafeAttrName("Onload")).toBe(false);
+    expect(isSafeAttrName("oNclick")).toBe(false);
+    expect(isSafeAttrName("onError")).toBe(false);
+    expect(isSafeAttrName("on")).toBe(true);
   });
 
   it("allows attributes starting with 'o' that are not event handlers", () => {
