@@ -1570,7 +1570,9 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     return markAppRscResponseConfigHeadersApplied(response);
   };
   const postMiddlewareRequestContext = buildPostMwRequestContext(userlandRequest);
-  filesystemRouteEligible ||= didMiddlewareRewrite;
+  // Like Next.js, only a pathname under the basePath resolves to a route or
+  // file. A rewrite's destination decides this, not the request.
+  if (didMiddlewareRewrite) filesystemRouteEligible = resolvedPathnameHasBasePath;
 
   // Rewrites (beforeFiles, afterFiles, fallback) use `matchPathname` from
   // above to splice in the default locale before matching. Route matching
@@ -1605,8 +1607,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       resolvedUrl = mergeRewriteQuery(resolvedUrl, beforeFilesRewrite);
       cleanPathname = pathnameForResolvedUrl(resolvedUrl);
       cleanPathnameIsRequestPathname = false;
-      filesystemRouteEligible = true;
       resolvedPathnameHasBasePath = !options.basePath || rewrite.basePath !== false;
+      filesystemRouteEligible = resolvedPathnameHasBasePath;
     }
   }
 
@@ -1824,7 +1826,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
         matchPathname(sourceRequestPathname),
         options.configRedirects,
         preMiddlewareRequestContext,
-        basePathState,
+        currentBasePathState(),
         dispatchResponseStage ? undefined : markConditionalRedirectCacheability,
       )
     ) {
@@ -1838,11 +1840,12 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       const sourceUrl = new URL(userlandRequest.url);
       sourceUrl.search = new URL(resolvedUrl, url).search;
       // Source middleware must see the URL a direct request to the source
-      // carries: the raw, still-encoded context. Concatenate basePath rather
+      // carries: the raw, still-encoded context, under the basePath the
+      // target's rewrites resolved to. Concatenate basePath rather
       // than using `addBasePathToPathname`, which leaves a context that already
       // starts with basePath unprefixed, so middleware would miss that segment.
       const sourceUrlPathname =
-        hadBasePath && options.basePath
+        resolvedPathnameHasBasePath && options.basePath
           ? sourceRequestPathname === "/"
             ? options.basePath
             : options.basePath + sourceRequestPathname
@@ -1904,7 +1907,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
             // or status to the target's response, which belongs to another route.
             context: sourceMiddlewareContext,
             externalRewriteRequest: normalizedUserlandRequest,
-            hadBasePath,
+            hadBasePath: resolvedPathnameHasBasePath,
             isDataRequest: isMiddlewareDataRequest,
             request: sourceMiddlewareRequest,
             validateExternalRewriteRequest: () => validateClaimedOutsideBasePathRsc(true),
@@ -1984,8 +1987,10 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
         // Rewrites such as locale insertion are valid only when they resolve to
         // the exact source route and params selected for interception. A
         // different route, params, or query would authorize one identity and
-        // render another, so fail closed instead.
+        // render another, so fail closed instead. A destination outside the
+        // basePath resolves no route at all.
         if (
+          (options.basePath && sourceMiddlewareResult.rewriteHadBasePath === false) ||
           sourceMiddlewareResult.search !== sourceUrl.search ||
           !adoptRewrittenInterceptionSource(sourceMiddlewareResult.cleanPathname)
         ) {
@@ -2011,7 +2016,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
           matchPathname(sourceRulesPathname),
           [rewrite],
           sourceRewriteContext,
-          basePathState,
+          currentBasePathState(),
           matchPathname(sourceRulesPathname),
           dispatchResponseStage === undefined ? markConditionalRewriteCacheability : undefined,
         );
@@ -2411,8 +2416,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       cleanPathname = pathnameForResolvedUrl(resolvedUrl);
       cleanPathnameIsRequestPathname = false;
       invalidateInterceptionCacheProof();
-      filesystemRouteEligible = true;
       resolvedPathnameHasBasePath = !options.basePath || rewrite.basePath !== false;
+      filesystemRouteEligible = resolvedPathnameHasBasePath;
       const claimedRscCacheBustingRedirect = await validateClaimedOutsideBasePathRsc();
       if (claimedRscCacheBustingRedirect) return claimedRscCacheBustingRedirect;
       const rewrittenImageEndpointResponse = serveImageEndpointIfMatched();
@@ -2476,8 +2481,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       cleanPathname = pathnameForResolvedUrl(resolvedUrl);
       cleanPathnameIsRequestPathname = false;
       invalidateInterceptionCacheProof();
-      filesystemRouteEligible = true;
       resolvedPathnameHasBasePath = !options.basePath || rewrite.basePath !== false;
+      filesystemRouteEligible = resolvedPathnameHasBasePath;
       const claimedRscCacheBustingRedirect = await validateClaimedOutsideBasePathRsc();
       if (claimedRscCacheBustingRedirect) return claimedRscCacheBustingRedirect;
       const rewrittenImageEndpointResponse = serveImageEndpointIfMatched();

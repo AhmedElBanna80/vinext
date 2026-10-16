@@ -75,6 +75,7 @@ import {
   ASSET_PREFIX_URL_DIR,
   assetPrefixPathname,
   isAbsoluteAssetPrefix,
+  isAssetPrefixBuildAsset,
 } from "../utils/asset-prefix.js";
 import { computeClientRuntimeMetadata } from "../utils/client-runtime-metadata.js";
 import { setPagesClientAssets, type AssetCrossOrigin } from "./pages-client-assets.js";
@@ -707,12 +708,6 @@ function staticCacheLookupPath(pathname: string): string | null {
   // Block .vite/ access, also encoded (e.g. /%2Evite/manifest.json)
   if (lookupPath.startsWith("/.vite/") || lookupPath === "/.vite") return null;
   return lookupPath;
-}
-
-// Next.js serves public files under basePath, so a direct request outside it
-// never matches one; only a rewrite can bring it into the public filesystem.
-function isOutsideBasePathDirectLookup(phase: FilesystemRoutePhase, hasBasePath: boolean): boolean {
-  return phase === "direct" && !hasBasePath;
 }
 
 /** Pathnames the Pages Router serves from routes rather than the client directory. */
@@ -2732,8 +2727,12 @@ async function createPagesRouterRequestHandler(
               _request,
               candidateHasBasePath,
             ) => {
+              // Like Next.js, a file resolves only for a pathname under the
+              // basePath, whether the source's own or a rewrite destination.
+              // Its built-in rewrite still maps `${assetPrefix}/_next/*` into it.
               if (
-                isOutsideBasePathDirectLookup(phase, candidateHasBasePath) ||
+                (!candidateHasBasePath &&
+                  !isAssetPrefixBuildAsset(candidate, pagesAssetPathPrefix)) ||
                 isImageOptimizationPath(candidate) ||
                 isPagesFilesystemExcludedPath(candidate, phase)
               ) {
@@ -2923,8 +2922,12 @@ async function createPagesRouterRequestHandler(
             res.end(INVALID_IMAGE_SOURCE_MESSAGE);
             return true;
           }
+          // Like Next.js, a file resolves only for a pathname under the
+          // basePath, whether the request's own or a rewrite destination.
+          // Its built-in rewrite still maps `${assetPrefix}/_next/*` into it.
           if (
-            isOutsideBasePathDirectLookup(phase, resolvedPathnameHasBasePath) ||
+            (!resolvedPathnameHasBasePath &&
+              !isAssetPrefixBuildAsset(requestPathname, pagesAssetPathPrefix)) ||
             isPagesFilesystemExcludedPath(requestPathname, phase)
           ) {
             return false;
