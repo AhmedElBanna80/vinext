@@ -1620,7 +1620,9 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   const isProgressiveActionRequest =
     isPostRequest && !actionId && contentType.startsWith("multipart/form-data");
   let resolvedLateRewritesForAction = false;
-  if (!filesystemRouteEligible && (actionId || isProgressiveActionRequest)) {
+  // Progressive actions (no action id) wait for the final route, so they take
+  // the normal late-rewrite loops below, where Pages routes can claim them.
+  if (!filesystemRouteEligible && actionId) {
     let actionMatch: ReturnType<typeof options.matchRoute> = null;
     for (const rewrite of options.configRewrites.afterFiles) {
       const rewritten = await applyRewrite(
@@ -1742,23 +1744,26 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     return composeResponseStageResponse(metadataRouteResponse);
   }
 
-  const publicFileResponse = filesystemRouteEligible
-    ? resolvePublicFileRoute({
-        // A direct request pathname is already normalized; a rewrite
-        // destination is still URL-encoded.
-        cleanPathname: cleanPathnameIsRequestPathname
-          ? cleanPathname
-          : normalizePathnameForRouteMatch(cleanPathname),
-        middlewareContext,
-        pathname,
-        publicFiles: options.publicFiles,
-        request,
-      })
-    : null;
-  if (publicFileResponse) {
-    options.clearRequestContext();
+  // Late rewrites can also reach a public file, so the afterFiles and fallback
+  // loops repeat this check.
+  const servePublicFileIfMatched = (): Response | null => {
+    if (!filesystemRouteEligible) return null;
+    const publicFileResponse = resolvePublicFileRoute({
+      // A direct request pathname is already normalized; a rewrite
+      // destination is still URL-encoded.
+      cleanPathname: cleanPathnameIsRequestPathname
+        ? cleanPathname
+        : normalizePathnameForRouteMatch(cleanPathname),
+      middlewareContext,
+      pathname,
+      publicFiles: options.publicFiles,
+      request,
+    });
+    if (publicFileResponse) options.clearRequestContext();
     return publicFileResponse;
-  }
+  };
+  const publicFileResponse = servePublicFileIfMatched();
+  if (publicFileResponse) return publicFileResponse;
 
   stripRscCacheBustingSearchParam(url);
   resolvedUrl = serializeResolvedUrl(resolvedUrl, url);
@@ -1780,8 +1785,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   // The route is matched against the current cleanPathname here. Ordinary
   // requests may still be rewritten by the afterFiles / fallback loops below,
   // where the second `setRootParams` call replaces this value before rendering.
-  // Out-of-basePath Server Actions resolve those late rewrites above so this
-  // match already uses their claimed destination.
+  // Out-of-basePath Server Actions with an action id resolve those late
+  // rewrites above so this match already uses their claimed destination.
   // Interception-only RSC targets promote their source route at this same
   // boundary so Server Action rerenders receive the same route and params as
   // the subsequent page dispatch. Document requests remain direct-route-only.
@@ -2181,62 +2186,54 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     options.clearRequestContext();
     return notFoundResponse();
   }
-  let progressiveActionResult: Response | ProgressiveActionFormStateResult | null = null;
-  if (
-    filesystemRouteEligible &&
-    isPostRequest &&
-    contentType.startsWith("multipart/form-data") &&
-    !actionId &&
-    // Next.js only handles Server Actions while rendering App pages. Route
-    // Handlers receive multipart POSTs untouched, without the action origin
-    // check or body size limit. Only a static match is final here: afterFiles
-    // rewrites can still move a dynamic one to an App page.
-    !(
-      renderedPreActionMatch &&
-      preActionMatch &&
-      !preActionMatch.route.isDynamic &&
-      isAppRouteHandlerRoute(renderedPreActionMatch.route)
-    )
-  ) {
-    if (options.handleProgressiveActionRequest) {
-      progressiveActionResult = await options.handleProgressiveActionRequest({
-        actionId,
-        cleanPathname,
-        contentType,
-        middlewareContext,
-        request,
-        routeMatch: renderedPreActionMatch,
-      });
-    } else if (preActionMatch?.route.__loadPage && !preActionMatch.route.__loadRouteHandler) {
-      return createMissingServerActionResponse(options, null);
+  // Next.js only handles Server Actions while rendering App pages. Route
+  // Handlers and Pages routes receive multipart POSTs untouched, without the
+  // action origin check or body size limit. A static or interception App match
+  // is final here; otherwise afterFiles and fallback rewrites or Pages routes
+  // may still claim the request, so the action waits for the final route.
+  let progressiveActionHandled = false;
+  let progressiveActionFormState: ProgressiveActionFormStateResult | null = null;
+  const handleProgressiveAction = async (
+    routeMatch: AppRscRouteMatch<TRoute> | null,
+    unrenderedRouteMatch: AppRscRouteMatch<TRoute> | null,
+  ): Promise<Response | ProgressiveActionFormStateResult | null> => {
+    if (!filesystemRouteEligible || !isProgressiveActionRequest) return null;
+    if (routeMatch && isAppRouteHandlerRoute(routeMatch.route)) return null;
+    if (!options.handleProgressiveActionRequest) {
+      return unrenderedRouteMatch?.route.__loadPage &&
+        !unrenderedRouteMatch.route.__loadRouteHandler
+        ? createMissingServerActionResponse(options, null)
+        : null;
     }
-  }
-  if (progressiveActionResult instanceof Response) return progressiveActionResult;
-  const progressiveActionFormState =
-    progressiveActionResult?.kind === "form-state" ? progressiveActionResult : null;
-  const isProgressiveActionRender = progressiveActionFormState !== null;
-  const formState = progressiveActionFormState?.formState ?? null;
-  const failedProgressiveActionResult =
-    progressiveActionFormState && "actionError" in progressiveActionFormState
-      ? progressiveActionFormState
-      : null;
-  const actionFailed = failedProgressiveActionResult !== null;
-  const actionError = failedProgressiveActionResult?.actionError;
-  const actionErrorDigest =
-    actionError && typeof actionError === "object" && "digest" in actionError
-      ? String(actionError.digest)
-      : null;
-  const actionHttpFallbackStatus = actionErrorDigest
-    ? (parseNextHttpErrorDigest(actionErrorDigest)?.status ?? null)
-    : null;
-  const normalizedProgressiveActionError =
-    actionHttpFallbackStatus === null || actionHttpFallbackStatus === 404
-      ? actionError
-      : { digest: "NEXT_NOT_FOUND" };
-  // Other errors answer a plain 500 before the render, so this is an action
-  // that failed to find another Server Action.
-  if (actionFailed && middlewareContext.status === null && actionHttpFallbackStatus === null) {
-    middlewareContext.status = 500;
+    const progressiveActionResult = await options.handleProgressiveActionRequest({
+      actionId,
+      cleanPathname,
+      contentType,
+      middlewareContext,
+      request,
+      routeMatch,
+    });
+    if (progressiveActionResult instanceof Response) return progressiveActionResult;
+    if (progressiveActionResult?.kind !== "form-state") return null;
+    // Other errors answer a plain 500 before the render, so this is an action
+    // that failed to find another Server Action.
+    if (
+      "actionError" in progressiveActionResult &&
+      middlewareContext.status === null &&
+      progressiveActionHttpFallbackStatus(progressiveActionResult.actionError) === null
+    ) {
+      middlewareContext.status = 500;
+    }
+    return progressiveActionResult;
+  };
+  if (preActionMatch && (isInterceptionMatch || !preActionMatch.route.isDynamic)) {
+    progressiveActionHandled = true;
+    const progressiveActionResult = await handleProgressiveAction(
+      renderedPreActionMatch,
+      preActionMatch,
+    );
+    if (progressiveActionResult instanceof Response) return progressiveActionResult;
+    progressiveActionFormState = progressiveActionResult;
   }
 
   let sourceConfigHeaders: Headers | null = null;
@@ -2473,6 +2470,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       if (rewrittenMetadataResponse) {
         return composeResponseStageResponse(rewrittenMetadataResponse);
       }
+      const rewrittenPublicFileResponse = servePublicFileIfMatched();
+      if (rewrittenPublicFileResponse) return rewrittenPublicFileResponse;
       match = matchCleanPathname();
       const rewrittenStaticPagesResponse = await renderPagesForMatchKind("static");
       if (rewrittenStaticPagesResponse) {
@@ -2536,6 +2535,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       if (rewrittenMetadataResponse) {
         return composeResponseStageResponse(rewrittenMetadataResponse);
       }
+      const rewrittenPublicFileResponse = servePublicFileIfMatched();
+      if (rewrittenPublicFileResponse) return rewrittenPublicFileResponse;
       match = matchCleanPathname();
       const rewrittenStaticPagesResponse = await renderPagesForMatchKind("static");
       if (rewrittenStaticPagesResponse) {
@@ -2624,6 +2625,19 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       return new Response("{}", { status: 200, headers });
     }
     return buildNextDataNotFoundResponse();
+  }
+
+  if (isProgressiveActionRequest && !progressiveActionHandled) {
+    const finalRouteMatch = renderedRouteMatch(match);
+    // The action renders the final route, so it sees that route's root params.
+    setRootParams(
+      finalRouteMatch
+        ? pickRootParams(finalRouteMatch.params, finalRouteMatch.route.rootParamNames)
+        : null,
+    );
+    const progressiveActionResult = await handleProgressiveAction(finalRouteMatch, match);
+    if (progressiveActionResult instanceof Response) return progressiveActionResult;
+    progressiveActionFormState = progressiveActionResult;
   }
 
   if (!match) {
@@ -2840,6 +2854,17 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     });
   }
 
+  const failedProgressiveActionResult =
+    progressiveActionFormState && "actionError" in progressiveActionFormState
+      ? progressiveActionFormState
+      : null;
+  const actionHttpFallbackStatus = failedProgressiveActionResult
+    ? progressiveActionHttpFallbackStatus(failedProgressiveActionResult.actionError)
+    : null;
+  const normalizedProgressiveActionError =
+    actionHttpFallbackStatus === null || actionHttpFallbackStatus === 404
+      ? failedProgressiveActionResult?.actionError
+      : { digest: "NEXT_NOT_FOUND" };
   const renderedPageResponse = matchedResponseStage
     ? await matchedResponseStage(responseStageRequest(), {
         kind: "app-page",
@@ -2873,14 +2898,14 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
         clientReuseManifest,
         cleanPathname,
         displayPathname: canonicalPathname,
-        formState,
+        formState: progressiveActionFormState?.formState ?? null,
         actionError: normalizedProgressiveActionError,
-        actionFailed,
+        actionFailed: failedProgressiveActionResult !== null,
         handlerStart,
         interceptionContext: interceptionSourceContext,
         interceptionId: interceptionIdHeader,
         interceptionPathname: cleanPathnameIsRequestPathname ? requestCleanPathname : cleanPathname,
-        isProgressiveActionRender,
+        isProgressiveActionRender: progressiveActionFormState !== null,
         isRscRequest,
         middlewareContext,
         mountedSlotsHeader,
@@ -2919,10 +2944,18 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   // Set-Cookie headers and revalidation marker, mirroring Next.js'
   // res.setHeader('set-cookie', ...) flush in action-handler.ts / app-render.tsx.
   // Issue: https://github.com/cloudflare/vinext/issues/1483
-  if (isProgressiveActionRender) {
+  if (progressiveActionFormState) {
     return applyProgressiveActionSideEffects(pageResponse, progressiveActionFormState);
   }
   return pageResponse;
+}
+
+function progressiveActionHttpFallbackStatus(actionError: unknown): number | null {
+  const actionErrorDigest =
+    actionError && typeof actionError === "object" && "digest" in actionError
+      ? String(actionError.digest)
+      : null;
+  return actionErrorDigest ? (parseNextHttpErrorDigest(actionErrorDigest)?.status ?? null) : null;
 }
 
 /**
