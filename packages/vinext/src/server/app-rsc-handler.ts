@@ -92,6 +92,7 @@ import {
   markAppRscResponseConfigHeadersApplied,
 } from "./app-rsc-response-finalizer.js";
 import { normalizeRscRequest } from "./app-rsc-request-normalization.js";
+import { isAppRouteHandlerRoute } from "./app-rsc-route-matching.js";
 import { buildNextDataNotFoundResponse, normalizePagesDataRequest } from "./pages-data-route.js";
 import { normalizeDefaultLocalePathname } from "./pages-i18n.js";
 import {
@@ -2184,7 +2185,17 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     filesystemRouteEligible &&
     isPostRequest &&
     contentType.startsWith("multipart/form-data") &&
-    !actionId
+    !actionId &&
+    // Next.js only handles Server Actions while rendering App pages. Route
+    // Handlers receive multipart POSTs untouched, without the action origin
+    // check or body size limit. Only a static match is final here: afterFiles
+    // rewrites can still move a dynamic one to an App page.
+    !(
+      renderedPreActionMatch &&
+      preActionMatch &&
+      !preActionMatch.route.isDynamic &&
+      isAppRouteHandlerRoute(renderedPreActionMatch.route)
+    )
   ) {
     if (options.handleProgressiveActionRequest) {
       progressiveActionResult = await options.handleProgressiveActionRequest({

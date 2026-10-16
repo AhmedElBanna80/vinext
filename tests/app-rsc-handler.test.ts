@@ -10,6 +10,7 @@ import {
 } from "../packages/vinext/src/server/app-rsc-cache-busting.js";
 import { createAppRscHandler } from "../packages/vinext/src/server/app-rsc-combined-handler.js";
 import { createTrackedAppRouteRequest } from "../packages/vinext/src/server/app-route-handler-runtime.js";
+import { readActionFormDataWithLimit } from "../packages/vinext/src/server/app-server-action-execution.js";
 import { getRequestContext } from "../packages/vinext/src/shims/unified-request-context.js";
 import {
   APP_WORKER_RESPONSE_STAGE_PROTOCOL_VERSION,
@@ -7120,6 +7121,134 @@ describe("createAppRscHandler", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("location")).toBeNull();
     expect(await response.text()).toBe("icon bytes");
+  });
+
+  describe.each([true, false])("multipart Route Handlers (isDev=%s)", (isDev) => {
+    it.each(["text", "file"] as const)(
+      "receives a complete %s payload larger than the Server Actions body limit",
+      async (kind) => {
+        const maxActionBodySize = 1024 * 1024;
+        const payload = "x".repeat(maxActionBodySize + 1);
+        const formData = new FormData();
+        if (kind === "text") {
+          formData.set("message", payload);
+        } else {
+          formData.set("image", new Blob([payload], { type: "image/bmp" }), "image.bmp");
+        }
+        const request = new Request("https://example.test/docs/upload", {
+          method: "POST",
+          body: formData,
+        });
+        expect(request.headers.has("content-length")).toBe(false);
+
+        const route = createPageRoute({
+          __loadPage: undefined,
+          __loadRouteHandler() {},
+          page: null,
+          pattern: "/upload",
+          routeHandler: { GET: () => new Response("route") },
+          routeSegments: ["upload"],
+        });
+        const handleProgressiveActionRequest = vi.fn<
+          NonNullable<HandlerOptions["handleProgressiveActionRequest"]>
+        >(async ({ request }) => {
+          try {
+            await readActionFormDataWithLimit(request.clone(), maxActionBodySize);
+            return null;
+          } catch (error) {
+            if (!(error instanceof Error) || error.message !== "Request body too large") {
+              throw error;
+            }
+            return new Response("Payload Too Large", { status: 413 });
+          }
+        });
+        const dispatchMatchedRouteHandler = vi.fn<DispatchMatchedRouteHandler>(
+          async ({ request }) => {
+            expect(request.bodyUsed).toBe(false);
+            const body = await request.formData();
+            if (kind === "text") {
+              expect(body.get("message")).toBe(payload);
+            } else {
+              const image = body.get("image");
+              expect(image).toBeInstanceOf(File);
+              if (!(image instanceof File)) throw new Error("Expected uploaded file");
+              expect(image.name).toBe("image.bmp");
+              expect(image.type).toBe("image/bmp");
+              expect(image.size).toBe(payload.length);
+              expect(await image.text()).toBe(payload);
+            }
+            return new Response("uploaded", { status: 200 });
+          },
+        );
+        const handler = createHandler({
+          configHeaders: [],
+          isDev,
+          handleProgressiveActionRequest,
+          dispatchMatchedRouteHandler,
+          matchRoute: (pathname) => (pathname === "/upload" ? { route, params: {} } : null),
+        });
+
+        const response = await handler(request, null);
+
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe("uploaded");
+        expect(dispatchMatchedRouteHandler).toHaveBeenCalledOnce();
+        expect(handleProgressiveActionRequest).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  it("runs progressive actions for a page that an afterFiles rewrite reaches from a dynamic route handler", async () => {
+    const dynamicRouteHandler = createPageRoute({
+      __loadPage: undefined,
+      __loadRouteHandler() {},
+      isDynamic: true,
+      page: null,
+      pattern: "/api/:slug",
+      routeHandler: { GET: () => new Response("route") },
+      routeSegments: ["api", "[slug]"],
+    });
+    const aboutPage = createPageRoute();
+    const emptyParams: Record<string, string | string[]> = {};
+    const handleProgressiveActionRequest = vi.fn<
+      NonNullable<HandlerOptions["handleProgressiveActionRequest"]>
+    >(async () => null);
+    const dispatchMatchedRouteHandler = vi.fn<DispatchMatchedRouteHandler>(
+      async () => new Response("route", { status: 200 }),
+    );
+    const dispatchMatchedPage = vi.fn(
+      async ({ route }: { route: TestRoute }) =>
+        new Response(`page:${route.pattern}`, { status: 200 }),
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        afterFiles: [{ source: "/api/legacy-form", destination: "/about" }],
+        beforeFiles: [],
+        fallback: [],
+      },
+      dispatchMatchedPage,
+      dispatchMatchedRouteHandler,
+      handleProgressiveActionRequest,
+      matchRoute: (pathname) => {
+        if (pathname === "/about") return { params: emptyParams, route: aboutPage };
+        if (pathname.startsWith("/api/")) {
+          return { params: { slug: pathname.slice("/api/".length) }, route: dynamicRouteHandler };
+        }
+        return null;
+      },
+    });
+    const body = new FormData();
+    body.set("message", "hello");
+
+    const response = await handler(
+      new Request("https://example.test/docs/api/legacy-form", { method: "POST", body }),
+      null,
+    );
+
+    expect(await response.text()).toBe("page:/about");
+    expect(handleProgressiveActionRequest).toHaveBeenCalledOnce();
+    expect(dispatchMatchedRouteHandler).not.toHaveBeenCalled();
   });
 
   it("marks progressive action page renders even when decoded form state is null", async () => {
