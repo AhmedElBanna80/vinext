@@ -34,7 +34,11 @@ import { cloneRequestWithUrl, normalizeTrailingSlash } from "./request-pipeline.
 import { applyConfigHeadersToHeaderRecord } from "./config-headers.js";
 import type { HeaderRecord } from "./request-pipeline.js";
 import { finalizeMissingStaticAssetResponse, mergeHeaders } from "./worker-utils.js";
-import { assetPrefixPathname, isNextStaticPath } from "../utils/asset-prefix.js";
+import {
+  assetPrefixPathname,
+  isAssetPrefixBuildAsset,
+  isNextStaticPath,
+} from "../utils/asset-prefix.js";
 import {
   detectPathnameLocale,
   normalizeDefaultLocalePathname,
@@ -114,7 +118,7 @@ export async function fetchWorkerFilesystemRoute(
   publicFiles: ReadonlySet<string>,
   basePath = "",
   assetPathPrefix = "",
-  hadBasePath = true,
+  pathnameHasBasePath = true,
 ): Promise<Response | false> {
   const isRetrievalMethod = request.method === "GET" || request.method === "HEAD";
   const assetUrl = new URL(request.url);
@@ -128,9 +132,13 @@ export async function fetchWorkerFilesystemRoute(
   } catch {
     return false;
   }
-  // Next.js serves public files under basePath, so a direct request outside it
-  // never matches one; only a rewrite can bring it into the public filesystem.
-  const isPublicFile = (phase !== "direct" || hadBasePath) && publicFiles.has(publicFileKey);
+  // Like Next.js, a file resolves only for a pathname under the basePath,
+  // whether the request's own or a rewrite destination. Its built-in rewrite
+  // still maps `${assetPrefix}/_next/*` into the basePath.
+  if (!pathnameHasBasePath && !isAssetPrefixBuildAsset(decodedAssetUrl.pathname, assetPathPrefix)) {
+    return false;
+  }
+  const isPublicFile = pathnameHasBasePath && publicFiles.has(publicFileKey);
   // Public files precede API routes in the filesystem order, so a file such as
   // public/api/schema.json is served rather than handed to API routing.
   if (!isPublicFile && (requestPathname === "/api" || requestPathname.startsWith("/api/"))) {
@@ -759,15 +767,22 @@ export async function runPagesRequest(
 
   const isMissingBuildAsset = () =>
     isNextStaticPath(resolvedPathname, "", assetPrefixPathname(deps.assetPrefix ?? ""));
-  const isOutsideBasePathUnclaimed = () => basePath && !hadBasePath && !configRewriteFired;
+  // Like Next.js, only a pathname under the basePath resolves to a file, API
+  // route, or page. A rewrite's destination decides this, not the request.
+  const isOutsideBasePathUnclaimed = () => basePath && !resolvedPathnameHasBasePath;
+  // Like Next.js, keep the routing response headers (config headers and
+  // middleware next() headers) on the outside-basePath 404.
   const outOfBasePathNotFound = (): PagesPipelineResult => ({
     type: "response",
     response: isMissingBuildAsset()
       ? notFoundStaticAssetResponse(headersFromRecord(middlewareHeaders))
-      : new Response("This page could not be found", {
-          status: 404,
-          headers: { "Content-Type": "text/html; charset=utf-8" },
-        }),
+      : mergeHeaders(
+          new Response("This page could not be found", {
+            status: 404,
+            headers: { "Content-Type": "text/html; charset=utf-8" },
+          }),
+          middlewareHeaders,
+        ),
   });
 
   const handleResolvedApiRoute = async (): Promise<PagesPipelineResult | null> => {
@@ -785,7 +800,7 @@ export async function runPagesRequest(
       let apiRequest = request;
       // Prod re-adds basePath only when the original request carried it.
       // Dev reconstructs Vite's stripped basePath in api-handler.ts; the paths
-      // differ only for an out-of-basePath request config-rewritten into an API.
+      // differ only for an out-of-basePath request middleware-rewritten into an API.
       if (basePath && hadBasePath) {
         const apiRequestUrl = new URL(request.url);
         apiRequestUrl.pathname = addBasePathToPathname(apiRequestUrl.pathname, basePath);

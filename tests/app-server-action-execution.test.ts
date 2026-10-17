@@ -49,6 +49,7 @@ import {
 import { withEnvVar } from "./env-test-helpers.js";
 import {
   createRscOnErrorHandler as createRealRscOnErrorHandler,
+  PRODUCTION_SERVER_COMPONENTS_ERROR_MESSAGE,
   sanitizeErrorForClient,
 } from "../packages/vinext/src/server/app-rsc-errors.js";
 
@@ -1306,10 +1307,9 @@ describe("app server action execution helpers", () => {
     }
   });
 
-  // Route handlers (route.ts) accept raw multipart POSTs that legitimately
-  // decode to no action; those must still fall through to the route-handler
-  // dispatch rather than 404. The page-vs-route distinction comes from the
-  // caller (`hasPageRoute`).
+  // Multipart POSTs without a page match that decode to no action fall
+  // through to the caller's normal dispatch rather than 404. The page
+  // distinction comes from the caller (`hasPageRoute`).
   it("falls through for multipart posts that decode to no action on a non-page route", async () => {
     const response = await handleProgressiveServerActionRequest(
       createOptions({
@@ -1478,7 +1478,7 @@ describe("app server action execution helpers", () => {
       expect(response?.status).toBe(500);
       const { digest, reason } = (await rejection) as { digest: unknown; reason: unknown };
       expect(reason).toBeInstanceOf(Error);
-      expect((reason as Error).message).toContain("omitted in production builds");
+      expect((reason as Error).message).toBe(PRODUCTION_SERVER_COMPONENTS_ERROR_MESSAGE);
       expect(digest).toEqual(expect.any(String));
       expect(digest).toBe((reason as { digest?: unknown }).digest);
       expect(reportRequestError).toHaveBeenCalledTimes(1);
@@ -3758,6 +3758,63 @@ describe("server reference module loading", () => {
     );
 
     expect(observed).toBe("no-request");
+  });
+
+  // The imports are memoized for the isolate, and workerd drops a canceled
+  // request's pending I/O, so the caller stays alive until they settle.
+  it.each([
+    ["decodes a progressive action", "progressive"],
+    ["loads a fetch action", "fetch"],
+  ] as const)("keeps the request that %s alive until its references load", async (_name, kind) => {
+    let entered: () => void = () => {};
+    const loading = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release: () => void = () => {};
+    const loaded = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const load = async () => {
+      entered();
+      await loaded;
+    };
+    const waitUntil = vi.fn();
+    const formData = new FormData();
+    formData.set("$ACTION_ID_test", "");
+    const request = kind === "progressive" ? createMultipartRequest() : createFetchActionRequest();
+
+    const handled = runWithRequestContext(
+      createRequestContext({
+        executionContext: { waitUntil },
+        headersContext: headersContextFromRequest(request),
+      }),
+      () =>
+        kind === "progressive"
+          ? handleProgressiveServerActionRequest(
+              createOptions({
+                request,
+                async decodeAction() {
+                  await load();
+                  return async () => {};
+                },
+                readFormDataWithLimit: () => Promise.resolve(formData),
+              }),
+            )
+          : handleServerActionRscRequest(
+              createRscOptions({
+                request,
+                async loadServerAction() {
+                  await load();
+                  return async () => "ok";
+                },
+              }),
+            ),
+    );
+
+    await loading;
+    expect(waitUntil).toHaveBeenCalledOnce();
+    release();
+    await handled;
   });
 
   it("decodes progressive action references outside the caller's request", async () => {

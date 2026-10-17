@@ -1121,6 +1121,31 @@ describe("App Router integration", () => {
     expect(deleteCookie).toContain("Expires=");
   });
 
+  // Next.js writes middleware response headers before the handler runs and
+  // appends the handler's Set-Cookie afterwards, so the browser keeps the
+  // handler's cookie when middleware refreshes the same one.
+  it.each([
+    { method: "POST", status: 200, session: /^session=; / },
+    { method: "PUT", status: 200, session: /^session=rotated; / },
+    { method: "DELETE", status: 307, session: /^session=; / },
+  ])(
+    "orders a route handler's $method cookie after middleware's refresh of it",
+    async ({ method, status, session }) => {
+      const res = await fetch(`${baseUrl}/api/session-refresh`, {
+        method,
+        headers: { cookie: "session=old" },
+        redirect: "manual",
+      });
+      expect(res.status).toBe(status);
+      const sessionCookies = res.headers
+        .getSetCookie()
+        .filter((cookie: string) => cookie.startsWith("session="));
+      expect(sessionCookies).toHaveLength(2);
+      expect(sessionCookies[0]).toMatch(/^session=old; .*Max-Age=600/);
+      expect(sessionCookies[1]).toMatch(session);
+    },
+  );
+
   it("renders custom not-found.tsx for unmatched routes", async () => {
     const res = await fetch(`${baseUrl}/does-not-exist`);
     expect(res.status).toBe(404);
@@ -2017,6 +2042,30 @@ describe("App Router integration", () => {
     expect(unknown.status).toBe(404);
   });
 
+  // https://github.com/cloudflare/vinext/issues/3919
+  it("completes a dynamic = 'error' page whose server component imports CSS", async () => {
+    // The RSC plugin wraps a CSS-importing page so its props, searchParams
+    // included, go through React's dev-only debug serialization. The headers
+    // arrive either way; only the body hung, so time the body alone.
+    const readBody = (res: Response) =>
+      Promise.race([
+        res.text(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("response body did not finish")), 15_000),
+        ),
+      ]);
+    const pathname = "/nextjs-compat/dynamic-error-css-module";
+    const res = await fetch(`${baseUrl}${pathname}`);
+    expect(res.status).toBe(200);
+    const html = await readBody(res);
+    expect(html).toContain('data-testid="dynamic-error-css-module"');
+    expect(html).toContain("</html>");
+
+    const rsc = await fetch(`${baseUrl}${pathname}.rsc`, { headers: { RSC: "1" } });
+    expect(rsc.status).toBe(200);
+    expect(await readBody(rsc)).toContain('"data-testid":"dynamic-error-css-module"');
+  });
+
   it("applies dynamic = 'error' as only-cache fetch policy", async () => {
     const res = await fetch(`${baseUrl}/layout-segment-config/dynamic-error-fetch`);
     expect(res.status).toBe(500);
@@ -2364,6 +2413,60 @@ describe("App Router integration", () => {
     expect(res.status).toBe(404);
     expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
     expect(await res.text()).toBe("Server action not found.");
+  });
+
+  // Next.js only runs Server Action handling for App pages, so a Route
+  // Handler receives multipart POSTs without the action body limit (#3886).
+  it("delivers multipart POSTs larger than the Server Action body limit to a route handler", async () => {
+    const name = "x".repeat(1024 * 1024 + 1);
+    const textBody = new FormData();
+    textBody.append("name", name);
+    const textRes = await fetch(`${baseUrl}/api/methods`, {
+      method: "POST",
+      headers: { Origin: baseUrl, Host: new URL(baseUrl).host },
+      body: textBody,
+    });
+    expect(textRes.status).toBe(202);
+    expect(await textRes.json()).toEqual({ message: "ok", name, email: null });
+
+    // The handler ignores `image`; this case guards the body limit only.
+    const fileBody = new FormData();
+    fileBody.append("name", "upload");
+    fileBody.append("image", new Blob([name], { type: "image/bmp" }), "image.bmp");
+    const fileRes = await fetch(`${baseUrl}/api/methods`, {
+      method: "POST",
+      headers: { Origin: baseUrl, Host: new URL(baseUrl).host },
+      body: fileBody,
+    });
+    expect(fileRes.status).toBe(202);
+    expect(await fileRes.json()).toEqual({ message: "ok", name: "upload", email: null });
+  });
+
+  it("delivers multipart POSTs with Server Action fields to a route handler", async () => {
+    const body = new FormData();
+    body.append("$ACTION_ID_deadbeef", "");
+    body.append("name", "not-an-action");
+    const res = await fetch(`${baseUrl}/api/methods`, {
+      method: "POST",
+      headers: { Origin: baseUrl, Host: new URL(baseUrl).host },
+      body,
+    });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ message: "ok", name: "not-an-action", email: null });
+  });
+
+  it("does not apply the Server Action origin check to multipart route handler POSTs", async () => {
+    const body = new FormData();
+    body.append("name", "cross-origin");
+    const res = await fetch(`${baseUrl}/api/methods`, {
+      method: "POST",
+      // The dev origin guard admits any *.localhost origin; the Server Action
+      // check would reject it as cross-origin.
+      headers: { Origin: "http://other.localhost", Host: new URL(baseUrl).host },
+      body,
+    });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ message: "ok", name: "cross-origin", email: null });
   });
 
   it("returns action-not-found before reading cyclic multipart payloads for stale ids", async () => {

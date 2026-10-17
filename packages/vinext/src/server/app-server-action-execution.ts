@@ -17,6 +17,7 @@ import {
 } from "vinext/shims/fetch-cache";
 import type { ReactFormState } from "react-dom/client";
 import { runOutsideRequestScopes } from "vinext/shims/internal/als-registry";
+import { getRequestExecutionContext } from "vinext/shims/request-context";
 import { createRootParamsUsageController, runWithRootParamsUsage } from "vinext/shims/root-params";
 import { isExternalUrl } from "../utils/external-url.js";
 import { splitPathSegments } from "../routing/utils.js";
@@ -67,6 +68,7 @@ import {
 } from "./server-action-not-found.js";
 import { internalServerErrorResponse, payloadTooLargeResponse } from "./http-error-responses.js";
 import { hasDigest } from "./app-rsc-errors.js";
+import { shareIsolatePromise } from "./isolate-shared-promise.js";
 import { createStaticGenerationHeadersContext } from "./app-static-generation.js";
 import { markAppRscResponseConfigHeadersApplied } from "./app-rsc-response-finalizer.js";
 import type { AppRenderErrorContextOverrides } from "./app-rsc-error-handler.js";
@@ -237,9 +239,19 @@ type DecodeServerActionReplyOptions<TTemporaryReferences> = {
  *
  * The result is awaited inside the callback because `decodeReply()` returns a
  * lazy thenable that only resolves (and imports) its references once awaited.
+ *
+ * The imports are shared with every later request that names the same modules,
+ * and the server-reference loader cannot see this request's execution context
+ * once it has been left, so the request is kept alive here until they settle.
+ * From here a request that starts a load cannot be told apart from one that
+ * joins it, so each keeps its own decode alive; it awaits that decode anyway.
  */
 function loadOutsideRequestScopes<T>(load: () => T | PromiseLike<T>): Promise<T> {
-  return runOutsideRequestScopes(async () => await load());
+  const ctx = getRequestExecutionContext();
+  return shareIsolatePromise(
+    runOutsideRequestScopes(async () => await load()),
+    ctx,
+  );
 }
 
 export type HandleProgressiveServerActionRequestOptions = {
@@ -261,8 +273,8 @@ export type HandleProgressiveServerActionRequestOptions = {
    * a route handler or no match). Multipart form POSTs to a page are always
    * server-action attempts in Next.js, so a body that decodes to no action must
    * surface as 404 action-not-found rather than rendering the page. Route
-   * handlers (which run *after* this dispatch in vinext) legitimately receive
-   * raw multipart POSTs, so they must still fall through. See issue #1340.
+   * handlers and Pages routes never reach this dispatch (#3886); unmatched
+   * routes fall through. See issue #1340.
    */
   hasPageRoute: boolean;
   maxActionBodySize: number;
@@ -1307,9 +1319,8 @@ export async function handleProgressiveServerActionRequest(
       // A multipart POST to a *page* is always a server-action attempt; a body
       // that decodes to no action means the referenced action doesn't exist
       // (e.g. the build has no server actions). Mirror Next.js' 404 +
-      // action-not-found rather than rendering the page. Route handlers run
-      // after this dispatch and legitimately receive raw multipart POSTs, so
-      // fall through for them (and for unmatched routes). See issue #1340.
+      // action-not-found rather than rendering the page. Unmatched routes
+      // fall through. See issue #1340.
       if (options.hasPageRoute) {
         return createActionNotFoundResponse(null, {
           clearRequestContext: options.clearRequestContext,

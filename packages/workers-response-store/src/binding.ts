@@ -740,10 +740,19 @@ export class ResponseStoreBinding extends WorkerEntrypoint<
       () => true,
     );
     pendingR2Reads.set(readKey, pending);
+    // Later reads of this key await the pending read. workerd drops a canceled
+    // call's I/O, so keep this call alive until the read is cleared from the map.
+    let cleared!: () => void;
+    this.ctx.waitUntil(
+      new Promise<void>((resolve) => {
+        cleared = resolve;
+      }),
+    );
     try {
       return await read;
     } finally {
       if (pendingR2Reads.get(readKey) === pending) pendingR2Reads.delete(readKey);
+      cleared();
     }
   }
 
@@ -1370,7 +1379,18 @@ export class ResponseStoreBinding extends WorkerEntrypoint<
         cacheTags,
       );
     })();
-    if (options.coalesce) pendingPuts.set(pendingPutKey, write);
+    let cleared = () => {};
+    if (options.coalesce) {
+      pendingPuts.set(pendingPutKey, write);
+      // Later coalesced puts of this key await the write, and treat a published
+      // one as their own. workerd drops a canceled call's I/O, so keep this call
+      // alive until the write is cleared from the map.
+      this.ctx.waitUntil(
+        new Promise<void>((resolve) => {
+          cleared = resolve;
+        }),
+      );
+    }
     try {
       const result = await write;
       if (!result.published || !result.entry) {
@@ -1387,6 +1407,7 @@ export class ResponseStoreBinding extends WorkerEntrypoint<
       if (options.coalesce && pendingPuts.get(pendingPutKey) === write) {
         pendingPuts.delete(pendingPutKey);
       }
+      cleared();
     }
   }
 

@@ -180,7 +180,10 @@ import {
   VINEXT_DEV_RESTART_CONFIG,
 } from "./cli-dev-config.js";
 import { ensureAssetsIgnore } from "./build/assets-ignore.js";
-import { emitNextClientRuntimeManifests } from "./build/next-client-runtime-manifests.js";
+import {
+  emitNextClientRuntimeManifests,
+  getPagesManifestPage,
+} from "./build/next-client-runtime-manifests.js";
 import { collectInlineCssManifest, injectInlineCssManifestGlobal } from "./build/inline-css.js";
 import { validateDevRequest } from "./server/dev-origin-check.js";
 import { readTrustedRevalidationHostname } from "./server/revalidation-host.js";
@@ -380,6 +383,7 @@ import {
   getViteCliInvocation,
   isViteCliConfigFile,
 } from "./utils/vite-cli-invocation.js";
+import { resolvePluginReactPath } from "./utils/plugin-react-version.js";
 import { assertPluginRscVersion, needsAppReactServerDom } from "./utils/plugin-rsc-version.js";
 import { getReactUpgradeDeps, reactUpgradeRequiredMessage } from "./utils/react-version.js";
 import {
@@ -2004,13 +2008,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   //
   // Pre-resolve the plugins eagerly so all import() calls in this module use
   // consistent resolution.
-  let resolvedReactPath: string | null = null;
   let resolvedRscPath: string | null = null;
   let rscPluginModulePromise: Promise<typeof import("@vitejs/plugin-rsc")> | null = null;
   // Prefer the user's project graph so vinext shares the app's Vite/plugin
   // instances. In source/workspace development, test fixtures may not declare
   // peer deps explicitly, so fall back to vinext's own install location.
-  resolvedReactPath = resolveOptionalDependency(earlyBaseDir, "@vitejs/plugin-react");
   resolvedRscPath = resolveOptionalDependency(earlyBaseDir, "@vitejs/plugin-rsc");
   const rscVersion =
     earlyAppDirExists && resolvedRscPath ? assertPluginRscVersion(resolvedRscPath) : null;
@@ -2085,6 +2087,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let reactPluginPromise: Promise<PluginOption[]> | null = null;
   let reactCompilerPluginPromise: Promise<PluginOption[]> | null = null;
   if (options.react !== false) {
+    const resolvedReactPath = resolvePluginReactPath(earlyBaseDir);
     if (!resolvedReactPath) {
       throw new Error(
         "vinext: @vitejs/plugin-react is not installed.\n" +
@@ -7085,7 +7088,10 @@ export const loadServerActionClient = ${
                       : new Response("Invalid image optimization parameters", { status: 400 });
                   }
                   const isRetrievalMethod = req.method === "GET" || req.method === "HEAD";
+                  // Like Next.js, nothing in the filesystem resolves for a
+                  // rewrite destination outside the basePath.
                   if (
+                    !resolvedPathnameHasBasePath ||
                     (phase === "direct" && isRetrievalMethod) ||
                     requestPathname === "/" ||
                     requestPathname === "/api" ||
@@ -8282,18 +8288,30 @@ export const loadServerActionClient = ${
       writeBundle: {
         sequential: true,
         order: "post",
-        handler(outputOptions: { dir?: string }) {
+        async handler(outputOptions: { dir?: string }) {
           const clientDir = outputOptions.dir;
           if (!clientDir) return;
 
           const isClientBuild = this.environment?.name === "client";
           if (!isClientBuild) return;
 
+          const pageRoutes = hasPagesDir
+            ? (
+                await Promise.all([
+                  pagesRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher),
+                  apiRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher),
+                ])
+              ).flat()
+            : [];
+
           emitNextClientRuntimeManifests({
             clientDir,
             assetsSubdir: resolveAssetsDir(nextConfig.assetPrefix),
             buildId: nextConfig.buildId,
             rewrites: nextConfig.rewrites,
+            pages: pageRoutes.map((route) =>
+              getPagesManifestPage(pagesDir, route.filePath, fileMatcher),
+            ),
           });
         },
       },

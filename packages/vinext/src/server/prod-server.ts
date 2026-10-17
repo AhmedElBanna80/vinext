@@ -75,6 +75,7 @@ import {
   ASSET_PREFIX_URL_DIR,
   assetPrefixPathname,
   isAbsoluteAssetPrefix,
+  isAssetPrefixBuildAsset,
 } from "../utils/asset-prefix.js";
 import { computeClientRuntimeMetadata } from "../utils/client-runtime-metadata.js";
 import { setPagesClientAssets, type AssetCrossOrigin } from "./pages-client-assets.js";
@@ -105,6 +106,7 @@ import {
   trustedHosts,
   resolveRequestProtocol,
   resolveRequestHost as resolveHost,
+  resolveTrustedForwardedHost,
 } from "./proxy-trust.js";
 import {
   negotiateEncoding,
@@ -1507,9 +1509,16 @@ type WorkerAppRouterEntry = {
   fetch(request: Request, env?: unknown, ctx?: ExecutionContextLike): Promise<Response> | Response;
 };
 
-function createNodeExecutionContext(trustedRevalidateOrigin?: string): ExecutionContextLike {
+function createNodeExecutionContext(
+  trustedRevalidateOrigin?: string,
+  {
+    middlewareOrigin,
+    requestSignal,
+  }: { middlewareOrigin?: string; requestSignal?: AbortSignal } = {},
+): ExecutionContextLike {
   return {
     hostRuntime: "node",
+    requestSignal,
     waitUntil(promise: Promise<unknown>) {
       // Node doesn't provide a Workers lifecycle, but we still attach a
       // rejection handler so background waitUntil work doesn't surface as an
@@ -1518,6 +1527,7 @@ function createNodeExecutionContext(trustedRevalidateOrigin?: string): Execution
     },
     passThroughOnException() {},
     trustedRevalidateOrigin,
+    middlewareOrigin,
   };
 }
 
@@ -1547,9 +1557,37 @@ function resolveTrustedNodeRevalidateOrigin(
   configuredHost: string,
   configuredPort: number,
 ): string {
+  return `http://${resolveNodeServerHost(req, configuredHost, configuredPort)}`;
+}
+
+/**
+ * The origin middleware runs against. The Host header is client-controlled,
+ * so, like Next.js, which builds the middleware URL from its own hostname and
+ * port, it never counts as the server's origin. Otherwise a client could send
+ * the host of an external middleware rewrite target and turn that rewrite into
+ * an internal one, skipping middleware's checks for the target path. A trusted
+ * `X-Forwarded-Host` is operator-approved, so it keeps the request origin, and
+ * rewrites to that host stay internal.
+ */
+function resolveNodeMiddlewareOrigin(
+  req: IncomingMessage,
+  requestUrl: string,
+  configuredHost: string,
+  configuredPort: number,
+): string {
+  const url = new URL(requestUrl);
+  if (resolveTrustedForwardedHost(req) !== undefined) return url.origin;
+  return `${url.protocol}//${resolveNodeServerHost(req, configuredHost, configuredPort)}`;
+}
+
+/** The `host:port` this server is reachable at locally. */
+function resolveNodeServerHost(
+  req: IncomingMessage,
+  configuredHost: string,
+  configuredPort: number,
+): string {
   const port = req.socket.localPort ?? configuredPort;
-  const host = normalizeInternalFetchHost(configuredHost);
-  return `http://${host}:${port}`;
+  return `${normalizeInternalFetchHost(configuredHost)}:${port}`;
 }
 
 function normalizeInternalFetchHost(host: string): string {
@@ -1952,7 +1990,9 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
     if (sourcePathname !== null) {
       const sourceResponse = await rscHandler(
         new Request(sourceUrl, { signal: request.signal }),
-        createNodeExecutionContext(resolveTrustedNodeRevalidateOrigin(req, host, port)),
+        createNodeExecutionContext(resolveTrustedNodeRevalidateOrigin(req, host, port), {
+          middlewareOrigin: resolveNodeMiddlewareOrigin(req, request.url, host, port),
+        }),
       );
       const sourceSignal = isImageSourceBodyStatus(sourceResponse.status)
         ? readStaticFileSignal(sourceResponse)
@@ -2082,15 +2122,19 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
       // handler must receive the original URL so its request boundary decodes
       // each segment exactly once. Passing `pathname` here would make encoded
       // percent signs eligible for a second decode inside normalizeRscRequest.
+      const signal = signalFromNodeResponse(res);
       const request = nodeToWebRequest(
         req,
         rawUrl,
         prerenderSecret,
         appRouterI18nConfig,
         appRouterAuthorizeOnDemandRevalidate,
-        signalFromNodeResponse(res),
+        signal,
       );
-      const ctx = createNodeExecutionContext(resolveTrustedNodeRevalidateOrigin(req, host, port));
+      const ctx = createNodeExecutionContext(resolveTrustedNodeRevalidateOrigin(req, host, port), {
+        middlewareOrigin: resolveNodeMiddlewareOrigin(req, request.url, host, port),
+        requestSignal: signal,
+      });
       const recorded: { marker?: PrerenderSpecialErrorMarker } = {};
       if (purpose === "prerender") {
         ctx.recordPrerenderSpecialError = (marker) => {
@@ -2633,6 +2677,13 @@ async function createPagesRouterRequestHandler(
         isDataReq && skipProxyUrlNormalize
           ? new Request(new URL(originalRenderUrl, webRequest.url), webRequest)
           : undefined;
+      const middlewareCtx = createNodeExecutionContext(undefined, {
+        middlewareOrigin: resolveNodeMiddlewareOrigin(req, webRequest.url, host, port),
+      });
+      const runNodeMiddleware: PagesPipelineDeps["runMiddleware"] =
+        typeof runMiddleware === "function"
+          ? (request, _ctx, opts) => runMiddleware(request, middlewareCtx, opts)
+          : null;
 
       // The public file the pipeline serves for an anonymous GET of an image
       // source, or null when middleware, a redirect, or a route answers it.
@@ -2663,14 +2714,25 @@ async function createPagesRouterRequestHandler(
             recordCacheability: false,
             rawSearch: sourceUrl.search,
             configMatchPathname: strippedSourcePathname,
-            runMiddleware:
-              typeof runMiddleware === "function"
-                ? wrapMiddlewareWithBasePath(runMiddleware, basePath, sourceHadBasePath)
-                : null,
+            runMiddleware: runNodeMiddleware
+              ? wrapMiddlewareWithBasePath(runNodeMiddleware, basePath, sourceHadBasePath)
+              : null,
             renderPage: null,
             handleApi: null,
-            serveFilesystemRoute: async (candidate, _stagedHeaders, phase) => {
+            serveFilesystemRoute: async (
+              candidate,
+              _stagedHeaders,
+              phase,
+              _resolvedUrl,
+              _request,
+              candidateHasBasePath,
+            ) => {
+              // Like Next.js, a file resolves only for a pathname under the
+              // basePath, whether the source's own or a rewrite destination.
+              // Its built-in rewrite still maps `${assetPrefix}/_next/*` into it.
               if (
+                (!candidateHasBasePath &&
+                  !isAssetPrefixBuildAsset(candidate, pagesAssetPathPrefix)) ||
                 isImageOptimizationPath(candidate) ||
                 isPagesFilesystemExcludedPath(candidate, phase)
               ) {
@@ -2707,7 +2769,7 @@ async function createPagesRouterRequestHandler(
         hasMiddleware,
         middlewareRequest,
         dataNotFoundResponse,
-        ctx: undefined, // Node has no ExecutionContext
+        ctx: undefined, // Node has no platform ExecutionContext; middleware gets middlewareCtx
         // Raw query from req.url so redirect Locations aren't re-encoded by URL parsing.
         rawSearch: rawQs,
         authorizeOnDemandRevalidate:
@@ -2720,10 +2782,9 @@ async function createPagesRouterRequestHandler(
         // Pass the original (pre-basePath-stripping) URL to middleware so that
         // request.nextUrl.basePath reflects whether the URL actually had the
         // basePath prefix (see wrapMiddlewareWithBasePath).
-        runMiddleware:
-          typeof runMiddleware === "function"
-            ? wrapMiddlewareWithBasePath(runMiddleware, basePath, hadBasePath)
-            : null,
+        runMiddleware: runNodeMiddleware
+          ? wrapMiddlewareWithBasePath(runNodeMiddleware, basePath, hadBasePath)
+          : null,
         renderPage:
           typeof renderPage === "function"
             ? (
@@ -2861,7 +2922,16 @@ async function createPagesRouterRequestHandler(
             res.end(INVALID_IMAGE_SOURCE_MESSAGE);
             return true;
           }
-          if (isPagesFilesystemExcludedPath(requestPathname, phase)) return false;
+          // Like Next.js, a file resolves only for a pathname under the
+          // basePath, whether the request's own or a rewrite destination.
+          // Its built-in rewrite still maps `${assetPrefix}/_next/*` into it.
+          if (
+            (!resolvedPathnameHasBasePath &&
+              !isAssetPrefixBuildAsset(requestPathname, pagesAssetPathPrefix)) ||
+            isPagesFilesystemExcludedPath(requestPathname, phase)
+          ) {
+            return false;
+          }
           return tryServeStatic(
             req,
             res,

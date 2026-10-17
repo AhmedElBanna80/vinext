@@ -7069,6 +7069,9 @@ describe('"use cache" runtime', () => {
         );
 
       await expect(request()).resolves.toEqual({ tags: ["fetch-tag-1"], value: 1 });
+      // The miss can keep its request alive for the shared RSC codec import
+      // when it is the isolate's first "use cache" call.
+      waitUntil.length = 0;
       vi.advanceTimersByTime(1_500);
       // The background regeneration's fetch tags stay out of the stale response.
       await expect(request()).resolves.toEqual({ tags: [], value: 1 });
@@ -12535,6 +12538,35 @@ describe("NextURL basePath and locale properties", () => {
     const url = new NextURL("http://localhost/FR/about", undefined, i18nConfig);
     expect(url.locale).toBe("fr");
     expect(url.pathname).toBe("/about");
+  });
+
+  it("detects the domain locale from the Host header before the URL hostname", async () => {
+    // Ported from Next.js: packages/next/src/shared/lib/get-hostname.ts
+    // On Node, middleware's URL carries the server's own origin, so it passes
+    // the host the client asked for.
+    const { NextRequest, NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const nextConfig = {
+      i18n: {
+        locales: ["en", "fr"],
+        defaultLocale: "en",
+        domains: [{ domain: "example.fr", defaultLocale: "fr", locales: ["fr"] }],
+      },
+    };
+    const url = new NextURL("http://localhost:3000/about", undefined, {
+      headers: { host: "example.fr:8080" },
+      nextConfig,
+    });
+    expect(url.domainLocale?.domain).toBe("example.fr");
+    expect(url.locale).toBe("fr");
+    url.href = "http://localhost:3000/about";
+    expect(url.clone().domainLocale?.domain).toBe("example.fr");
+
+    const request = new NextRequest("http://localhost:3000/about", {
+      nextConfig,
+      requestHost: "example.fr",
+    });
+    expect(request.nextUrl.defaultLocale).toBe("fr");
+    expect(request.nextUrl.href).toBe("http://localhost:3000/about");
   });
 
   it("locale setter updates the locale and affects href", async () => {
