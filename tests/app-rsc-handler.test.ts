@@ -9,6 +9,9 @@ import {
   VINEXT_RSC_VARY_HEADER,
 } from "../packages/vinext/src/server/app-rsc-cache-busting.js";
 import { createAppRscHandler } from "../packages/vinext/src/server/app-rsc-combined-handler.js";
+import { createTrackedAppRouteRequest } from "../packages/vinext/src/server/app-route-handler-runtime.js";
+import { readActionFormDataWithLimit } from "../packages/vinext/src/server/app-server-action-execution.js";
+import { getRequestContext } from "../packages/vinext/src/shims/unified-request-context.js";
 import {
   APP_WORKER_RESPONSE_STAGE_PROTOCOL_VERSION,
   type AppWorkerResponseStageProps,
@@ -34,6 +37,7 @@ import {
   VINEXT_SPECIAL_ERROR_STATUS_HEADER,
 } from "../packages/vinext/src/server/headers.js";
 import { applyAppMiddleware } from "../packages/vinext/src/server/app-middleware.js";
+import { sealForwardedMiddlewareContext } from "../packages/vinext/src/server/forwarded-middleware-context.js";
 import type { NextRequest } from "../packages/vinext/src/shims/server.js";
 import {
   handleMetadataRouteRequest,
@@ -54,6 +58,7 @@ import {
   headers as requestHeaders,
 } from "../packages/vinext/src/shims/headers.js";
 import { readStaticFileSignal } from "../packages/vinext/src/server/static-file-signal.js";
+import { publicFileRouteKey } from "../packages/vinext/src/utils/public-file-path.js";
 import {
   runWithExecutionContext,
   type ExecutionContextLike,
@@ -84,6 +89,7 @@ import { createWorkerCacheabilityAdmissionContext } from "../packages/vinext/src
 import { registerFrameworkTracingIntegration } from "../packages/vinext/src/server/tracer.js";
 import type { ResolvedFrameworkSpanDescriptor } from "../packages/vinext/src/server/framework-tracer.js";
 import { workUnitAsyncStorage } from "../packages/vinext/src/shims/internal/work-unit-async-storage.js";
+import { getServerActionNotFoundMessage } from "../packages/vinext/src/server/server-action-not-found.js";
 
 const capturedFindPageComponentsSpans: ResolvedFrameworkSpanDescriptor[] = [];
 let captureFindPageComponentsSpans = false;
@@ -157,6 +163,12 @@ function createPageRoute(overrides: Partial<TestRoute> = {}): TestRoute {
   };
 }
 
+const TEST_FORWARDED_MW_CTX_KEY = "test-forwarded-mw-ctx-key";
+
+function sealedForwardedContext(context: Record<string, unknown>): string {
+  return sealForwardedMiddlewareContext(TEST_FORWARDED_MW_CTX_KEY, JSON.stringify(context));
+}
+
 function createHandler(overrides: Partial<TestHandlerOptions> = {}) {
   const route = createPageRoute();
 
@@ -180,6 +192,8 @@ function createHandler(overrides: Partial<TestHandlerOptions> = {}) {
     },
     createPprFallbackShells: overrides.createPprFallbackShells,
     draftModeSecret: overrides.draftModeSecret ?? "test-draft-secret",
+    devForwardedMiddlewareContextKey:
+      overrides.devForwardedMiddlewareContextKey ?? TEST_FORWARDED_MW_CTX_KEY,
     dispatchMatchedPage:
       overrides.dispatchMatchedPage ??
       (async () => new Response("page", { status: 200, headers: { "x-from-dispatch": "page" } })),
@@ -227,6 +241,7 @@ function createHandler(overrides: Partial<TestHandlerOptions> = {}) {
             }
           : null),
     matchRequestRoute: overrides.matchRequestRoute,
+    matchRawRequestRoute: overrides.matchRawRequestRoute,
     runMiddleware:
       overrides.runMiddleware ??
       (overrides.middlewareModule
@@ -238,6 +253,7 @@ function createHandler(overrides: Partial<TestHandlerOptions> = {}) {
               i18nConfig: overrides.i18nConfig ?? null,
               isProxy: overrides.isMiddlewareProxy ?? false,
               module: overrides.middlewareModule!,
+              skipTrailingSlashRedirect: overrides.skipTrailingSlashRedirect,
               trailingSlash: overrides.trailingSlash ?? false,
             })
         : undefined),
@@ -248,6 +264,7 @@ function createHandler(overrides: Partial<TestHandlerOptions> = {}) {
     renderResponseStageLocally: overrides.renderResponseStageLocally,
     rootParamNamesByPattern: overrides.rootParamNamesByPattern,
     setNavigationContext: overrides.setNavigationContext ?? (() => {}),
+    skipTrailingSlashRedirect: overrides.skipTrailingSlashRedirect,
     staticParamsMap: overrides.staticParamsMap ?? {},
     trailingSlash: overrides.trailingSlash ?? false,
     validateDevRequestOrigin: overrides.validateDevRequestOrigin ?? (() => null),
@@ -375,7 +392,9 @@ describe("createAppRscHandler", () => {
       const handler = createHandler({
         configHeaders: cacheableConfigHeaders,
         configRewrites: {
-          beforeFiles: [{ source: "/outside", destination: "/about", basePath: false }],
+          beforeFiles: [
+            { source: "/outside", destination: "https://upstream.example/about", basePath: false },
+          ],
           afterFiles: [],
           fallback: [],
         },
@@ -609,6 +628,76 @@ describe("createAppRscHandler", () => {
     expect(dispatchMatchedRouteHandler).toHaveBeenCalledWith(
       expect.objectContaining({ bypassInterceptionContextCache: true, cleanPathname: "/about" }),
     );
+  });
+
+  it("keeps a split route handler's request.signal following the inbound signal after GC", async () => {
+    // Undici's Request follows its input's signal through a WeakRef, so the
+    // response stage's request clones are weak links to the inbound signal.
+    const v8 = await import("node:v8");
+    const vm = await import("node:vm");
+    v8.setFlagsFromString("--expose-gc");
+    const gc = vm.runInNewContext("gc") as () => void;
+
+    const route = createPageRoute({
+      __loadPage: undefined,
+      page: null,
+      routeHandler: { GET: () => new Response("route") },
+      routeSegments: ["about"],
+    });
+    let dispatched = false;
+    let aborted = false;
+    const handler = createHandler({
+      // Builds the handler's request the way dispatchAppRouteHandler does.
+      dispatchMatchedRouteHandler: async ({ request }) => {
+        dispatched = true;
+        const signal = getRequestContext().requestSignal ?? undefined;
+        const tracked = createTrackedAppRouteRequest(request, { signal });
+        tracked.request.signal.addEventListener("abort", () => {
+          aborted = true;
+        });
+        return new Response("route");
+      },
+      matchRequestRoute: (pathname) => (pathname === "/about" ? { params: {}, route } : null),
+    });
+
+    // The platform holds the inbound request (and its signal) for its lifetime.
+    const inbound = new AbortController();
+    const inboundRequest = new Request("https://example.test/about", { signal: inbound.signal });
+    const response = await handler.handleResponseStage(inboundRequest, null, {
+      kind: "app-route-handler",
+      buildId: "build-id",
+      cacheability: { policyHeaders: null, probeMode: null, resolvedRoutePathname: "/about" },
+      bypassInterceptionContextCache: false,
+      cachePathname: "/about",
+      canUseCanonicalLoadingShell: false,
+      canonicalPathname: "/about",
+      cleanPathname: "/about",
+      draftModeCookie: null,
+      interceptionContext: null,
+      interceptionId: null,
+      isRscRequest: false,
+      matchKind: "request",
+      middlewareCookieOverlay: null,
+      mountedSlotsHeader: null,
+      params: {},
+      protocolVersion: APP_WORKER_RESPONSE_STAGE_PROTOCOL_VERSION,
+      requestOrigin: "https://example.test",
+      renderMode: "navigation",
+      resolvedUrl: "/about",
+      routePattern: "/about",
+      routePathname: "/about",
+      scriptNonce: null,
+    });
+    expect(response.status).toBe(200);
+    expect(dispatched).toBe(true);
+    for (let round = 0; round < 3; round += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+      gc();
+    }
+
+    inbound.abort(new Error("client disconnected"));
+    expect(inboundRequest.signal.aborted).toBe(true);
+    expect(aborted).toBe(true);
   });
 
   it("normalizes a direct contextual RSC request before shared response-stage dispatch", async () => {
@@ -923,6 +1012,9 @@ describe("createAppRscHandler", () => {
       vi.stubEnv("VINEXT_PRERENDER", "1");
       expect(await marker("/account")).toBe("1");
       expect(await marker("/about")).toBe("0");
+      // The URL parser encodes these characters; that alone is no rewrite.
+      expect(await marker("/blog/café")).toBe("0");
+      expect(await marker("/blog/a b")).toBe("0");
     } finally {
       vi.unstubAllEnvs();
     }
@@ -2309,6 +2401,58 @@ describe("createAppRscHandler", () => {
     await expect(response.text()).resolves.toBe("page");
   });
 
+  // Next.js renders Pages Router routes without a work store, but runs
+  // middleware with one.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/web/adapter.ts
+  it.each(["single-stage", "response-stage"] as const)(
+    "runs the hybrid Pages fallback outside the work store scope (%s)",
+    async (mode) => {
+      const { isInsideWorkStoreScope } =
+        await import("../packages/vinext/src/shims/internal/work-store-scope.js");
+      const scopes: Record<string, boolean> = {};
+      let responseStageHandler: ReturnType<typeof createHandler>;
+      const options = {
+        configHeaders: [],
+        matchRequestRoute: () => null,
+        matchRoute: () => null,
+        middlewareModule: {
+          default() {
+            scopes.middleware = isInsideWorkStoreScope();
+            return new Response(null, { headers: { "x-middleware-next": "1" } });
+          },
+        },
+        renderPagesFallback: async (fallbackOptions) => {
+          if (fallbackOptions.dispatchPagesResponseStage) {
+            return fallbackOptions.dispatchPagesResponseStage(
+              fallbackOptions.request,
+              "page",
+              "server",
+            );
+          }
+          scopes.pages = isInsideWorkStoreScope();
+          return new Response("page");
+        },
+      } satisfies Partial<TestHandlerOptions>;
+      responseStageHandler = createHandler(options);
+      const requestStageHandler = createHandler(options);
+      const dispatchResponseStage: DispatchAppWorkerResponseStage = (
+        request,
+        props,
+        stageOptions,
+      ) => responseStageHandler.handleResponseStage(request, null, props, stageOptions);
+
+      const response = await requestStageHandler(
+        new Request("https://example.test/docs/pages"),
+        null,
+        false,
+        mode === "response-stage" ? dispatchResponseStage : undefined,
+      );
+
+      await expect(response.text()).resolves.toBe("page");
+      expect(scopes).toEqual({ middleware: true, pages: false });
+    },
+  );
+
   it.each(["page", "api"] as const)(
     "does not turn hybrid Pages %s next.config Content-Length into response framing",
     async (resourceKind) => {
@@ -3124,6 +3268,131 @@ describe("createAppRscHandler", () => {
     expect(await response.text()).toBe("nonce-render");
   });
 
+  it("routes hybrid Pages by the raw request pathname until a rewrite replaces it", async () => {
+    // Next.js reads the Pages locale and static segments from the raw pathname
+    // and decodes dynamic captures once, so `/%66r/...` must not reach the
+    // Pages router as the decoded `fr` locale that middleware never matched.
+    const pathnames: Array<string | undefined> = [];
+    const dispatchResponseStage = vi.fn<DispatchAppWorkerResponseStage>(async () =>
+      Promise.resolve(new Response("page")),
+    );
+    const handler = createHandler({
+      configRewrites: {
+        afterFiles: [],
+        beforeFiles: [{ source: "/legacy", destination: "/blog/a%2561" }],
+        fallback: [],
+      },
+      matchRequestRoute: () => null,
+      matchRoute: () => null,
+      renderPagesFallback: async (options) => {
+        pathnames.push(options.pathname);
+        return options.dispatchPagesResponseStage?.(options.request, "page") ?? null;
+      },
+    });
+
+    for (const pathname of ["/docs/%66r/a%2561?q=1", "/docs/legacy?q=1"]) {
+      await handler(
+        new Request(new URL(pathname, "https://example.test")),
+        null,
+        false,
+        dispatchResponseStage,
+      );
+    }
+
+    expect(pathnames).toEqual(["/%66r/a%2561?q=1", "/blog/a%2561?q=1"]);
+    expect(dispatchResponseStage.mock.calls.map(([, props]) => props)).toMatchObject([
+      { kind: "hybrid-pages", resolvedUrl: "/%66r/a%2561?q=1" },
+      { kind: "hybrid-pages", resolvedUrl: "/blog/a%2561?q=1" },
+    ]);
+  });
+
+  it("serializes hybrid Pages rewrite destinations in every rewrite phase", async () => {
+    // Next.js parses every rewrite destination as a URL, so a literal `é` reaches
+    // the Pages router as `%C3%A9` whichever phase rewrote to it.
+    const pathnames: Array<string | undefined> = [];
+    const handler = createHandler({
+      configRewrites: {
+        afterFiles: [{ source: "/after", destination: "/café" }],
+        beforeFiles: [{ source: "/before", destination: "/café" }],
+        fallback: [{ source: "/fallback", destination: "/café" }],
+      },
+      matchRequestRoute: () => null,
+      matchRoute: () => null,
+      renderPagesFallback: async (options) => {
+        pathnames.push(options.pathname);
+        return options.pathname?.startsWith("/caf") ? new Response("page") : null;
+      },
+    });
+
+    for (const pathname of ["/before", "/after", "/fallback"]) {
+      const response = await handler(
+        new Request(new URL(`/docs${pathname}`, "https://example.test")),
+        null,
+      );
+      expect(await response.text(), pathname).toBe("page");
+    }
+
+    expect(pathnames.filter((pathname) => pathname?.startsWith("/caf"))).toEqual([
+      "/caf%C3%A9",
+      "/caf%C3%A9",
+      "/caf%C3%A9",
+    ]);
+  });
+
+  it("keeps a substituted dot-segment capture verbatim in every rewrite phase", async () => {
+    // Next.js only URL-parses the destination template, so a captured `..`
+    // must not resolve into a Pages route the middleware matcher never saw.
+    const pathnames: Array<string | undefined> = [];
+    const capture = (source: string) => ({
+      source,
+      has: [{ type: "query" as const, key: "n", value: "(?<n>.*)" }],
+      destination: "/blog/:n",
+    });
+    const handler = createHandler({
+      configRewrites: {
+        afterFiles: [capture("/after")],
+        beforeFiles: [capture("/before")],
+        fallback: [capture("/fallback")],
+      },
+      matchRequestRoute: () => null,
+      matchRoute: () => null,
+      renderPagesFallback: async (options) => {
+        pathnames.push(options.pathname);
+        return null;
+      },
+    });
+
+    for (const pathname of ["/before", "/after", "/fallback"]) {
+      await handler(
+        new Request(new URL(`/docs${pathname}?n=..%2Fabout`, "https://example.test")),
+        null,
+      );
+    }
+
+    expect(pathnames.filter((pathname) => pathname?.startsWith("/about"))).toEqual([]);
+    expect(
+      pathnames.filter((pathname) => pathname?.startsWith("/blog/../about")).length,
+    ).toBeGreaterThanOrEqual(3);
+  });
+
+  it("does not report URL-parser encoding as a hybrid Pages data rewrite", async () => {
+    const handler = createHandler({
+      configHeaders: [],
+      matchRequestRoute: () => null,
+      matchRoute: () => null,
+      renderPagesFallback: async () => new Response("pages-data"),
+    });
+
+    for (const page of ["blog/caf%C3%A9", "blog/a%20b"]) {
+      const response = await handler(
+        new Request(`https://example.test/docs/_next/data/build-id/${page}.json`),
+        null,
+      );
+      expect(await response.text(), page).toBe("pages-data");
+      expect(response.headers.get("x-nextjs-rewrite"), page).toBeNull();
+    }
+  });
+
   it("restores hybrid Pages pre-handler headers inside the response stage", async () => {
     // Next.js exposes middleware response headers through `res.getHeader()` in
     // getServerSideProps. Keep the same response snapshot across the App to
@@ -3418,9 +3687,11 @@ describe("createAppRscHandler", () => {
     expect(await response.text()).toBe("icon-page");
   });
 
-  // Ported from Next.js: test/e2e/app-dir/app-basepath/index.test.ts
-  // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/app-basepath/index.test.ts
-  it("applies basePath: false rewrites outside the App Router basePath", async () => {
+  // Next.js rejects an internal `basePath: false` rewrite when it loads the
+  // config. At runtime, its destination is outside the basePath, so like
+  // Next.js' resolve-routes it resolves no route or file.
+  it("does not resolve basePath: false rewrites to internal destinations", async () => {
+    const dispatchMatchedPage = vi.fn(async () => new Response("page"));
     const handler = createHandler({
       configHeaders: [],
       configRewrites: {
@@ -3428,15 +3699,17 @@ describe("createAppRscHandler", () => {
         afterFiles: [],
         fallback: [],
       },
+      dispatchMatchedPage,
     });
 
     const response = await handler(new Request("https://example.test/outside"), null);
 
-    expect(response.status).toBe(200);
-    expect(await response.text()).toBe("page");
+    expect(response.status).toBe(404);
+    expect(dispatchMatchedPage).not.toHaveBeenCalled();
   });
 
-  it("allows identity basePath: false rewrites to claim App routes", async () => {
+  it("does not let identity basePath: false rewrites claim App routes", async () => {
+    const dispatchMatchedPage = vi.fn(async () => new Response("page"));
     const handler = createHandler({
       configHeaders: [],
       configRewrites: {
@@ -3444,12 +3717,13 @@ describe("createAppRscHandler", () => {
         afterFiles: [],
         fallback: [],
       },
+      dispatchMatchedPage,
     });
 
     const response = await handler(new Request("https://example.test/about"), null);
 
-    expect(response.status).toBe(200);
-    expect(await response.text()).toBe("page");
+    expect(response.status).toBe(404);
+    expect(dispatchMatchedPage).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -3521,7 +3795,7 @@ describe("createAppRscHandler", () => {
   );
 
   it.each(["afterFiles", "fallback"] as const)(
-    "allows out-of-basePath %s rewrites to reach Pages routes",
+    "does not let out-of-basePath %s rewrites reach Pages routes",
     async (phase) => {
       const renderPagesFallback = vi.fn(async () => new Response("pages", { status: 200 }));
       const handler = createHandler({
@@ -3543,11 +3817,8 @@ describe("createAppRscHandler", () => {
 
       const response = await handler(new Request("https://example.test/outside"), null);
 
-      expect(response.status).toBe(200);
-      expect(await response.text()).toBe("pages");
-      expect(renderPagesFallback).toHaveBeenCalledWith(
-        expect.objectContaining({ pathname: "/pages" }),
-      );
+      expect(response.status).toBe(404);
+      expect(renderPagesFallback).not.toHaveBeenCalled();
     },
   );
 
@@ -3664,7 +3935,7 @@ describe("createAppRscHandler", () => {
   });
 
   it.each(["afterFiles", "fallback"] as const)(
-    "allows out-of-basePath POST requests through %s rewrites to App route handlers",
+    "does not let out-of-basePath POST requests through %s rewrites reach App route handlers",
     async (phase) => {
       const route = createPageRoute({
         __loadPage: undefined,
@@ -3697,14 +3968,109 @@ describe("createAppRscHandler", () => {
         null,
       );
 
-      expect(response.status).toBe(200);
-      expect(await response.text()).toBe("route");
-      expect(dispatchMatchedRouteHandler).toHaveBeenCalledOnce();
+      expect(response.status).toBe(404);
+      expect(dispatchMatchedRouteHandler).not.toHaveBeenCalled();
     },
   );
 
+  describe("encoded request answered by a static page", () => {
+    // Next.js 16.2.7 serves `/%61bout` beside `/[slug]` from the prerendered
+    // `/about`, but draft mode and server actions skip that cache and render
+    // the raw-matched `/[slug]`.
+    const staticRoute = createPageRoute();
+    const dynamicRoute = createPageRoute({
+      isDynamic: true,
+      params: ["slug"],
+      pattern: "/:slug",
+      rootParamNames: ["slug"],
+    });
+    const encodedRouteOptions = (overrides: Partial<TestHandlerOptions> = {}) => ({
+      matchRoute: (pathname: string) =>
+        pathname === "/about" ? { params: {}, route: staticRoute } : null,
+      matchRequestRoute: (pathname: string) =>
+        pathname === "/%61bout" ? { params: {}, route: staticRoute } : null,
+      matchRawRequestRoute: (pathname: string) =>
+        pathname === "/%61bout" ? { params: { slug: "%61bout" }, route: dynamicRoute } : null,
+      ...overrides,
+    });
+
+    it("renders the static page", async () => {
+      const dispatchMatchedPage = vi.fn(async () => new Response("page"));
+      const handler = createHandler(encodedRouteOptions({ dispatchMatchedPage }));
+
+      await handler(new Request("https://example.test/docs/%61bout"), null);
+
+      expect(dispatchMatchedPage).toHaveBeenCalledWith(
+        expect.objectContaining({ route: staticRoute }),
+      );
+    });
+
+    it("renders the raw-matched page in draft mode", async () => {
+      const dispatchMatchedPage = vi.fn(async () => new Response("page"));
+      const handler = createHandler(encodedRouteOptions({ dispatchMatchedPage }));
+
+      await handler(
+        new Request("https://example.test/docs/%61bout", {
+          headers: { Cookie: "__prerender_bypass=test-draft-secret" },
+        }),
+        null,
+      );
+
+      expect(dispatchMatchedPage).toHaveBeenCalledWith(
+        expect.objectContaining({ params: { slug: "%61bout" }, route: dynamicRoute }),
+      );
+    });
+
+    it("transports the raw match through the split response stage in draft mode", async () => {
+      const dispatchMatchedPage = vi.fn(async () => new Response("page"));
+      const dispatchResponseStage = vi.fn<DispatchAppWorkerResponseStage>(async () =>
+        Promise.resolve(new Response("stage")),
+      );
+      const handler = createHandler(encodedRouteOptions({ dispatchMatchedPage }));
+      const request = new Request("https://example.test/docs/%61bout", {
+        headers: { Cookie: "__prerender_bypass=test-draft-secret" },
+      });
+
+      await handler(request, null, false, dispatchResponseStage);
+      const [stageRequest, props] = dispatchResponseStage.mock.calls[0]!;
+      expect(props).toMatchObject({ matchKind: "raw-request", routePattern: "/:slug" });
+
+      const response = await handler.handleResponseStage(stageRequest, null, props);
+      expect(response.status).toBe(200);
+      expect(dispatchMatchedPage).toHaveBeenCalledWith(
+        expect.objectContaining({ params: { slug: "%61bout" }, route: dynamicRoute }),
+      );
+    });
+
+    it("runs a server action against the raw-matched page", async () => {
+      let observedRootParams: unknown = null;
+      const handleServerActionRequest = vi.fn(async () => {
+        const { getCurrentRootParams } =
+          await import("../packages/vinext/src/shims/root-params.js");
+        observedRootParams = getCurrentRootParams();
+        return new Response("action");
+      });
+      const handler = createHandler(encodedRouteOptions({ handleServerActionRequest }));
+
+      await handler(
+        new Request("https://example.test/docs/%61bout", {
+          method: "POST",
+          headers: { "next-action": "action-id", "content-type": "text/plain" },
+        }),
+        null,
+      );
+
+      expect(handleServerActionRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          routeMatch: { params: { slug: "%61bout" }, route: dynamicRoute },
+        }),
+      );
+      expect(observedRootParams).toEqual({ slug: "%61bout" });
+    });
+  });
+
   it.each(["afterFiles", "fallback"] as const)(
-    "allows out-of-basePath Server Actions through %s rewrites",
+    "does not let out-of-basePath Server Actions through %s rewrites",
     async (phase) => {
       const handleServerActionRequest = vi.fn(async () => new Response("action"));
       const handler = createHandler({
@@ -3731,16 +4097,13 @@ describe("createAppRscHandler", () => {
         null,
       );
 
-      expect(response.status).toBe(200);
-      expect(await response.text()).toBe("action");
-      expect(handleServerActionRequest).toHaveBeenCalledWith(
-        expect.objectContaining({ cleanPathname: "/about" }),
-      );
+      expect(response.status).toBe(404);
+      expect(handleServerActionRequest).not.toHaveBeenCalled();
     },
   );
 
   it.each(["afterFiles", "fallback"] as const)(
-    "allows out-of-basePath progressive Server Actions through %s rewrites",
+    "does not let out-of-basePath progressive Server Actions through %s rewrites",
     async (phase) => {
       const handleProgressiveActionRequest = vi.fn(async () => new Response("progressive-action"));
       const handler = createHandler({
@@ -3767,19 +4130,78 @@ describe("createAppRscHandler", () => {
         null,
       );
 
-      expect(response.status).toBe(200);
-      expect(await response.text()).toBe("progressive-action");
-      expect(handleProgressiveActionRequest).toHaveBeenCalledWith(
-        expect.objectContaining({ cleanPathname: "/about" }),
-      );
+      expect(response.status).toBe(404);
+      expect(handleProgressiveActionRequest).not.toHaveBeenCalled();
     },
   );
 
   it.each(["afterFiles", "fallback"] as const)(
-    "validates out-of-basePath RSC requests claimed by %s rewrites",
+    "checks public files after a %s rewrite",
+    async (phase) => {
+      const handleProgressiveActionRequest = vi.fn(async () => new Response("progressive-action"));
+      const rewrite = { source: "/alias", destination: "/logo.svg" };
+      const handler = createHandler({
+        configHeaders: [],
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: phase === "afterFiles" ? [rewrite] : [],
+          fallback: phase === "fallback" ? [rewrite] : [],
+        },
+        handleProgressiveActionRequest,
+        publicFiles: new Set(["/logo.svg"]),
+      });
+
+      const getResponse = await handler(new Request("https://example.test/docs/alias"), null);
+      const postResponse = await handler(
+        new Request("https://example.test/docs/alias", {
+          method: "POST",
+          headers: { "content-type": "multipart/form-data; boundary=vinext" },
+        }),
+        null,
+      );
+
+      expect(readStaticFileSignal(getResponse)).toBe("%2Flogo.svg");
+      expect(postResponse.status).toBe(405);
+      expect(postResponse.headers.get("allow")).toBe("GET, HEAD");
+      expect(handleProgressiveActionRequest).not.toHaveBeenCalled();
+    },
+  );
+
+  it("lets a Pages route claim a progressive POST before fallback rewrites", async () => {
+    const handleProgressiveActionRequest = vi.fn(async () => new Response("progressive-action"));
+    const renderPagesFallback = vi.fn<NonNullable<HandlerOptions["renderPagesFallback"]>>(
+      async (options) =>
+        (options.pathname ?? options.url.pathname) === "/api/upload"
+          ? new Response("pages-api")
+          : null,
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [],
+        afterFiles: [{ source: "/alias", destination: "/api/upload" }],
+        fallback: [{ source: "/api/upload", destination: "/about" }],
+      },
+      handleProgressiveActionRequest,
+      renderPagesFallback,
+    });
+
+    const response = await handler(
+      new Request("https://example.test/docs/alias", {
+        method: "POST",
+        headers: { "content-type": "multipart/form-data; boundary=vinext" },
+      }),
+      null,
+    );
+
+    expect(await response.text()).toBe("pages-api");
+    expect(handleProgressiveActionRequest).not.toHaveBeenCalled();
+  });
+
+  it.each(["afterFiles", "fallback"] as const)(
+    "does not validate out-of-basePath RSC requests that %s rewrites keep outside basePath",
     async (phase) => {
       const headers = createRscRequestHeaders({ mountedSlotsHeader: "slot:modal:/" });
-      const expectedHash = await computeRscCacheBustingSearchParam(headers);
       const handler = createHandler({
         configHeaders: [],
         configRewrites: {
@@ -3800,10 +4222,32 @@ describe("createAppRscHandler", () => {
         null,
       );
 
-      expect(response.status).toBe(307);
-      expect(response.headers.get("location")).toBe(`/outside.rsc?tab=latest&_rsc=${expectedHash}`);
+      expect(response.status).toBe(404);
+      expect(response.headers.get("location")).toBeNull();
     },
   );
+
+  it("validates out-of-basePath RSC requests middleware rewrites into basePath", async () => {
+    const headers = createRscRequestHeaders({ mountedSlotsHeader: "slot:modal:/" });
+    const expectedHash = await computeRscCacheBustingSearchParam(headers);
+    const handler = createHandler({
+      configHeaders: [],
+      middlewareModule: {
+        default: (request: Request) =>
+          new Response(null, {
+            headers: { "x-middleware-rewrite": new URL("/docs/about", request.url).toString() },
+          }),
+      },
+    });
+
+    const response = await handler(
+      new Request("https://example.test/outside.rsc?tab=latest", { headers }),
+      null,
+    );
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get("location")).toBe(`/outside.rsc?tab=latest&_rsc=${expectedHash}`);
+  });
 
   it("does not expose App routes directly outside basePath", async () => {
     const renderNotFound = vi.fn(async () => new Response("rendered not found", { status: 404 }));
@@ -4044,6 +4488,187 @@ describe("createAppRscHandler", () => {
     );
     expect(defaultOnly.status).toBe(400);
   });
+
+  it.each([
+    {
+      name: "a middleware rewrite into basePath",
+      requestPath: "/docs/photo",
+      overrides: {
+        middlewareModule: {
+          default: (request: Request) =>
+            new Response(null, {
+              headers: {
+                "x-middleware-rewrite": new URL(
+                  "/docs/_next/image?url=%2Fimg.jpg&w=640&q=75",
+                  request.url,
+                ).toString(),
+              },
+            }),
+        },
+      },
+      served: true,
+    },
+    {
+      name: "a middleware rewrite outside basePath",
+      requestPath: "/docs/photo",
+      overrides: {
+        middlewareModule: {
+          default: (request: Request) =>
+            new Response(null, {
+              headers: {
+                "x-middleware-rewrite": new URL(
+                  "/_next/image?url=%2Fimg.jpg&w=640&q=75",
+                  request.url,
+                ).toString(),
+              },
+            }),
+        },
+      },
+      served: false,
+    },
+    {
+      name: "a default config rewrite",
+      requestPath: "/docs/photo",
+      overrides: {
+        configRewrites: {
+          beforeFiles: [
+            { source: "/photo", destination: "/_next/image?url=%2Fimg.jpg&w=640&q=75" },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+      },
+      served: true,
+    },
+    {
+      name: "a basePath: false config rewrite",
+      requestPath: "/photo",
+      overrides: {
+        configRewrites: {
+          beforeFiles: [
+            {
+              source: "/photo",
+              destination: "/_next/image?url=%2Fimg.jpg&w=640&q=75",
+              basePath: false as const,
+            },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+      },
+      served: false,
+    },
+    {
+      name: "a default config rewrite after a middleware rewrite outside basePath",
+      requestPath: "/docs/photo",
+      overrides: {
+        middlewareModule: {
+          default: (request: Request) =>
+            new Response(null, {
+              headers: { "x-middleware-rewrite": new URL("/outside", request.url).toString() },
+            }),
+        },
+        configRewrites: {
+          beforeFiles: [
+            { source: "/outside", destination: "/_next/image?url=%2Fimg.jpg&w=640&q=75" },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+      },
+      served: false,
+    },
+    {
+      name: "a default config rewrite after a middleware rewrite into basePath",
+      requestPath: "/photo",
+      overrides: {
+        middlewareModule: {
+          default: (request: Request) =>
+            new Response(null, {
+              headers: { "x-middleware-rewrite": new URL("/docs/legacy", request.url).toString() },
+            }),
+        },
+        configRewrites: {
+          beforeFiles: [
+            { source: "/legacy", destination: "/_next/image?url=%2Fimg.jpg&w=640&q=75" },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+      },
+      served: true,
+    },
+    {
+      name: "an afterFiles config rewrite",
+      requestPath: "/docs/photo",
+      overrides: {
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [{ source: "/photo", destination: "/_next/image?url=%2Fimg.jpg&w=640&q=75" }],
+          fallback: [],
+        },
+      },
+      served: true,
+    },
+    {
+      name: "a fallback config rewrite",
+      requestPath: "/docs/photo",
+      overrides: {
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [],
+          fallback: [{ source: "/photo", destination: "/_next/image?url=%2Fimg.jpg&w=640&q=75" }],
+        },
+      },
+      served: true,
+    },
+  ])(
+    "serves the App Router image endpoint only when $name keeps the basePath",
+    async ({ requestPath, overrides, served }) => {
+      // Next.js filesystem lookups return nothing for a path without the
+      // basePath, so a rewrite target must carry it to reach the endpoint.
+      const handler = createHandler({ configHeaders: [], ...overrides });
+      const response = await handler(new Request(`https://example.test${requestPath}`), null);
+      if (served) {
+        expect(response.status).toBe(302);
+        expect(response.headers.get("location")).toBe("https://example.test/img.jpg");
+      } else {
+        expect(response.status).toBe(404);
+      }
+    },
+  );
+
+  it.each([
+    { rewriteHadBasePath: true, served: true },
+    { rewriteHadBasePath: false, served: false },
+  ])(
+    "serves the App Router image endpoint for a forwarded middleware rewrite only when it kept the basePath ($rewriteHadBasePath)",
+    async ({ rewriteHadBasePath, served }) => {
+      // Hybrid app+pages dev runs middleware in the Pages pipeline and forwards
+      // the basePath-stripped rewrite, so the basePath state travels with it.
+      const handler = createHandler({
+        configHeaders: [],
+        middlewareModule: { default: () => new Response(null) },
+      });
+      const response = await handler(
+        new Request("https://example.test/docs/photo", {
+          headers: {
+            [VINEXT_MW_CTX_HEADER]: sealedForwardedContext({
+              r: "/_next/image?url=%2Fimg.jpg&w=640&q=75",
+              b: rewriteHadBasePath,
+            }),
+          },
+        }),
+        null,
+      );
+      if (served) {
+        expect(response.status).toBe(302);
+        expect(response.headers.get("location")).toBe("https://example.test/img.jpg");
+      } else {
+        expect(response.status).toBe(404);
+      }
+    },
+  );
 
   it("dispatches an RSC interception target with all dynamic descendant source params", async () => {
     const sourceRoute = createPageRoute({
@@ -4348,6 +4973,53 @@ describe("createAppRscHandler", () => {
 
       expect(response.status).toBe(200);
       expect(middlewarePaths).toEqual([seen]);
+    },
+  );
+
+  it.each([
+    { source: "/feed/secret/", trailingSlash: false },
+    { source: "/feed/secret", trailingSlash: true },
+  ])(
+    "keeps the interception source $source as named under skipTrailingSlashRedirect (trailingSlash: $trailingSlash)",
+    async ({ source, trailingSlash }) => {
+      const targetRoute = createPageRoute({
+        pattern: "/photos/1",
+        routeSegments: ["photos", "1"],
+      });
+      const sourceRoute = createPageRoute({ pattern: "/feed/secret" });
+      const middlewarePaths: string[] = [];
+      const handler = createHandler({
+        configHeaders: [],
+        matchInterceptRoute: (_pathname, sourcePathname) =>
+          sourcePathname === source
+            ? { interceptionSourceIsConcrete: true, route: sourceRoute, params: {} }
+            : null,
+        matchRoute: (pathname: string) =>
+          pathname === "/photos/1" || pathname === "/photos/1/"
+            ? { params: {}, route: targetRoute }
+            : null,
+        middlewareModule: {
+          default(request: NextRequest) {
+            if (request.nextUrl.pathname.startsWith("/feed")) {
+              middlewarePaths.push(request.nextUrl.pathname);
+            }
+          },
+        },
+        skipTrailingSlashRedirect: true,
+        trailingSlash,
+      });
+
+      const headers = createRscRequestHeaders({ interceptionContext: source });
+      const rscUrl = await createRscRequestUrl("/docs/photos/1", headers);
+      const response = await handler(
+        new Request(`https://example.test${rscUrl}`, { headers }),
+        null,
+      );
+
+      // A direct request to the source is not redirected, so middleware
+      // authorizes the same spelling.
+      expect(response.status).toBe(200);
+      expect(middlewarePaths).toEqual([source]);
     },
   );
 
@@ -5437,6 +6109,49 @@ describe("createAppRscHandler", () => {
     ]);
   });
 
+  it("does not pass an unauthorized interception source to a non-RSC Server Action", async () => {
+    const targetRoute = createPageRoute({ pattern: "/photos/1", routeSegments: ["photos", "1"] });
+    const sourceRoute = createPageRoute({ pattern: "/feed/secret" });
+    const middlewarePaths: string[] = [];
+    const handleServerActionRequest = vi.fn(async () => new Response("action"));
+    const handler = createHandler({
+      configHeaders: [],
+      handleServerActionRequest,
+      matchInterceptRoute: (_pathname, sourcePathname) =>
+        sourcePathname === "/feed/secret" ? { route: sourceRoute, params: {} } : null,
+      matchRoute: (pathname: string) =>
+        pathname === "/photos/1" ? { params: {}, route: targetRoute } : null,
+      middlewareModule: {
+        default(request: NextRequest) {
+          middlewarePaths.push(request.nextUrl.pathname);
+          if (request.nextUrl.pathname.startsWith("/feed")) {
+            return new Response("denied", { status: 401 });
+          }
+          return undefined;
+        },
+      },
+    });
+
+    const response = await handler(
+      new Request("https://example.test/docs/photos/1", {
+        body: "[]",
+        headers: {
+          "content-type": "text/plain",
+          "next-action": "interception-action",
+          "x-vinext-interception-context": "/feed/secret",
+        },
+        method: "POST",
+      }),
+      null,
+    );
+
+    expect(response.status).toBe(200);
+    expect(middlewarePaths).toEqual(["/photos/1"]);
+    expect(handleServerActionRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ interceptionContext: null, isRscRequest: false }),
+    );
+  });
+
   it("does not replay a forwarded target middleware result for the interception source", async () => {
     const targetRoute = createPageRoute({ pattern: "/photos/1", routeSegments: ["photos", "1"] });
     const sourceRoute = createPageRoute({ pattern: "/feed/secret" });
@@ -5458,7 +6173,7 @@ describe("createAppRscHandler", () => {
     });
 
     const headers = createRscRequestHeaders({ interceptionContext: "/feed/secret" });
-    headers.set(VINEXT_MW_CTX_HEADER, JSON.stringify({ h: [["x-mw-target", "1"]] }));
+    headers.set(VINEXT_MW_CTX_HEADER, sealedForwardedContext({ h: [["x-mw-target", "1"]] }));
     const rscUrl = await createRscRequestUrl("/docs/photos/1", headers);
     const response = await handler(new Request(`https://example.test${rscUrl}`, { headers }), null);
 
@@ -5759,6 +6474,114 @@ describe("createAppRscHandler", () => {
       expect.objectContaining({ interceptionContext: "/en/feed" }),
     );
     expect(interceptSources).toContain("/en/feed");
+  });
+
+  // The source is authorized under the basePath the target resolved to, so a
+  // target middleware rewrites into the basePath keeps its source there too.
+  it("authorizes the interception source of a target middleware rewrites into basePath", async () => {
+    const targetRoute = createPageRoute({ pattern: "/photos/1", routeSegments: ["photos", "1"] });
+    const localeRootRoute = createPageRoute({ pattern: "/:locale", routeSegments: ["[locale]"] });
+    const feedRoute = createPageRoute({
+      pattern: "/:locale/feed",
+      routeSegments: ["[locale]", "feed"],
+    });
+    const dispatchMatchedPage = vi.fn(async () => new Response("page"));
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+      matchInterceptRoute: (_pathname, sourcePathname) => {
+        if (sourcePathname === "/feed") {
+          return { route: localeRootRoute, params: { locale: "feed" } };
+        }
+        if (sourcePathname === "/en/feed") {
+          return { route: feedRoute, params: { locale: "en" } };
+        }
+        return null;
+      },
+      matchRoute(pathname: string) {
+        if (pathname === "/photos/1") {
+          return { params: {} as Record<string, string | string[]>, route: targetRoute };
+        }
+        if (pathname === "/en/feed") {
+          return {
+            params: { locale: "en" } as Record<string, string | string[]>,
+            route: feedRoute,
+          };
+        }
+        return null;
+      },
+      middlewareModule: {
+        default(request: NextRequest) {
+          const pathname = new URL(request.url).pathname;
+          if (pathname === "/photos/1") {
+            return new Response(null, {
+              headers: { "x-middleware-rewrite": "https://example.test/docs/photos/1" },
+            });
+          }
+          return pathname === "/docs/feed"
+            ? new Response(null, {
+                headers: { "x-middleware-rewrite": "https://example.test/docs/en/feed" },
+              })
+            : new Response(null, { headers: { "x-middleware-next": "1" } });
+        },
+      },
+    });
+
+    const headers = createRscRequestHeaders({ interceptionContext: "/feed" });
+    const rscUrl = await createRscRequestUrl("/photos/1", headers);
+    const response = await handler(new Request(`https://example.test${rscUrl}`, { headers }), null);
+
+    expect(response.status).toBe(200);
+    expect(dispatchMatchedPage).toHaveBeenCalledWith(
+      expect.objectContaining({ interceptionContext: "/en/feed" }),
+    );
+  });
+
+  // Next.js resolves no route for a pathname outside the basePath, so a source
+  // rewritten there cannot authorize the interception.
+  it("does not render an interception source that middleware rewrites outside basePath", async () => {
+    const targetRoute = createPageRoute({ pattern: "/photos/1", routeSegments: ["photos", "1"] });
+    const feedRoute = createPageRoute({
+      pattern: "/:locale/feed",
+      routeSegments: ["[locale]", "feed"],
+    });
+    const dispatchMatchedPage = vi.fn(async () => new Response("page"));
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+      matchInterceptRoute: (_pathname, sourcePathname) =>
+        sourcePathname === "/feed" || sourcePathname === "/en/feed"
+          ? { route: feedRoute, params: { locale: "en" } }
+          : null,
+      matchRoute(pathname: string) {
+        if (pathname === "/photos/1") {
+          return { params: {} as Record<string, string | string[]>, route: targetRoute };
+        }
+        if (pathname === "/en/feed") {
+          return {
+            params: { locale: "en" } as Record<string, string | string[]>,
+            route: feedRoute,
+          };
+        }
+        return null;
+      },
+      middlewareModule: {
+        default(request: NextRequest) {
+          return request.nextUrl.pathname === "/feed"
+            ? new Response(null, {
+                headers: { "x-middleware-rewrite": "https://example.test/en/feed" },
+              })
+            : new Response(null, { headers: { "x-middleware-next": "1" } });
+        },
+      },
+    });
+
+    const headers = createRscRequestHeaders({ interceptionContext: "/feed" });
+    const rscUrl = await createRscRequestUrl("/docs/photos/1", headers);
+    const response = await handler(new Request(`https://example.test${rscUrl}`, { headers }), null);
+
+    expect(response.status).toBe(404);
+    expect(dispatchMatchedPage).not.toHaveBeenCalled();
   });
 
   it("hands a Server Action the interception source its locale rewrite reaches", async () => {
@@ -6489,6 +7312,975 @@ describe("createAppRscHandler", () => {
     expect(await response.text()).toBe("icon bytes");
   });
 
+  describe.each([true, false])("multipart Route Handlers (isDev=%s)", (isDev) => {
+    it.each(["text", "file"] as const)(
+      "receives a complete %s payload larger than the Server Actions body limit",
+      async (kind) => {
+        const maxActionBodySize = 1024 * 1024;
+        const payload = "x".repeat(maxActionBodySize + 1);
+        const formData = new FormData();
+        if (kind === "text") {
+          formData.set("message", payload);
+        } else {
+          formData.set("image", new Blob([payload], { type: "image/bmp" }), "image.bmp");
+        }
+        const request = new Request("https://example.test/docs/upload", {
+          method: "POST",
+          body: formData,
+        });
+        expect(request.headers.has("content-length")).toBe(false);
+
+        const route = createPageRoute({
+          __loadPage: undefined,
+          __loadRouteHandler() {},
+          page: null,
+          pattern: "/upload",
+          routeHandler: { GET: () => new Response("route") },
+          routeSegments: ["upload"],
+        });
+        const handleProgressiveActionRequest = vi.fn<
+          NonNullable<HandlerOptions["handleProgressiveActionRequest"]>
+        >(async ({ request }) => {
+          try {
+            await readActionFormDataWithLimit(request.clone(), maxActionBodySize);
+            return null;
+          } catch (error) {
+            if (!(error instanceof Error) || error.message !== "Request body too large") {
+              throw error;
+            }
+            return new Response("Payload Too Large", { status: 413 });
+          }
+        });
+        const dispatchMatchedRouteHandler = vi.fn<DispatchMatchedRouteHandler>(
+          async ({ request }) => {
+            expect(request.bodyUsed).toBe(false);
+            const body = await request.formData();
+            if (kind === "text") {
+              expect(body.get("message")).toBe(payload);
+            } else {
+              const image = body.get("image");
+              expect(image).toBeInstanceOf(File);
+              if (!(image instanceof File)) throw new Error("Expected uploaded file");
+              expect(image.name).toBe("image.bmp");
+              expect(image.type).toBe("image/bmp");
+              expect(image.size).toBe(payload.length);
+              expect(await image.text()).toBe(payload);
+            }
+            return new Response("uploaded", { status: 200 });
+          },
+        );
+        const handler = createHandler({
+          configHeaders: [],
+          isDev,
+          handleProgressiveActionRequest,
+          dispatchMatchedRouteHandler,
+          matchRoute: (pathname) => (pathname === "/upload" ? { route, params: {} } : null),
+        });
+
+        const response = await handler(request, null);
+
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe("uploaded");
+        expect(dispatchMatchedRouteHandler).toHaveBeenCalledOnce();
+        expect(handleProgressiveActionRequest).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  it("runs progressive actions for a page that an afterFiles rewrite reaches from a dynamic route handler", async () => {
+    const dynamicRouteHandler = createPageRoute({
+      __loadPage: undefined,
+      __loadRouteHandler() {},
+      isDynamic: true,
+      page: null,
+      pattern: "/api/:slug",
+      routeHandler: { GET: () => new Response("route") },
+      routeSegments: ["api", "[slug]"],
+    });
+    const aboutPage = createPageRoute();
+    const emptyParams: Record<string, string | string[]> = {};
+    const handleProgressiveActionRequest = vi.fn<
+      NonNullable<HandlerOptions["handleProgressiveActionRequest"]>
+    >(async () => null);
+    const dispatchMatchedRouteHandler = vi.fn<DispatchMatchedRouteHandler>(
+      async () => new Response("route", { status: 200 }),
+    );
+    const dispatchMatchedPage = vi.fn(
+      async ({ route }: { route: TestRoute }) =>
+        new Response(`page:${route.pattern}`, { status: 200 }),
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        afterFiles: [{ source: "/api/legacy-form", destination: "/about" }],
+        beforeFiles: [],
+        fallback: [],
+      },
+      dispatchMatchedPage,
+      dispatchMatchedRouteHandler,
+      handleProgressiveActionRequest,
+      matchRoute: (pathname) => {
+        if (pathname === "/about") return { params: emptyParams, route: aboutPage };
+        if (pathname.startsWith("/api/")) {
+          return { params: { slug: pathname.slice("/api/".length) }, route: dynamicRouteHandler };
+        }
+        return null;
+      },
+    });
+    const body = new FormData();
+    body.set("message", "hello");
+
+    const response = await handler(
+      new Request("https://example.test/docs/api/legacy-form", { method: "POST", body }),
+      null,
+    );
+
+    expect(await response.text()).toBe("page:/about");
+    expect(handleProgressiveActionRequest).toHaveBeenCalledOnce();
+    expect(handleProgressiveActionRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ routeMatch: { params: emptyParams, route: aboutPage } }),
+    );
+    expect(dispatchMatchedRouteHandler).not.toHaveBeenCalled();
+  });
+
+  describe("progressive actions after late routing", () => {
+    const routeHandler = createPageRoute({
+      __loadPage: undefined,
+      __loadRouteHandler() {},
+      page: null,
+      pattern: "/upload",
+      routeHandler: { GET: () => new Response("route") },
+      routeSegments: ["upload"],
+    });
+    const aboutPage = createPageRoute();
+    const dynamicPage = createPageRoute({
+      isDynamic: true,
+      pattern: "/:slug",
+      routeSegments: ["[slug]"],
+    });
+    const emptyParams: Record<string, string | string[]> = {};
+    const multipartPost = (pathname: string) => {
+      const body = new FormData();
+      body.set("message", "hello");
+      return new Request(`https://example.test/docs${pathname}`, { method: "POST", body });
+    };
+    const createProgressiveHandler = (overrides: Partial<TestHandlerOptions>) => {
+      const handleProgressiveActionRequest = vi.fn<
+        NonNullable<HandlerOptions["handleProgressiveActionRequest"]>
+      >(async () => null);
+      const dispatchMatchedRouteHandler = vi.fn<DispatchMatchedRouteHandler>(
+        async () => new Response("route", { status: 200 }),
+      );
+      const dispatchMatchedPage = vi.fn(
+        async ({ route }: { route: TestRoute }) =>
+          new Response(`page:${route.pattern}`, { status: 200 }),
+      );
+      const handler = createHandler({
+        configHeaders: [],
+        dispatchMatchedPage,
+        dispatchMatchedRouteHandler,
+        handleProgressiveActionRequest,
+        ...overrides,
+      });
+      return {
+        dispatchMatchedPage,
+        dispatchMatchedRouteHandler,
+        handleProgressiveActionRequest,
+        handler,
+      };
+    };
+
+    it.each(["afterFiles", "fallback"] as const)(
+      "skips them for a route handler reached through %s rewrites",
+      async (phase) => {
+        const { dispatchMatchedRouteHandler, handleProgressiveActionRequest, handler } =
+          createProgressiveHandler({
+            configRewrites: {
+              afterFiles: [],
+              beforeFiles: [],
+              fallback: [],
+              [phase]: [{ source: "/upload-alias", destination: "/upload" }],
+            },
+            matchRoute: (pathname) =>
+              pathname === "/upload" ? { params: emptyParams, route: routeHandler } : null,
+          });
+
+        const response = await handler(multipartPost("/upload-alias"), null);
+
+        expect(await response.text()).toBe("route");
+        expect(dispatchMatchedRouteHandler).toHaveBeenCalledOnce();
+        expect(handleProgressiveActionRequest).not.toHaveBeenCalled();
+      },
+    );
+
+    it("skips them for an unrewritten dynamic route handler", async () => {
+      const dynamicRouteHandler = createPageRoute({
+        __loadPage: undefined,
+        __loadRouteHandler() {},
+        isDynamic: true,
+        page: null,
+        pattern: "/api/:slug",
+        routeHandler: { GET: () => new Response("route") },
+        routeSegments: ["api", "[slug]"],
+      });
+      const dispatchMatchedRouteHandler = vi.fn<DispatchMatchedRouteHandler>(
+        async ({ request }) => {
+          const message = (await request.formData()).get("message");
+          return new Response(typeof message === "string" ? message : null);
+        },
+      );
+      const { handleProgressiveActionRequest, handler } = createProgressiveHandler({
+        dispatchMatchedRouteHandler,
+        matchRoute: (pathname) =>
+          pathname.startsWith("/api/")
+            ? { params: { slug: pathname.slice("/api/".length) }, route: dynamicRouteHandler }
+            : null,
+      });
+
+      const response = await handler(multipartPost("/api/upload"), null);
+
+      expect(await response.text()).toBe("hello");
+      expect(dispatchMatchedRouteHandler).toHaveBeenCalledOnce();
+      expect(handleProgressiveActionRequest).not.toHaveBeenCalled();
+    });
+
+    it.each(["afterFiles", "fallback"] as const)(
+      "skips them for a %s external rewrite",
+      async (phase) => {
+        const receivedBodies: string[] = [];
+        const server = createServer((req, res) => {
+          let body = "";
+          req.setEncoding("utf8");
+          req.on("data", (chunk: string) => (body += chunk));
+          req.on("end", () => {
+            receivedBodies.push(body);
+            res.writeHead(200, { "content-type": "text/plain" });
+            res.end("upstream");
+          });
+        });
+        await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+        const address = server.address() as AddressInfo;
+
+        try {
+          const { handleProgressiveActionRequest, handler } = createProgressiveHandler({
+            configRewrites: {
+              afterFiles: [],
+              beforeFiles: [],
+              fallback: [],
+              [phase]: [
+                {
+                  source: "/proxy-upload",
+                  destination: `http://127.0.0.1:${address.port}/upload`,
+                },
+              ],
+            },
+            matchRoute: () => null,
+          });
+
+          const response = await handler(multipartPost("/proxy-upload"), null);
+
+          expect(await response.text()).toBe("upstream");
+          expect(receivedBodies).toHaveLength(1);
+          expect(receivedBodies[0]).toContain('name="message"');
+          expect(receivedBodies[0]).toContain("hello");
+          expect(handleProgressiveActionRequest).not.toHaveBeenCalled();
+        } finally {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+      },
+    );
+
+    it("skips them when an afterFiles rewrite moves a dynamic page match to a route handler", async () => {
+      const { dispatchMatchedRouteHandler, handleProgressiveActionRequest, handler } =
+        createProgressiveHandler({
+          configRewrites: {
+            afterFiles: [{ source: "/upload-alias", destination: "/upload" }],
+            beforeFiles: [],
+            fallback: [],
+          },
+          matchRoute: (pathname) => {
+            if (pathname === "/upload") return { params: emptyParams, route: routeHandler };
+            return { params: { slug: pathname.slice(1) }, route: dynamicPage };
+          },
+        });
+
+      const response = await handler(multipartPost("/upload-alias"), null);
+
+      expect(await response.text()).toBe("route");
+      expect(dispatchMatchedRouteHandler).toHaveBeenCalledOnce();
+      expect(handleProgressiveActionRequest).not.toHaveBeenCalled();
+    });
+
+    it("skips them for a Pages route", async () => {
+      const { handleProgressiveActionRequest, handler } = createProgressiveHandler({
+        matchRoute: () => null,
+        renderPagesFallback: async () => new Response("pages", { status: 200 }),
+      });
+
+      const response = await handler(multipartPost("/pages-upload"), null);
+
+      expect(await response.text()).toBe("pages");
+      expect(handleProgressiveActionRequest).not.toHaveBeenCalled();
+    });
+
+    it("runs them against the page an afterFiles rewrite reaches", async () => {
+      const { dispatchMatchedPage, handleProgressiveActionRequest, handler } =
+        createProgressiveHandler({
+          configRewrites: {
+            afterFiles: [{ source: "/about-alias", destination: "/about" }],
+            beforeFiles: [],
+            fallback: [],
+          },
+          matchRoute: (pathname) =>
+            pathname === "/about" ? { params: emptyParams, route: aboutPage } : null,
+        });
+
+      const response = await handler(multipartPost("/about-alias"), null);
+
+      expect(await response.text()).toBe("page:/about");
+      expect(dispatchMatchedPage).toHaveBeenCalledOnce();
+      expect(handleProgressiveActionRequest).toHaveBeenCalledOnce();
+      expect(handleProgressiveActionRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cleanPathname: "/about",
+          routeMatch: { params: emptyParams, route: aboutPage },
+        }),
+      );
+    });
+
+    it("skips them when a Pages route outranks a dynamic page match", async () => {
+      const { dispatchMatchedPage, handleProgressiveActionRequest, handler } =
+        createProgressiveHandler({
+          matchRoute: (pathname) => ({ params: { slug: pathname.slice(1) }, route: dynamicPage }),
+          renderPagesFallback: async () => new Response("pages", { status: 200 }),
+        });
+
+      const response = await handler(multipartPost("/contact"), null);
+
+      expect(await response.text()).toBe("pages");
+      expect(dispatchMatchedPage).not.toHaveBeenCalled();
+      expect(handleProgressiveActionRequest).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["/blog/[slug]", false],
+      ["/blog/[slug]/", true],
+    ])(
+      "runs them on the literal path %s of a dynamic page and renders that page",
+      async (pathname, trailingSlash) => {
+        const blogPage = createPageRoute({
+          isDynamic: true,
+          params: ["slug"],
+          pattern: "/blog/:slug",
+          routeSegments: ["blog", "[slug]"],
+        });
+        const renderPagesFallback = vi.fn(async () => new Response("pages"));
+        const { dispatchMatchedRouteHandler, handleProgressiveActionRequest, handler } =
+          createProgressiveHandler({
+            configRewrites: {
+              afterFiles: [{ source: "/blog/:slug", destination: "/upload" }],
+              beforeFiles: [],
+              fallback: [],
+            },
+            matchRoute: (routePathname) => {
+              if (routePathname === "/upload") return { params: emptyParams, route: routeHandler };
+              return routePathname.startsWith("/blog/")
+                ? {
+                    params: { slug: routePathname.slice("/blog/".length).replace(/\/$/, "") },
+                    route: blogPage,
+                  }
+                : null;
+            },
+            renderPagesFallback,
+            trailingSlash,
+          });
+
+        const response = await handler(multipartPost(pathname), null);
+
+        expect(await response.text()).toBe("page:/blog/:slug");
+        expect(handleProgressiveActionRequest).toHaveBeenCalledWith(
+          expect.objectContaining({ routeMatch: { params: { slug: "[slug]" }, route: blogPage } }),
+        );
+        expect(dispatchMatchedRouteHandler).not.toHaveBeenCalled();
+        expect(renderPagesFallback).not.toHaveBeenCalled();
+      },
+    );
+
+    it("runs them with an empty action header on the page an afterFiles rewrite reaches", async () => {
+      const { handleProgressiveActionRequest, handler } = createProgressiveHandler({
+        configRewrites: {
+          afterFiles: [{ source: "/:slug", destination: "/about" }],
+          beforeFiles: [],
+          fallback: [],
+        },
+        matchRoute: (pathname) =>
+          pathname === "/about"
+            ? { params: emptyParams, route: aboutPage }
+            : { params: { slug: pathname.slice(1) }, route: dynamicPage },
+      });
+      const request = multipartPost("/hello");
+      request.headers.set("next-action", "");
+
+      const response = await handler(request, null);
+
+      expect(await response.text()).toBe(`page:${aboutPage.pattern}`);
+      expect(handleProgressiveActionRequest).toHaveBeenCalledWith(
+        expect.objectContaining({ routeMatch: { params: emptyParams, route: aboutPage } }),
+      );
+    });
+
+    it("runs them with the root params of the page an afterFiles rewrite reaches", async () => {
+      const localizedPage = createPageRoute({
+        isDynamic: true,
+        params: ["lang"],
+        pattern: "/:lang/contact",
+        rootParamNames: ["lang"],
+        routeSegments: ["[lang]", "contact"],
+      });
+      let observedRootParams: unknown = null;
+      const handleProgressiveActionRequest = vi.fn<
+        NonNullable<HandlerOptions["handleProgressiveActionRequest"]>
+      >(async () => {
+        const { getCurrentRootParams } =
+          await import("../packages/vinext/src/shims/root-params.js");
+        observedRootParams = getCurrentRootParams();
+        return null;
+      });
+      const { handler } = createProgressiveHandler({
+        configRewrites: {
+          afterFiles: [{ source: "/contact-alias", destination: "/en/contact" }],
+          beforeFiles: [],
+          fallback: [],
+        },
+        handleProgressiveActionRequest,
+        matchRoute: (pathname) =>
+          pathname === "/en/contact" ? { params: { lang: "en" }, route: localizedPage } : null,
+      });
+
+      await handler(multipartPost("/contact-alias"), null);
+
+      expect(handleProgressiveActionRequest).toHaveBeenCalledOnce();
+      expect(observedRootParams).toEqual({ lang: "en" });
+    });
+
+    it.each(["afterFiles", "fallback"] as const)(
+      "renders a failed action on the page that %s rewrites reach",
+      async (phase) => {
+        const actionError = new Error("action failed");
+        const rewrite = { source: "/about-alias", destination: "/about" };
+        const handleProgressiveActionRequest = vi.fn<
+          NonNullable<TestHandlerOptions["handleProgressiveActionRequest"]>
+        >(async () => ({
+          actionError,
+          actionFailed: true,
+          draftCookie: null,
+          formState: null,
+          kind: "form-state",
+          pendingCookies: [],
+          revalidationKind: 0,
+        }));
+        const { dispatchMatchedPage, handler } = createProgressiveHandler({
+          configRewrites: {
+            afterFiles: phase === "afterFiles" ? [rewrite] : [],
+            beforeFiles: [],
+            fallback: phase === "fallback" ? [rewrite] : [],
+          },
+          handleProgressiveActionRequest,
+          matchRoute: (pathname) =>
+            pathname === "/about" ? { params: emptyParams, route: aboutPage } : null,
+        });
+
+        await handler(multipartPost("/about-alias"), null);
+
+        expect(handleProgressiveActionRequest).toHaveBeenCalledWith(
+          expect.objectContaining({
+            cleanPathname: "/about",
+            routeMatch: { params: emptyParams, route: aboutPage },
+          }),
+        );
+        expect(dispatchMatchedPage).toHaveBeenCalledWith(
+          expect.objectContaining({
+            actionError,
+            actionFailed: true,
+            formState: null,
+            isProgressiveActionRender: true,
+            middlewareContext: expect.objectContaining({ status: 500 }),
+          }),
+        );
+      },
+    );
+
+    it("still runs them for an unmatched route", async () => {
+      const { handleProgressiveActionRequest, handler } = createProgressiveHandler({
+        matchRoute: () => null,
+      });
+
+      const response = await handler(multipartPost("/missing"), null);
+
+      expect(response.status).toBe(404);
+      expect(handleProgressiveActionRequest).toHaveBeenCalledOnce();
+      expect(handleProgressiveActionRequest).toHaveBeenCalledWith(
+        expect.objectContaining({ routeMatch: null }),
+      );
+    });
+  });
+
+  describe("server actions after late routing", () => {
+    const routeHandler = createPageRoute({
+      __loadPage: undefined,
+      __loadRouteHandler() {},
+      page: null,
+      pattern: "/upload",
+      routeHandler: { GET: () => new Response("route") },
+      routeSegments: ["upload"],
+    });
+    const aboutPage = createPageRoute();
+    const dynamicPage = createPageRoute({
+      isDynamic: true,
+      pattern: "/:slug",
+      routeSegments: ["[slug]"],
+    });
+    const emptyParams: Record<string, string | string[]> = {};
+    const actionPost = (pathname: string, origin = "https://example.test") =>
+      new Request(`${origin}/docs${pathname}`, {
+        method: "POST",
+        headers: { "content-type": "text/plain;charset=UTF-8", "next-action": "action-id" },
+        body: "[]",
+      });
+    const createActionHandler = (overrides: Partial<TestHandlerOptions>) => {
+      const handleServerActionRequest = vi.fn<
+        NonNullable<HandlerOptions["handleServerActionRequest"]>
+      >(async ({ routeMatch }) => new Response(`action:${routeMatch?.route.pattern ?? "none"}`));
+      const dispatchMatchedRouteHandler = vi.fn<DispatchMatchedRouteHandler>(
+        async ({ request }) => new Response(`route:${await request.text()}`, { status: 200 }),
+      );
+      const handler = createHandler({
+        configHeaders: [],
+        dispatchMatchedRouteHandler,
+        handleServerActionRequest,
+        ...overrides,
+      });
+      return { dispatchMatchedRouteHandler, handleServerActionRequest, handler };
+    };
+
+    it("leaves them to a statically matched route handler", async () => {
+      const { dispatchMatchedRouteHandler, handleServerActionRequest, handler } =
+        createActionHandler({
+          matchRoute: (pathname) =>
+            pathname === "/upload" ? { params: emptyParams, route: routeHandler } : null,
+        });
+
+      const response = await handler(actionPost("/upload"), null);
+
+      expect(await response.text()).toBe("route:[]");
+      expect(dispatchMatchedRouteHandler).toHaveBeenCalledOnce();
+      expect(handleServerActionRequest).not.toHaveBeenCalled();
+    });
+
+    it("leaves them to a route handler in a build without server actions", async () => {
+      const { handler } = createActionHandler({
+        handleServerActionRequest: undefined,
+        matchRoute: (pathname) =>
+          pathname === "/upload" ? { params: emptyParams, route: routeHandler } : null,
+      });
+
+      const response = await handler(actionPost("/upload"), null);
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("route:[]");
+    });
+
+    it("leaves them to an unrewritten dynamic route handler", async () => {
+      const dynamicRouteHandler = createPageRoute({
+        __loadPage: undefined,
+        __loadRouteHandler() {},
+        isDynamic: true,
+        page: null,
+        pattern: "/api/:slug",
+        routeHandler: { GET: () => new Response("route") },
+        routeSegments: ["api", "[slug]"],
+      });
+      const { dispatchMatchedRouteHandler, handleServerActionRequest, handler } =
+        createActionHandler({
+          matchRoute: (pathname) =>
+            pathname.startsWith("/api/")
+              ? { params: { slug: pathname.slice("/api/".length) }, route: dynamicRouteHandler }
+              : null,
+        });
+
+      const response = await handler(actionPost("/api/upload"), null);
+
+      expect(await response.text()).toBe("route:[]");
+      expect(dispatchMatchedRouteHandler).toHaveBeenCalledOnce();
+      expect(handleServerActionRequest).not.toHaveBeenCalled();
+    });
+
+    it.each(["afterFiles", "fallback"] as const)(
+      "leaves them to a route handler that %s rewrites reach",
+      async (phase) => {
+        const { dispatchMatchedRouteHandler, handleServerActionRequest, handler } =
+          createActionHandler({
+            configRewrites: {
+              afterFiles: [],
+              beforeFiles: [],
+              fallback: [],
+              [phase]: [{ source: "/upload-alias", destination: "/upload" }],
+            },
+            matchRoute: (pathname) =>
+              pathname === "/upload" ? { params: emptyParams, route: routeHandler } : null,
+          });
+
+        const response = await handler(actionPost("/upload-alias"), null);
+
+        expect(await response.text()).toBe("route:[]");
+        expect(dispatchMatchedRouteHandler).toHaveBeenCalledOnce();
+        expect(handleServerActionRequest).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(["afterFiles", "fallback"] as const)(
+      "proxies them through %s external rewrites",
+      async (phase) => {
+        const received: { action: string | undefined; body: string }[] = [];
+        const server = createServer((req, res) => {
+          let body = "";
+          req.setEncoding("utf8");
+          req.on("data", (chunk: string) => (body += chunk));
+          req.on("end", () => {
+            received.push({ action: req.headers["next-action"] as string | undefined, body });
+            res.writeHead(200, { "content-type": "text/plain" });
+            res.end("upstream");
+          });
+        });
+        await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+        const address = server.address() as AddressInfo;
+
+        try {
+          const { handleServerActionRequest, handler } = createActionHandler({
+            configRewrites: {
+              afterFiles: [],
+              beforeFiles: [],
+              fallback: [],
+              [phase]: [
+                { source: "/proxy", destination: `http://127.0.0.1:${address.port}/upload` },
+              ],
+            },
+            matchRoute: () => null,
+          });
+
+          const response = await handler(actionPost("/proxy"), null);
+
+          expect(await response.text()).toBe("upstream");
+          expect(received).toEqual([{ action: "action-id", body: "[]" }]);
+          expect(handleServerActionRequest).not.toHaveBeenCalled();
+        } finally {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+      },
+    );
+
+    it("leaves them to a Pages route", async () => {
+      const { handleServerActionRequest, handler } = createActionHandler({
+        matchRoute: () => null,
+        renderPagesFallback: async ({ request }) => new Response(`pages:${await request.text()}`),
+      });
+
+      const response = await handler(actionPost("/legacy"), null);
+
+      expect(await response.text()).toBe("pages:[]");
+      expect(handleServerActionRequest).not.toHaveBeenCalled();
+    });
+
+    it("leaves them to a Pages route that outranks a dynamic page match", async () => {
+      const { handleServerActionRequest, handler } = createActionHandler({
+        matchRoute: (pathname) => ({ params: { slug: pathname.slice(1) }, route: dynamicPage }),
+        renderPagesFallback: async () => new Response("pages"),
+      });
+
+      const response = await handler(actionPost("/legacy"), null);
+
+      expect(await response.text()).toBe("pages");
+      expect(handleServerActionRequest).not.toHaveBeenCalled();
+    });
+
+    it("runs them against the page an afterFiles rewrite moves a dynamic match to", async () => {
+      const { handleServerActionRequest, handler } = createActionHandler({
+        configRewrites: {
+          afterFiles: [{ source: "/about-alias", destination: "/about" }],
+          beforeFiles: [],
+          fallback: [],
+        },
+        matchRoute: (pathname) =>
+          pathname === "/about"
+            ? { params: emptyParams, route: aboutPage }
+            : { params: { slug: pathname.slice(1) }, route: dynamicPage },
+      });
+
+      const response = await handler(actionPost("/about-alias"), null);
+
+      expect(await response.text()).toBe("action:/about");
+      expect(handleServerActionRequest).toHaveBeenCalledOnce();
+      expect(handleServerActionRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cleanPathname: "/about",
+          routeMatch: { params: emptyParams, route: aboutPage },
+          routePathname: "/about",
+        }),
+      );
+    });
+
+    it.each(["afterFiles", "fallback"] as const)(
+      "runs them against the page that %s rewrites reach from an unmatched path",
+      async (phase) => {
+        const { handleServerActionRequest, handler } = createActionHandler({
+          configRewrites: {
+            afterFiles: [],
+            beforeFiles: [],
+            fallback: [],
+            [phase]: [{ source: "/about-alias", destination: "/about" }],
+          },
+          matchRoute: (pathname) =>
+            pathname === "/about" ? { params: emptyParams, route: aboutPage } : null,
+        });
+
+        const response = await handler(actionPost("/about-alias"), null);
+
+        expect(await response.text()).toBe("action:/about");
+        expect(handleServerActionRequest).toHaveBeenCalledWith(
+          expect.objectContaining({
+            cleanPathname: "/about",
+            routeMatch: { params: emptyParams, route: aboutPage },
+          }),
+        );
+      },
+    );
+
+    it("runs actions on the literal path of a dynamic owner before afterFiles rewrites", async () => {
+      const blogPage = createPageRoute({
+        isDynamic: true,
+        params: ["slug"],
+        pattern: "/blog/:slug",
+        routeSegments: ["blog", "[slug]"],
+      });
+      const { handler } = createActionHandler({
+        configRewrites: {
+          afterFiles: [{ source: "/blog/:slug", destination: "/about" }],
+          beforeFiles: [],
+          fallback: [],
+        },
+        matchRoute: (pathname) => {
+          if (pathname === "/about") return { params: emptyParams, route: aboutPage };
+          return pathname.startsWith("/blog/")
+            ? { params: { slug: pathname.slice("/blog/".length) }, route: blogPage }
+            : null;
+        },
+      });
+
+      const forwarded = await handler(actionPost("/blog/[slug]"), null);
+      const rewritten = await handler(actionPost("/blog/hello"), null);
+
+      expect(await forwarded.text()).toBe("action:/blog/:slug");
+      expect(await rewritten.text()).toBe("action:/about");
+    });
+
+    it("runs actions on the literal path of a dynamic owner before Pages routes", async () => {
+      const blogPage = createPageRoute({
+        isDynamic: true,
+        params: ["slug"],
+        pattern: "/blog/:slug",
+        routeSegments: ["blog", "[slug]"],
+      });
+      const renderPagesFallback = vi.fn(async () => new Response("pages"));
+      const { handler } = createActionHandler({
+        matchRoute: (pathname) =>
+          pathname.startsWith("/blog/")
+            ? { params: { slug: pathname.slice("/blog/".length) }, route: blogPage }
+            : null,
+        renderPagesFallback,
+      });
+
+      const forwarded = await handler(actionPost("/blog/[slug]"), null);
+      const direct = await handler(actionPost("/blog/hello"), null);
+
+      expect(await forwarded.text()).toBe("action:/blog/:slug");
+      expect(await direct.text()).toBe("pages");
+    });
+
+    it("runs actions on an encoded literal path of a dynamic owner", async () => {
+      const cafePage = createPageRoute({
+        isDynamic: true,
+        params: ["id"],
+        pattern: "/café/:id",
+        routeSegments: ["café", "[id]"],
+      });
+      const { handler } = createActionHandler({
+        configRewrites: {
+          afterFiles: [{ source: "/:segment/:id", destination: "/about" }],
+          beforeFiles: [],
+          fallback: [],
+        },
+        matchRoute: (pathname) => {
+          if (pathname === "/about") return { params: emptyParams, route: aboutPage };
+          return pathname.startsWith("/café/")
+            ? { params: { id: pathname.slice("/café/".length) }, route: cafePage }
+            : null;
+        },
+      });
+
+      // Forwarding builds the owner URL from its pattern, so the path arrives encoded.
+      const response = await handler(actionPost("/caf%C3%A9/[id]"), null);
+
+      expect(await response.text()).toBe("action:/café/:id");
+    });
+
+    it("runs actions on a literal owner path that a beforeFiles rewrite reaches", async () => {
+      const blogPage = createPageRoute({
+        isDynamic: true,
+        params: ["slug"],
+        pattern: "/blog/:slug",
+        routeSegments: ["blog", "[slug]"],
+      });
+      const { handler } = createActionHandler({
+        configRewrites: {
+          afterFiles: [{ source: "/blog/:slug", destination: "/about" }],
+          beforeFiles: [{ source: "/owner", destination: "/blog/[slug]" }],
+          fallback: [],
+        },
+        matchRoute: (pathname) => {
+          if (pathname === "/about") return { params: emptyParams, route: aboutPage };
+          return pathname.startsWith("/blog/")
+            ? { params: { slug: pathname.slice("/blog/".length) }, route: blogPage }
+            : null;
+        },
+      });
+
+      const response = await handler(actionPost("/owner"), null);
+
+      expect(await response.text()).toBe("action:/blog/:slug");
+    });
+
+    // Next.js serves any App file's literal path from its filesystem check,
+    // Route Handlers included. vinext doesn't for any method yet, so a crafted
+    // POST to a dynamic handler's literal path keeps the normal late routing,
+    // and the action never skips its checks on the page it reaches.
+    it("keeps late routing for the literal path of a dynamic route handler", async () => {
+      const dynamicRouteHandler = createPageRoute({
+        __loadPage: undefined,
+        __loadRouteHandler() {},
+        isDynamic: true,
+        page: null,
+        pattern: "/api/:slug",
+        routeHandler: { GET: () => new Response("route") },
+        routeSegments: ["api", "[slug]"],
+      });
+      const { dispatchMatchedRouteHandler, handler } = createActionHandler({
+        configRewrites: {
+          afterFiles: [{ source: "/api/:slug", destination: "/about" }],
+          beforeFiles: [],
+          fallback: [],
+        },
+        matchRoute: (pathname) => {
+          if (pathname === "/about") return { params: emptyParams, route: aboutPage };
+          return pathname.startsWith("/api/")
+            ? { params: { slug: pathname.slice("/api/".length) }, route: dynamicRouteHandler }
+            : null;
+        },
+      });
+
+      const response = await handler(actionPost("/api/[slug]"), null);
+
+      expect(await response.text()).toBe("action:/about");
+      expect(dispatchMatchedRouteHandler).not.toHaveBeenCalled();
+    });
+
+    it("runs them with the root params of the page an afterFiles rewrite reaches", async () => {
+      const localizedPage = createPageRoute({
+        isDynamic: true,
+        params: ["lang"],
+        pattern: "/:lang/contact",
+        rootParamNames: ["lang"],
+        routeSegments: ["[lang]", "contact"],
+      });
+      let observedRootParams: unknown = null;
+      const { handler } = createActionHandler({
+        configRewrites: {
+          afterFiles: [{ source: "/contact-alias", destination: "/en/contact" }],
+          beforeFiles: [],
+          fallback: [],
+        },
+        handleServerActionRequest: async () => {
+          const { getCurrentRootParams } =
+            await import("../packages/vinext/src/shims/root-params.js");
+          observedRootParams = getCurrentRootParams();
+          return new Response("action");
+        },
+        matchRoute: (pathname) =>
+          pathname === "/en/contact" ? { params: { lang: "en" }, route: localizedPage } : null,
+      });
+
+      await handler(actionPost("/contact-alias"), null);
+
+      expect(observedRootParams).toEqual({ lang: "en" });
+    });
+
+    it("answers a page match in a build without server actions with action-not-found", async () => {
+      const { handler } = createActionHandler({
+        configRewrites: {
+          afterFiles: [{ source: "/about-alias", destination: "/about" }],
+          beforeFiles: [],
+          fallback: [],
+        },
+        handleServerActionRequest: undefined,
+        matchRoute: (pathname) =>
+          pathname === "/about" ? { params: emptyParams, route: aboutPage } : null,
+      });
+
+      const response = await handler(actionPost("/about-alias"), null);
+
+      expect(response.status).toBe(404);
+      expect(response.headers.get("x-nextjs-action-not-found")).toBe("1");
+    });
+
+    it("still runs them for an unmatched route", async () => {
+      const { handleServerActionRequest, handler } = createActionHandler({
+        matchRoute: () => null,
+      });
+
+      const response = await handler(actionPost("/missing"), null);
+
+      expect(await response.text()).toBe("action:none");
+      expect(handleServerActionRequest).toHaveBeenCalledWith(
+        expect.objectContaining({ routeMatch: null }),
+      );
+    });
+
+    it("lets a Pages route claim an action before fallback rewrites", async () => {
+      const { handleServerActionRequest, handler } = createActionHandler({
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [{ source: "/alias", destination: "/api/upload" }],
+          fallback: [{ source: "/api/upload", destination: "/about" }],
+        },
+        renderPagesFallback: async (options) =>
+          (options.pathname ?? options.url.pathname) === "/api/upload"
+            ? new Response("pages-api")
+            : null,
+      });
+
+      const response = await handler(
+        new Request("https://example.test/docs/alias", {
+          method: "POST",
+          headers: { "content-type": "text/plain;charset=UTF-8", "next-action": "action-id" },
+          body: "[]",
+        }),
+        null,
+      );
+
+      expect(await response.text()).toBe("pages-api");
+      expect(handleServerActionRequest).not.toHaveBeenCalled();
+    });
+  });
+
   it("marks progressive action page renders even when decoded form state is null", async () => {
     const dispatchMatchedPage = vi.fn(async () => new Response("page", { status: 200 }));
     const handler = createHandler({
@@ -6522,7 +8314,7 @@ describe("createAppRscHandler", () => {
     );
   });
 
-  it("returns HTTP 500 for progressive action execution failures", async () => {
+  it("returns HTTP 500 for progressive actions that fail to find a Server Action", async () => {
     const dispatchMatchedPage = vi.fn(async ({ middlewareContext }) =>
       Promise.resolve(new Response("error page", { status: middlewareContext.status ?? 200 })),
     );
@@ -6533,7 +8325,7 @@ describe("createAppRscHandler", () => {
         return {
           kind: "form-state",
           formState: null,
-          actionError: new Error("boom"),
+          actionError: new Error(getServerActionNotFoundMessage(null)),
           actionFailed: true,
           pendingCookies: [],
           draftCookie: null,
@@ -7008,7 +8800,9 @@ describe("createAppRscHandler", () => {
     const handler = createHandler({
       configHeaders: [],
       configRewrites: {
-        beforeFiles: [{ source: "/outside", destination: "/about", basePath: false }],
+        beforeFiles: [
+          { source: "/outside", destination: "https://upstream.example/about", basePath: false },
+        ],
         afterFiles: [],
         fallback: [],
       },
@@ -7020,6 +8814,32 @@ describe("createAppRscHandler", () => {
     expect(response.status).toBe(308);
     expect(response.headers.get("location")).toBe("/outside/");
   });
+
+  // Ported from Next.js: test/e2e/skip-trailing-slash-redirect/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/skip-trailing-slash-redirect/index.test.ts
+  it.each([
+    { trailingSlash: false, pathname: "/docs/about/" },
+    { trailingSlash: true, pathname: "/docs/about" },
+  ])(
+    "serves $pathname without a redirect under skipTrailingSlashRedirect (trailingSlash: $trailingSlash)",
+    async ({ trailingSlash, pathname }) => {
+      const route = createPageRoute();
+      // The real route matcher tolerates either slash form.
+      const matchRoute = (pathname: string) =>
+        pathname.replace(/\/$/, "") === "/about" ? { params: {}, route } : null;
+      const handler = createHandler({
+        configHeaders: [],
+        matchRoute,
+        skipTrailingSlashRedirect: true,
+        trailingSlash,
+      });
+
+      const response = await handler(new Request(`https://example.test${pathname}`), null);
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("page");
+    },
+  );
 
   it("preserves raw encoded spelling when normalizing trailing slashes", async () => {
     const handler = createHandler({ configHeaders: [], trailingSlash: true });
@@ -7391,7 +9211,8 @@ describe("createAppRscHandler", () => {
   it("preserves the original request query on config redirects for document requests (#1529)", async () => {
     // A plain (non-RSC) document request that hits a config redirect must
     // carry its original query onto the Location, matching Next.js
-    // resolve-routes.ts. The destination's own query wins on key conflicts.
+    // resolve-routes.ts. The destination's own query wins on key conflicts,
+    // overriding the request value in its request position.
     const handler = createHandler({
       configHeaders: [],
       configRedirects: [{ source: "/old-about", destination: "/about?from=old", permanent: true }],
@@ -7403,7 +9224,7 @@ describe("createAppRscHandler", () => {
     );
 
     expect(response.status).toBe(308);
-    expect(response.headers.get("location")).toBe("/docs/about?from=old&foo=bar");
+    expect(response.headers.get("location")).toBe("/docs/about?foo=bar&from=old");
   });
 
   it("redirects invalid RSC cache-busting requests before middleware", async () => {
@@ -7573,7 +9394,7 @@ describe("createAppRscHandler", () => {
         if (mode === "forwarded") {
           headers.set(
             VINEXT_MW_CTX_HEADER,
-            JSON.stringify({
+            sealedForwardedContext({
               h: [
                 ["location", "/middleware-location"],
                 ["set-cookie", "session=forwarded"],
@@ -7642,7 +9463,7 @@ describe("createAppRscHandler", () => {
         if (mode === "forwarded") {
           headers.set(
             VINEXT_MW_CTX_HEADER,
-            JSON.stringify({
+            sealedForwardedContext({
               h: [
                 [
                   "x-middleware-override-headers",
@@ -7694,6 +9515,113 @@ describe("createAppRscHandler", () => {
     },
   );
 
+  it.each([
+    { phase: "beforeFiles", action: false },
+    { phase: "afterFiles", action: false },
+    { phase: "fallback", action: false },
+    { phase: "afterFiles", action: true },
+    { phase: "fallback", action: true },
+  ] as const)(
+    "forwards middleware's request header override to $phase external rewrite proxies (action: $action)",
+    async ({ phase, action }) => {
+      // Next.js applies the override to req.headers before any config rewrite
+      // runs, so credentials deleted by middleware never reach the proxy.
+      const receivedRequests: Array<{
+        body: string;
+        headers: import("node:http").IncomingHttpHeaders;
+        url: string;
+      }> = [];
+      const server = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => chunks.push(chunk));
+        req.on("end", () => {
+          receivedRequests.push({
+            body: Buffer.concat(chunks).toString("utf8"),
+            headers: req.headers,
+            url: req.url ?? "",
+          });
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.end("upstream");
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address() as AddressInfo;
+      // Server Actions resolve late rewrites early only outside the basePath.
+      const rewrite = {
+        source: "/outside",
+        destination: `http://127.0.0.1:${address.port}/proxy`,
+        ...(action ? { basePath: false as const } : {}),
+      };
+
+      try {
+        const headers = createRscRequestHeaders({ mountedSlotsHeader: "slot:modal:/" });
+        headers.set("authorization", "Bearer secret");
+        headers.set("cookie", "session=secret");
+        headers.set("x-kept", "kept");
+        if (action) {
+          headers.set("next-action", "action-id");
+          headers.set("content-type", "text/plain");
+        }
+        const requestUrl = await createRscRequestUrl(
+          action ? "/outside" : "/docs/outside",
+          headers,
+        );
+        const handler = createHandler({
+          configHeaders: [],
+          configRewrites: {
+            beforeFiles: phase === "beforeFiles" ? [rewrite] : [],
+            afterFiles: phase === "afterFiles" ? [rewrite] : [],
+            fallback: phase === "fallback" ? [rewrite] : [],
+          },
+          middlewareModule: {
+            default(request: NextRequest) {
+              const nextHeaders = new Headers(request.headers);
+              nextHeaders.delete("authorization");
+              nextHeaders.delete("cookie");
+              nextHeaders.set("x-from-middleware", "added");
+              return new Response(null, {
+                headers: {
+                  "x-middleware-next": "1",
+                  "x-middleware-override-headers": [...nextHeaders.keys()].join(","),
+                  ...Object.fromEntries(
+                    [...nextHeaders].map(([name, value]) => [
+                      `x-middleware-request-${name}`,
+                      value,
+                    ]),
+                  ),
+                },
+              });
+            },
+          },
+          matchRoute: () => null,
+        });
+
+        const response = await handler(
+          new Request(
+            `https://example.test${requestUrl}`,
+            action ? { body: "action-body", headers, method: "POST" } : { headers },
+          ),
+          null,
+        );
+
+        expect(response.status).toBe(200);
+        expect(receivedRequests).toHaveLength(1);
+        const [received] = receivedRequests;
+        expect(received.body).toBe(action ? "action-body" : "");
+        expect(received.headers.authorization).toBeUndefined();
+        expect(received.headers.cookie).toBeUndefined();
+        expect(received.headers["x-kept"]).toBe("kept");
+        expect(received.headers["x-from-middleware"]).toBe("added");
+        // Flight headers are not overridable, so the proxy still receives them.
+        expect(received.headers[RSC_HEADER.toLowerCase()]).toBe("1");
+        const forwardedUrl = new URL(`http://vinext.local${received.url}`);
+        expect(forwardedUrl.searchParams.has(VINEXT_RSC_CACHE_BUSTING_SEARCH_PARAM)).toBe(true);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    },
+  );
+
   it("applies basePath false rewrites before rejecting outside-basePath requests", async () => {
     // Ported from Next.js: test/e2e/app-dir/app-basepath/index.test.ts
     // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/app-basepath/index.test.ts
@@ -7735,7 +9663,13 @@ describe("createAppRscHandler", () => {
     const handler = createHandler({
       configHeaders: [],
       configRewrites: {
-        beforeFiles: [{ source: "/only-this-path", destination: "/about", basePath: false }],
+        beforeFiles: [
+          {
+            source: "/only-this-path",
+            destination: "https://upstream.example/about",
+            basePath: false,
+          },
+        ],
         afterFiles: [],
         fallback: [],
       },
@@ -7819,26 +9753,34 @@ describe("createAppRscHandler", () => {
     expect(renderNotFound).not.toHaveBeenCalled();
   });
 
-  it("allows query-only middleware rewrites to make outside-basePath routes eligible", async () => {
-    const dispatchMatchedPage = vi.fn(async () => new Response("page"));
-    const handler = createHandler({
-      configHeaders: [{ source: "/about", headers: [], basePath: false }],
-      dispatchMatchedPage,
-      middlewareModule: {
-        default: (request: Request) =>
-          new Response(null, {
-            headers: {
-              "x-middleware-rewrite": new URL("/about?from=middleware", request.url).toString(),
-            },
-          }),
-      },
-    });
+  // Like Next.js' resolve-routes, the rewrite destination's basePath decides
+  // whether an outside-basePath request reaches a route.
+  it.each([
+    { destination: "/docs/about?from=middleware", expectedStatus: 200 },
+    { destination: "/about?from=middleware", expectedStatus: 404 },
+  ])(
+    "makes outside-basePath routes eligible only for middleware rewrites to $destination under basePath",
+    async ({ destination, expectedStatus }) => {
+      const dispatchMatchedPage = vi.fn(async () => new Response("page"));
+      const handler = createHandler({
+        configHeaders: [{ source: "/about", headers: [], basePath: false }],
+        dispatchMatchedPage,
+        middlewareModule: {
+          default: (request: Request) =>
+            new Response(null, {
+              headers: {
+                "x-middleware-rewrite": new URL(destination, request.url).toString(),
+              },
+            }),
+        },
+      });
 
-    const response = await handler(new Request("https://example.test/about"), null);
+      const response = await handler(new Request("https://example.test/about"), null);
 
-    expect(response.status).toBe(200);
-    expect(dispatchMatchedPage).toHaveBeenCalled();
-  });
+      expect(response.status).toBe(expectedStatus);
+      expect(dispatchMatchedPage).toHaveBeenCalledTimes(expectedStatus === 200 ? 1 : 0);
+    },
+  );
 
   it("preserves Node route handler RSC URLs while hiding internal parsed params", async () => {
     // Ported from Next.js:
@@ -8818,7 +10760,7 @@ describe("createAppRscHandler", () => {
               headers: {
                 "set-cookie": "probe=1; Path=/",
                 "x-test-header": "middleware",
-                "x-middleware-rewrite": new URL("/about", request.url).toString(),
+                "x-middleware-rewrite": new URL("/docs/about", request.url).toString(),
               },
             });
           }
@@ -8874,7 +10816,9 @@ describe("createAppRscHandler", () => {
         default: (request: NextRequest) =>
           request.nextUrl.pathname === "/source"
             ? new Response(null, {
-                headers: { "x-middleware-rewrite": new URL("/protected", request.url).toString() },
+                headers: {
+                  "x-middleware-rewrite": new URL("/docs/protected", request.url).toString(),
+                },
               })
             : undefined,
       },
@@ -8917,7 +10861,7 @@ describe("createAppRscHandler", () => {
                 headers: {
                   "set-cookie": "probe=1; Path=/",
                   "x-test-header": "middleware",
-                  "x-middleware-rewrite": new URL("/app-only", request.url).toString(),
+                  "x-middleware-rewrite": new URL("/docs/app-only", request.url).toString(),
                 },
               })
             : undefined,
@@ -9278,6 +11222,34 @@ describe("createAppRscHandler", () => {
     expect(response.headers.get("vary")).toBeNull();
     expect(clearRequestContext).toHaveBeenCalledTimes(1);
     expect(matchRoute).not.toHaveBeenCalled();
+  });
+
+  it("serves public files by their normalized request pathname", async () => {
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [{ source: "/files/:name", destination: "/:name" }],
+        afterFiles: [],
+        fallback: [],
+      },
+      matchRoute: () => null,
+      publicFiles: new Set(
+        ["/members only/file.txt", "/hello copy.txt", "/C#-notes.txt"].map(publicFileRouteKey),
+      ),
+    });
+    const signalFor = async (path: string) => {
+      const response = await handler(new Request(`https://example.test/docs${path}`), null);
+      const signal = readStaticFileSignal(response);
+      return signal === null ? null : decodeURIComponent(signal);
+    };
+
+    expect(await signalFor("/members%20only/file.txt")).toBe("/members only/file.txt");
+    expect(await signalFor("/C%23-notes.txt")).toBe("/C%23-notes.txt");
+    // Rewrite destinations are still URL-encoded when public files are checked.
+    expect(await signalFor("/files/hello%20copy.txt")).toBe("/hello copy.txt");
+    // Middleware matchers see this alias as /members%20only/file.txt, so it
+    // must not reach public/members only/file.txt.
+    expect(await signalFor("/members%2520only/file.txt")).toBeNull();
   });
 
   it.each([

@@ -12,10 +12,11 @@ import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
-import { createServer, build, type ViteDevServer } from "vite";
+import { createServer, build, type PluginOption, type ViteDevServer } from "vite";
 import vinext from "../packages/vinext/src/index.js";
 import path from "node:path";
 import type { NextConfigInput } from "../packages/vinext/src/config/next-config.js";
+import type { VinextCacheConfig } from "../packages/vinext/src/cache/cache-adapters-virtual.js";
 import { afterAll, expect } from "vite-plus/test";
 
 // ── Fixture paths ─────────────────────────────────────────────
@@ -81,6 +82,7 @@ export type TestServerResult = {
  * detected, so callers do NOT need to inject rsc() manually.
  *
  * @param fixtureDir - Path to the fixture directory
+ * @param opts.cache - The vinext() `cache` option, for declarative cache adapters
  * @param opts.listen - If false, creates server without listening (default: true)
  */
 export async function startFixtureServer(
@@ -88,7 +90,11 @@ export async function startFixtureServer(
   opts?: {
     appDir?: string | null;
     appRouter?: boolean;
+    /** The vinext() `cache` option (declarative cache adapters). */
+    cache?: VinextCacheConfig;
     listen?: boolean;
+    /** Plugins listed ahead of vinext() in the plugins array. */
+    prependPlugins?: PluginOption[];
     publicDir?: string | false;
     resolve?: { preserveSymlinks?: boolean };
     server?: {
@@ -108,14 +114,14 @@ export async function startFixtureServer(
     const previousCwd = process.cwd();
     try {
       process.chdir(fixtureDir);
-      plugin = vinext();
+      plugin = vinext({ cache: opts?.cache });
     } finally {
       process.chdir(previousCwd);
     }
   } else {
-    plugin = vinext({ appDir: opts?.appDir ?? fixtureDir });
+    plugin = vinext({ appDir: opts?.appDir ?? fixtureDir, cache: opts?.cache });
   }
-  const plugins = [plugin];
+  const plugins = [...(opts?.prependPlugins ?? []), plugin];
 
   const server = await createServer({
     root: fixtureDir,
@@ -282,7 +288,8 @@ export async function requestNodeServerWithHost(
 /**
  * Raw request targets and what `next start` (Next.js 16.2.7) answers for
  * them: literal repeated slashes and backslashes get a 308 to the collapsed
- * path, percent-encoded leading delimiters stay a 404.
+ * path, percent-encoded leading delimiters stay a 404. Absolute-form targets
+ * get vinext's deliberate 404 where Next.js would echo a cross-origin Location.
  */
 const REPEATED_SLASH_CASES: ReadonlyArray<readonly [string, string | 404]> = [
   ["//", "/"],
@@ -299,6 +306,12 @@ const REPEATED_SLASH_CASES: ReadonlyArray<readonly [string, string | 404]> = [
   ["/%2F/evil.com", 404],
   ["/%5C%5Cevil.com", 404],
   ["/.//%2Fevil.com", 404],
+  // Absolute-form targets: Next.js 308s to the target's own URL (another
+  // origin) without routing it. vinext never routes them either, but answers
+  // 404 rather than echoing a cross-origin Location.
+  ["http://evil.example/", 404],
+  ["http://evil.example/about", 404],
+  ["https://evil.example//evil.com?a=1", 404],
 ];
 
 /**
