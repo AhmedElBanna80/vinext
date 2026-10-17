@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "pathslash";
 import { toClientRewrites, type ClientRewrites } from "../client/client-rewrites.js";
 import type { ResolvedNextConfig } from "../config/next-config.js";
+import type { ValidFileMatcher } from "../routing/file-matcher.js";
 import { getSortedRoutes } from "../routing/route-validation.js";
 
 type ClientRuntimeBuildManifest = {
@@ -14,23 +15,36 @@ type EmitNextClientRuntimeManifestsOptions = {
   assetsSubdir: string;
   buildId: string;
   rewrites: ResolvedNextConfig["rewrites"];
-  /** The app's Pages Router routes (pages/ and pages/api), in Next.js format. */
+  /** Next.js-format paths of every `pages/` page and API route, e.g. "/posts/[id]". */
   pages: readonly string[];
 };
 
 /**
- * Next.js always builds an `_app` and an `_error` entry (its defaults when the
- * app has none) and lists both in `sortedPages`.
+ * Next.js page key for a `pages/` file, e.g. "/posts/[id]". Keeps the raw file
+ * name (no decoding), so `pages/caf%C3%A9.js` stays "/caf%C3%A9".
+ * Ported from Next.js: packages/next/src/build/route-discovery.ts (`getPageFromPath`).
  */
-const GLOBAL_PAGES = ["/_app", "/_error"];
+export function getPagesManifestPage(
+  pagesDir: string,
+  filePath: string,
+  matcher: Pick<ValidFileMatcher, "stripExtension">,
+): string {
+  const page = `/${matcher.stripExtension(path.relative(pagesDir, filePath))}`;
+  const withoutIndex = page.endsWith("/index") ? page.slice(0, -"/index".length) : page;
+  return withoutIndex === "" ? "/" : withoutIndex;
+}
 
 export function buildNextClientBuildManifestContent(
   rewrites: ResolvedNextConfig["rewrites"],
   pages: readonly string[],
 ): string {
+  // Next.js always lists `/_app` and `/_error` alongside the `pages/` routes
+  // (including API routes under Turbopack), even for App Router-only builds.
+  // Ported from Next.js: packages/next/src/shared/lib/turbopack/manifest-loader.ts
+  // (`writeClientBuildManifest`).
   const manifest: ClientRuntimeBuildManifest = {
     __rewrites: toClientRewrites(rewrites),
-    sortedPages: getSortedRoutes([...pages, ...GLOBAL_PAGES]),
+    sortedPages: getSortedRoutes([...pages, "/_app", "/_error"]),
   };
   return `self.__BUILD_MANIFEST = ${JSON.stringify(manifest)};self.__BUILD_MANIFEST_CB && self.__BUILD_MANIFEST_CB()`;
 }

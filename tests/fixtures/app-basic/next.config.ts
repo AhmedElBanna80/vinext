@@ -2,7 +2,7 @@
  * Next.js config for the app-basic test fixture.
  *
  * This config serves both Vitest integration tests (app-router.test.ts)
- * and Playwright E2E tests (ON-12, ON-13, ON-15).
+ * and Playwright E2E tests (config-redirect.spec.ts, routing-misc.spec.ts).
  *
  * IMPORTANT: The Vitest test previously wrote a temporary next.config.mjs.
  * Since next.config.ts takes priority over .mjs, this file must include
@@ -25,6 +25,11 @@ const nextConfig: NextConfig = {
   experimental: {
     gestureTransition: true,
   },
+
+  // Used by Vitest: app-router-production-server.test.ts — a next/dynamic()
+  // call site inside this package only gets preload metadata when the package
+  // is transpiled, matching Turbopack's foreign-code rule.
+  transpilePackages: ["fake-css-module-lib"],
 
   // Default is false — trailing slashes are stripped (redirects /about/ → /about)
   // trailingSlash: false,
@@ -90,6 +95,21 @@ const nextConfig: NextConfig = {
         destination: "/about",
         permanent: false,
       },
+      // Used by E2E: config-redirect.spec.ts — source params substituted into
+      // a redirect destination query.
+      {
+        source: "/query-param-redirect/:next",
+        destination: "/about?next=/:next&safe=1",
+        permanent: false,
+      },
+      // Used by E2E: config-redirect.spec.ts — a decoded query capture at the
+      // start of a local destination must not become protocol-relative.
+      {
+        source: "/query-capture-redirect",
+        destination: "/:to",
+        permanent: false,
+        has: [{ type: "query", key: "to", value: "(?<to>.*)" }],
+      },
       // Ported from Next.js v16.2.6:
       // test/e2e/app-dir/rsc-query-routing/next.config.js
       {
@@ -103,6 +123,18 @@ const nextConfig: NextConfig = {
   async rewrites() {
     return {
       beforeFiles: [
+        // Used by E2E: app-router-prod/image-middleware.spec.ts — a config
+        // rewrite to the image endpoint serves the destination's query.
+        {
+          source: "/config-image-rewrite",
+          destination: "/_next/image?url=%2Fheart.png&w=640&q=75",
+        },
+        // Used by E2E: config-redirect.spec.ts — a source param substituted
+        // into a destination query value must stay one value.
+        {
+          source: "/query-param-rewrite/:term",
+          destination: "/nextjs-compat/search-params-key?q=:term&fixed=1",
+        },
         {
           source: "/route-cache-choice",
           destination: "/route-cache-identity/about",
@@ -125,12 +157,42 @@ const nextConfig: NextConfig = {
             : "/encoded-parity/rewrite/:path*",
           destination: "/encoded-parity/page/:path*",
         },
+        // Used by E2E: app-router-encoded-basepath-i18n — every rewrite phase
+        // serializes a literal non-ASCII destination like Next.js, but keeps a
+        // substituted `..` capture verbatim instead of resolving it.
+        {
+          source: process.env.VINEXT_ENCODED_PATH_BASEPATH_I18N
+            ? "/en/encoded-parity-pages/before"
+            : "/encoded-parity-pages/before",
+          destination: "/encoded-parity-café",
+        },
+        {
+          source: process.env.VINEXT_ENCODED_PATH_BASEPATH_I18N
+            ? "/en/encoded-parity-pages/before-dynamic"
+            : "/encoded-parity-pages/before-dynamic",
+          destination: "/pages-to-app/café",
+        },
+        {
+          source: process.env.VINEXT_ENCODED_PATH_BASEPATH_I18N
+            ? "/en/encoded-parity-pages/before-capture"
+            : "/encoded-parity-pages/before-capture",
+          has: [{ type: "query", key: "n", value: "(?<n>.*)" }],
+          destination: "/pages-to-app/:n",
+        },
         // Used by Vitest: app-router.test.ts
         {
           source: process.env.VINEXT_ENCODED_PATH_BASEPATH_I18N
             ? "/en/rewrite-about"
             : "/rewrite-about",
           destination: "/about",
+        },
+        // Used by E2E: external-rewrite-host-capture.spec.ts. A request-controlled
+        // capture in an external destination host must not be able to
+        // retarget the proxy.
+        {
+          source: "/proxy-external-host-capture",
+          has: [{ type: "query", key: "host", value: "(?<proxyHost>.*)" }],
+          destination: "http://:proxyHost.invalid/host-capture",
         },
         // Used by Vitest: app-router.test.ts — repeated param substitution
         {
@@ -185,8 +247,32 @@ const nextConfig: NextConfig = {
         },
       ],
       afterFiles: [
+        // Used by E2E: app-router-encoded-basepath-i18n (see beforeFiles).
+        {
+          source: process.env.VINEXT_ENCODED_PATH_BASEPATH_I18N
+            ? "/en/encoded-parity-pages/after"
+            : "/encoded-parity-pages/after",
+          destination: "/encoded-parity-café",
+        },
+        {
+          source: process.env.VINEXT_ENCODED_PATH_BASEPATH_I18N
+            ? "/en/encoded-parity-pages/after-dynamic"
+            : "/encoded-parity-pages/after-dynamic",
+          destination: "/pages-to-app/café",
+        },
+        {
+          source: process.env.VINEXT_ENCODED_PATH_BASEPATH_I18N
+            ? "/en/encoded-parity-pages/after-capture"
+            : "/encoded-parity-pages/after-capture",
+          has: [{ type: "query", key: "n", value: "(?<n>.*)" }],
+          destination: "/pages-to-app/:n",
+        },
         // Used by Vitest: app-router.test.ts
         { source: "/after-rewrite-about", destination: "/about" },
+        // Used by E2E: app-router-prod/multipart-late-routing.spec.ts
+        { source: "/after-files-upload", destination: "/api/methods" },
+        // Used by E2E: app-router-prod/server-action-late-routing.spec.ts
+        { source: "/after-files-revalidate", destination: "/nextjs-compat/action-revalidate" },
         // Ported from Next.js: test/e2e/app-dir/revalidate-path-with-rewrites/next.config.js
         // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/revalidate-path-with-rewrites/next.config.js
         {
@@ -221,6 +307,30 @@ const nextConfig: NextConfig = {
         },
       ],
       fallback: [
+        // Used by E2E: app-router-prod/multipart-late-routing.spec.ts
+        { source: "/fallback-upload", destination: "/api/methods" },
+        // Used by E2E: app-router-prod/server-action-late-routing.spec.ts
+        { source: "/fallback-revalidate", destination: "/nextjs-compat/action-revalidate" },
+        // Used by E2E: app-router-encoded-basepath-i18n (see beforeFiles).
+        {
+          source: process.env.VINEXT_ENCODED_PATH_BASEPATH_I18N
+            ? "/en/encoded-parity-pages/fallback"
+            : "/encoded-parity-pages/fallback",
+          destination: "/encoded-parity-café",
+        },
+        {
+          source: process.env.VINEXT_ENCODED_PATH_BASEPATH_I18N
+            ? "/en/encoded-parity-pages/fallback-dynamic"
+            : "/encoded-parity-pages/fallback-dynamic",
+          destination: "/pages-to-app/café",
+        },
+        {
+          source: process.env.VINEXT_ENCODED_PATH_BASEPATH_I18N
+            ? "/en/encoded-parity-pages/fallback-capture"
+            : "/encoded-parity-pages/fallback-capture",
+          has: [{ type: "query", key: "n", value: "(?<n>.*)" }],
+          destination: "/pages-to-app/:n",
+        },
         // Used by Vitest: app-router.test.ts — fallback rewrite gated on a
         // cookie injected by middleware. Fallback runs after middleware and
         // after a 404 from route matching, so it should see middleware-injected
@@ -308,7 +418,7 @@ const nextConfig: NextConfig = {
         source: "/(.*)",
         headers: [{ key: "X-E2E-Header", value: "vinext-e2e" }],
       },
-      // Used by E2E: config-redirect.spec.ts — middleware header override test (ON-8 #2)
+      // Used by E2E: config-redirect.spec.ts — middleware header override test
       // Middleware sets e2e-headers=middleware; this config rule sets e2e-headers=next.config.js.
       // Middleware always wins (matching Next.js behavior), so middleware's value takes precedence.
       {

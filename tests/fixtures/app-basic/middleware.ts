@@ -7,7 +7,7 @@ import { REQUEST_SIGNAL_OVERRIDE_HEADER } from "./lib/request-signal-probe";
  * App Router middleware that uses NextRequest-specific APIs.
  * This tests that the middleware receives a NextRequest (not a plain Request).
  *
- * Also covers OpenNext compat tests (ON-11):
+ * Also covers OpenNext compat tests:
  * - Redirect with cookie setting
  * - Rewrite (URL stays, content from another page)
  * - Rewrite with custom status code
@@ -31,6 +31,39 @@ export async function middleware(request: NextRequest, event: NextFetchEvent) {
       status: 403,
       headers: { "content-type": "text/plain" },
     });
+  }
+
+  // Matched by the decoded-form `/members only/:path*` source below.
+  // A `members=1` cookie admits direct requests; the image optimizer fetches
+  // its source without the caller's cookies, as Next.js does.
+  if (pathname.startsWith("/members%20only/") && request.cookies.get("members")?.value !== "1") {
+    return new Response("blocked by middleware", {
+      status: 403,
+      headers: { "content-type": "text/plain" },
+    });
+  }
+
+  if (pathname === "/middleware-image-rewrite") {
+    return NextResponse.rewrite(new URL("/_next/image?url=%2Fheart.png&w=640&q=75", request.url));
+  }
+
+  // The image endpoint passes through middleware before it reads a source.
+  if (pathname === "/_next/image" || pathname === "/_vinext/image") {
+    const source = request.nextUrl.searchParams.get("url");
+    if (source === "/image-endpoint-guarded.png") {
+      return new Response("image endpoint blocked by middleware", {
+        status: 403,
+        headers: { "content-type": "text/plain" },
+      });
+    }
+    if (source === "/image-endpoint-replaced.png") {
+      const target = request.nextUrl.clone();
+      target.searchParams.set("url", "/heart.png");
+      return NextResponse.rewrite(target);
+    }
+    const response = NextResponse.next();
+    response.headers.set("x-mw-image-endpoint", "true");
+    return response;
   }
 
   if (pathname === "/static-file-header-collision.txt") {
@@ -65,8 +98,27 @@ export async function middleware(request: NextRequest, event: NextFetchEvent) {
     });
   }
 
+  // `nextUrl` keeps the basePath, which a rewrite destination needs to
+  // resolve when the fixture is built with one.
   if (pathname === "/%61dmin") {
-    return NextResponse.rewrite(new URL("/admin", request.url));
+    const target = request.nextUrl.clone();
+    target.pathname = "/admin";
+    return NextResponse.rewrite(target);
+  }
+
+  // Without a basePath, these unprefixed destinations resolve. Behind one,
+  // they resolve nothing, as in Next.js.
+  if (pathname === "/middleware-rewrite-unprefixed/page") {
+    return NextResponse.rewrite(new URL("/about", request.url));
+  }
+  if (pathname === "/middleware-rewrite-unprefixed/file") {
+    return NextResponse.rewrite(new URL("/heart.png", request.url));
+  }
+  if (pathname === "/middleware-rewrite-unprefixed/control") {
+    // nextUrl keeps the basePath, so this destination resolves either way.
+    const target = request.nextUrl.clone();
+    target.pathname = "/about";
+    return NextResponse.rewrite(target);
   }
 
   if (pathname.startsWith("/encoded-parity/middleware/")) {
@@ -121,6 +173,17 @@ export async function middleware(request: NextRequest, event: NextFetchEvent) {
     response.headers.set("x-mw-has-session", "true");
   }
 
+  // Sliding-session refresh: re-issue the session cookie with a renewed
+  // expiry. The route handler's logout/rotation cookie must still win.
+  if (pathname === "/api/session-refresh" && sessionToken) {
+    response.cookies.set("session", sessionToken.value, {
+      path: "/",
+      httpOnly: true,
+      maxAge: 600,
+    });
+    return response;
+  }
+
   // Redirect /middleware-redirect to /about (with cookie, like OpenNext)
   // Ref: opennextjs-cloudflare middleware.ts — redirect with set-cookie header
   // Same-origin redirect to a double-slash path. vinext must keep the
@@ -138,7 +201,9 @@ export async function middleware(request: NextRequest, event: NextFetchEvent) {
   // Rewrite /middleware-rewrite to render / content (URL stays the same)
   // Ref: opennextjs-cloudflare middleware.ts — NextResponse.rewrite
   if (pathname === "/middleware-rewrite") {
-    return NextResponse.rewrite(new URL("/", request.url));
+    const target = request.nextUrl.clone();
+    target.pathname = "/";
+    return NextResponse.rewrite(target);
   }
 
   // Used by Vitest: nextjs-compat/hooks.test.ts — verifies usePathname()
@@ -475,9 +540,14 @@ export const config = {
     "/middleware-rewrite-query",
     "/middleware-rewrite-keep-original-query",
     "/middleware-rewrite-status",
+    "/middleware-rewrite-unprefixed/:path*",
     "/middleware-blocked",
     "/internal-header-secret.txt",
     "/static-file-header-collision.txt",
+    "/members only/:path*",
+    "/_next/image",
+    "/_vinext/image",
+    "/middleware-image-rewrite",
     "/admin",
     "/%61dmin",
     "/encoded-parity/middleware/:path*",
@@ -488,6 +558,7 @@ export const config = {
     "/headers/override-from-middleware",
     "/header-override-delete",
     "/api/header-override-delete",
+    "/api/session-refresh",
     "/api/header-override-stray",
     "/api/pages-og",
     "/api/pages-fallback-to-app/:path*",

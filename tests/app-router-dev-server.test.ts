@@ -94,6 +94,37 @@ describe("App Router integration", () => {
     await server?.close();
   });
 
+  it.each(["file", "blob", "bytes", "captured-file", "captured-rich"])(
+    "uses the Flight cache codec for %s arguments in dev",
+    async (kind) => {
+      const response = await fetch(
+        `${baseUrl}/api/use-cache-arguments?${new URLSearchParams({ kind, text: "private", time: "111" })}`,
+      );
+      expect(response.status).toBe(200);
+      const result = await response.json();
+      if (kind === "bytes") {
+        expect(result.value).toEqual({
+          type: "Uint8Array",
+          offset: 0,
+          bytes: [...new TextEncoder().encode("private")],
+        });
+      } else if (kind === "captured-rich") {
+        expect(result.value).toMatchObject({
+          file: { name: "private.txt", lastModified: 111, text: "private" },
+          child: "captured child",
+          token: "Symbol(vinext:captured-token)",
+        });
+      } else {
+        expect(result.value).toMatchObject({
+          name: kind === "blob" ? "blob" : "private.txt",
+          // Native FormData gives a Blob's File wrapper the current time.
+          lastModified: kind === "blob" ? expect.any(Number) : 111,
+          text: "private",
+        });
+      }
+    },
+  );
+
   // Next.js 308s any raw path containing a backslash or a repeated slash to
   // the collapsed path (base-server.ts / resolve-routes.ts).
   it("redirects repeated slashes and backslashes like Next.js", async () => {
@@ -108,6 +139,28 @@ describe("App Router integration", () => {
     expect(res.headers.get("location")).toBe("/");
   });
 
+  it("never redirects the image endpoint off-site for a source that resolves to //", async () => {
+    for (const source of [
+      "/a/..//evil.com",
+      "/..//evil.com",
+      "/a/%2e%2e//evil.com",
+      "/a/..\\/evil.com",
+    ]) {
+      const res = await fetch(
+        `${baseUrl}/_next/image?url=${encodeURIComponent(source)}&w=640&q=75`,
+        { redirect: "manual" },
+      );
+      expect(res.status, source).toBe(400);
+      expect(res.headers.get("location"), source).toBeNull();
+    }
+    // A dot segment that stays on a single-slash path is still served.
+    const res = await fetch(`${baseUrl}/_next/image?url=%2Fa%2F..%2Fheart.png&w=640&q=75`, {
+      redirect: "manual",
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/heart.png");
+  });
+
   it("renders the home page with root layout", async () => {
     const { res, html } = await fetchHtml(baseUrl, "/");
     expect(res.status).toBe(200);
@@ -115,6 +168,13 @@ describe("App Router integration", () => {
     expect(html).toContain("<html");
     expect(html).toContain("Welcome to App Router");
     expect(html).toContain("Server Component");
+  });
+
+  it("preserves a parallel slot named like the page cache marker in a cached layout", async () => {
+    const { res, html } = await fetchHtml(baseUrl, "/use-cache-slot-markers");
+    expect(res.status).toBe(200);
+    expect(html).toContain("<p>page marker slot content</p>");
+    expect(html).toContain("<p>cached layout with marker-named slots</p>");
   });
 
   it("loads the current source App Router request handler in source-checkout tests", async () => {
@@ -1061,6 +1121,31 @@ describe("App Router integration", () => {
     expect(deleteCookie).toContain("Expires=");
   });
 
+  // Next.js writes middleware response headers before the handler runs and
+  // appends the handler's Set-Cookie afterwards, so the browser keeps the
+  // handler's cookie when middleware refreshes the same one.
+  it.each([
+    { method: "POST", status: 200, session: /^session=; / },
+    { method: "PUT", status: 200, session: /^session=rotated; / },
+    { method: "DELETE", status: 307, session: /^session=; / },
+  ])(
+    "orders a route handler's $method cookie after middleware's refresh of it",
+    async ({ method, status, session }) => {
+      const res = await fetch(`${baseUrl}/api/session-refresh`, {
+        method,
+        headers: { cookie: "session=old" },
+        redirect: "manual",
+      });
+      expect(res.status).toBe(status);
+      const sessionCookies = res.headers
+        .getSetCookie()
+        .filter((cookie: string) => cookie.startsWith("session="));
+      expect(sessionCookies).toHaveLength(2);
+      expect(sessionCookies[0]).toMatch(/^session=old; .*Max-Age=600/);
+      expect(sessionCookies[1]).toMatch(session);
+    },
+  );
+
   it("renders custom not-found.tsx for unmatched routes", async () => {
     const res = await fetch(`${baseUrl}/does-not-exist`);
     expect(res.status).toBe(404);
@@ -1908,6 +1993,28 @@ describe("App Router integration", () => {
     expect(unknown.status).toBe(404);
   });
 
+  it("does not enumerate nested generateStaticParams under parent params the request rules out", async () => {
+    const takeCalls = async () =>
+      (await fetch(`${baseUrl}/layout-segment-config/nested-gsp-calls`)).json();
+    await takeCalls();
+
+    // The layout lists three categories. A child listing runs only for the
+    // one that matches the request, not once per listed category.
+    const known = await fetch(`${baseUrl}/layout-segment-config/nested-gsp/guides/start`);
+    expect(known.status).toBe(200);
+    expect(await takeCalls()).toEqual({ layout: 1, page: ["guides"] });
+
+    const unknownChild = await fetch(`${baseUrl}/layout-segment-config/nested-gsp/guides/missing`);
+    expect(unknownChild.status).toBe(404);
+    expect(await takeCalls()).toEqual({ layout: 1, page: ["guides"] });
+
+    // With no matching category, a single child listing still runs, so a
+    // generator that rewrites its parent's params keeps Next's merge result.
+    const unknownParent = await fetch(`${baseUrl}/layout-segment-config/nested-gsp/missing/x`);
+    expect(unknownParent.status).toBe(404);
+    expect(await takeCalls()).toEqual({ layout: 1, page: ["docs"] });
+  });
+
   it("keeps implicit dynamicParams enabled under a dynamic = 'error' layout", async () => {
     const known = await fetch(`${baseUrl}/layout-segment-config/dynamic-error/known`);
     expect(known.status).toBe(200);
@@ -1933,6 +2040,30 @@ describe("App Router integration", () => {
 
     const unknown = await fetch(`${baseUrl}/layout-segment-config/dynamic-error-false/unknown`);
     expect(unknown.status).toBe(404);
+  });
+
+  // https://github.com/cloudflare/vinext/issues/3919
+  it("completes a dynamic = 'error' page whose server component imports CSS", async () => {
+    // The RSC plugin wraps a CSS-importing page so its props, searchParams
+    // included, go through React's dev-only debug serialization. The headers
+    // arrive either way; only the body hung, so time the body alone.
+    const readBody = (res: Response) =>
+      Promise.race([
+        res.text(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("response body did not finish")), 15_000),
+        ),
+      ]);
+    const pathname = "/nextjs-compat/dynamic-error-css-module";
+    const res = await fetch(`${baseUrl}${pathname}`);
+    expect(res.status).toBe(200);
+    const html = await readBody(res);
+    expect(html).toContain('data-testid="dynamic-error-css-module"');
+    expect(html).toContain("</html>");
+
+    const rsc = await fetch(`${baseUrl}${pathname}.rsc`, { headers: { RSC: "1" } });
+    expect(rsc.status).toBe(200);
+    expect(await readBody(rsc)).toContain('"data-testid":"dynamic-error-css-module"');
   });
 
   it("applies dynamic = 'error' as only-cache fetch policy", async () => {
@@ -2203,22 +2334,63 @@ describe("App Router integration", () => {
     expect(defaultVictim.status).toBe(200);
     expect(await defaultVictim.text()).toContain("VICTIM_DEFAULT_PRIVATE_RECORD");
 
-    for (const [exportName, secret] of [
-      ["readRecord", "VICTIM_PRIVATE_RECORD"],
-      ["default", "VICTIM_DEFAULT_PRIVATE_RECORD"],
+    const inlineVictim = await fetch(
+      `${baseUrl}/use-cache-hidden-reference?record=victim&source=inline`,
+      { headers: { Authorization: "Bearer fixture-victim-session" } },
+    );
+    expect(inlineVictim.status).toBe(200);
+    expect(await inlineVictim.text()).toContain("VICTIM_INLINE_PRIVATE_RECORD");
+
+    // Dev ids are module paths, so the source export names and the hoisted
+    // name plugin-rsc gives an inline helper are all derivable.
+    for (const [actionId, secret] of [
+      ["/app/use-cache-hidden-reference/records.ts#readRecord", "VICTIM_PRIVATE_RECORD"],
+      ["/app/use-cache-hidden-reference/records.ts#default", "VICTIM_DEFAULT_PRIVATE_RECORD"],
+      [
+        "/app/use-cache-hidden-reference/inline-records.ts#readInlineRecord",
+        "VICTIM_INLINE_PRIVATE_RECORD",
+      ],
+      [
+        "/app/use-cache-hidden-reference/inline-records.ts#$$hoist_0_readInlineRecord",
+        "VICTIM_INLINE_PRIVATE_RECORD",
+      ],
     ] as const) {
-      const exploit = await fetch(`${baseUrl}/use-cache-hidden-reference.rsc`, {
+      const fetchAction = await fetch(`${baseUrl}/use-cache-hidden-reference`, {
         method: "POST",
-        headers: {
-          "Content-Type": "text/plain",
-          "x-rsc-action": `/app/use-cache-hidden-reference/records.ts#${exportName}`,
-        },
+        headers: { "Content-Type": "text/plain;charset=UTF-8", "Next-Action": actionId },
         body: JSON.stringify(["victim"]),
       });
+      expect(fetchAction.status).toBe(404);
+      expect(fetchAction.headers.get("x-nextjs-action-not-found")).toBe("1");
+      expect(await fetchAction.text()).not.toContain(secret);
 
-      expect(exploit.status).toBe(404);
-      expect(exploit.headers.get("x-nextjs-action-not-found")).toBe("1");
-      expect(await exploit.text()).not.toContain(secret);
+      const rscAction = await fetch(`${baseUrl}/use-cache-hidden-reference.rsc`, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain", "x-rsc-action": actionId },
+        body: JSON.stringify(["victim"]),
+      });
+      expect(rscAction.status).toBe(404);
+      expect(rscAction.headers.get("x-nextjs-action-not-found")).toBe("1");
+      expect(await rscAction.text()).not.toContain(secret);
+
+      const form = new FormData();
+      form.append(`$ACTION_ID_${actionId}`, "");
+      form.append("id", "victim");
+      const formAction = await fetch(`${baseUrl}/use-cache-hidden-reference`, {
+        method: "POST",
+        headers: { Origin: baseUrl, Host: new URL(baseUrl).host },
+        body: form,
+      });
+      // The hoisted name is no longer exported, so React's decodeAction fails
+      // to resolve it. Like Next.js for an unknown progressive action, that
+      // surfaces as a 500 rather than running anything.
+      if (actionId.endsWith("#$$hoist_0_readInlineRecord")) {
+        expect(formAction.status).toBe(500);
+      } else {
+        expect(formAction.status).toBe(404);
+        expect(formAction.headers.get("x-nextjs-action-not-found")).toBe("1");
+      }
+      expect(await formAction.text()).not.toContain(secret);
     }
   });
 
@@ -2241,6 +2413,60 @@ describe("App Router integration", () => {
     expect(res.status).toBe(404);
     expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
     expect(await res.text()).toBe("Server action not found.");
+  });
+
+  // Next.js only runs Server Action handling for App pages, so a Route
+  // Handler receives multipart POSTs without the action body limit (#3886).
+  it("delivers multipart POSTs larger than the Server Action body limit to a route handler", async () => {
+    const name = "x".repeat(1024 * 1024 + 1);
+    const textBody = new FormData();
+    textBody.append("name", name);
+    const textRes = await fetch(`${baseUrl}/api/methods`, {
+      method: "POST",
+      headers: { Origin: baseUrl, Host: new URL(baseUrl).host },
+      body: textBody,
+    });
+    expect(textRes.status).toBe(202);
+    expect(await textRes.json()).toEqual({ message: "ok", name, email: null });
+
+    // The handler ignores `image`; this case guards the body limit only.
+    const fileBody = new FormData();
+    fileBody.append("name", "upload");
+    fileBody.append("image", new Blob([name], { type: "image/bmp" }), "image.bmp");
+    const fileRes = await fetch(`${baseUrl}/api/methods`, {
+      method: "POST",
+      headers: { Origin: baseUrl, Host: new URL(baseUrl).host },
+      body: fileBody,
+    });
+    expect(fileRes.status).toBe(202);
+    expect(await fileRes.json()).toEqual({ message: "ok", name: "upload", email: null });
+  });
+
+  it("delivers multipart POSTs with Server Action fields to a route handler", async () => {
+    const body = new FormData();
+    body.append("$ACTION_ID_deadbeef", "");
+    body.append("name", "not-an-action");
+    const res = await fetch(`${baseUrl}/api/methods`, {
+      method: "POST",
+      headers: { Origin: baseUrl, Host: new URL(baseUrl).host },
+      body,
+    });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ message: "ok", name: "not-an-action", email: null });
+  });
+
+  it("does not apply the Server Action origin check to multipart route handler POSTs", async () => {
+    const body = new FormData();
+    body.append("name", "cross-origin");
+    const res = await fetch(`${baseUrl}/api/methods`, {
+      method: "POST",
+      // The dev origin guard admits any *.localhost origin; the Server Action
+      // check would reject it as cross-origin.
+      headers: { Origin: "http://other.localhost", Host: new URL(baseUrl).host },
+      body,
+    });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ message: "ok", name: "cross-origin", email: null });
   });
 
   it("returns action-not-found before reading cyclic multipart payloads for stale ids", async () => {
@@ -2616,6 +2842,54 @@ describe("App Router public files whose route starts with basePath in dev", () =
     expect(res.status).toBe(405);
     expect(res.headers.get("allow")).toBe("GET, HEAD");
     expect(await res.text()).toBe("Method Not Allowed");
+  });
+
+  // Next.js routes `_next/data` by the raw page path, like the page request:
+  // an encoded locale names no locale and dynamic params decode once.
+  it("routes Pages data requests by the raw page path behind basePath and i18n", async () => {
+    const html = await (await fetch(`${baseUrl}/docs/pages-to-app/x`)).text();
+    const buildId = html.match(/"buildId":"([^"]+)"/)?.[1];
+    expect(buildId).toBeTruthy();
+    const dataUrl = (page: string) => `${baseUrl}/docs/_next/data/${buildId}/${page}.json`;
+
+    for (const page of ["pages-to-app/a%2561", "fr/pages-to-app/a%2561"]) {
+      const res = await fetch(dataUrl(page));
+      expect(res.status, page).toBe(200);
+      expect((await res.json()).pageProps, page).toEqual({ params: { slug: "a%61" } });
+    }
+
+    for (const page of ["%66r/pages-to-app/a", "%70ages-to-app/a"]) {
+      const res = await fetch(dataUrl(page));
+      expect(res.status, page).toBeLessThan(500);
+      expect(await res.text(), page).not.toContain("pageProps");
+    }
+
+    // An encoded `_next/data` prefix is an ordinary page path, as in production.
+    const encodedPrefix = await fetch(
+      `${baseUrl}/docs/_next/%64ata/${buildId}/pages-to-app/a.json`,
+    );
+    expect(encodedPrefix.status).toBe(404);
+    expect(await encodedPrefix.text()).not.toContain("pageProps");
+  });
+
+  // Next.js parses every rewrite destination as a URL, so the static
+  // `encoded-parity-café` page 404s in every phase and a capture decodes once.
+  it("serializes Pages rewrite destinations in every rewrite phase", async () => {
+    for (const phase of ["before", "after", "fallback"]) {
+      const staticPage = await fetch(`${baseUrl}/docs/encoded-parity-pages/${phase}`);
+      expect(staticPage.status, phase).toBe(404);
+      expect(await staticPage.text(), phase).not.toContain("encoded-parity-cafe");
+
+      const dynamicPage = await fetch(`${baseUrl}/docs/encoded-parity-pages/${phase}-dynamic`);
+      expect(dynamicPage.status, phase).toBe(200);
+      expect(await dynamicPage.text(), phase).toContain('"slug":"café"');
+
+      const capture = (n: string) =>
+        fetch(`${baseUrl}/docs/encoded-parity-pages/${phase}-capture?n=${encodeURIComponent(n)}`);
+      const dotCapture = await capture("../pages-script-manual-nonce");
+      expect(dotCapture.status, phase).toBe(404);
+      expect(await dotCapture.text(), phase).not.toContain("<p>script-nonce</p>");
+    }
   });
 });
 
