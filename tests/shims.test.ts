@@ -32640,6 +32640,134 @@ describe("default-locale path normalisation (issue #1336, item 4)", () => {
       matchRedirect(normalizeDefaultLocalePathname("/sv/old", i18n), rules, emptyCtx)?.destination,
     ).toBe("/sv/new");
   });
+
+  it("applyLocaleToRoutes emits only the locale-capture variant for headers", async () => {
+    // Next.js processRoutes (load-custom-routes.ts) gives header rules only the
+    // `/:nextInternalLocale(...)` source. An unprefixed copy would let
+    // `/((?!api).*)` match `/fr/api/x` (the lookahead sees `fr/api/x`).
+    const { applyLocaleToRoutes } =
+      await import("../packages/vinext/src/config/config-matchers.js");
+    const i18n = { locales: ["en", "fr"], defaultLocale: "en" };
+    const headers = [{ key: "x-test", value: "1" }];
+    const out = applyLocaleToRoutes(
+      [
+        { source: "/((?!api).*)", headers },
+        { source: "/en", headers, locale: false as const },
+      ],
+      i18n,
+      "header",
+    );
+    expect(out.map((rule) => rule.source)).toEqual([
+      "/:nextInternalLocale(en|fr)/((?!api).*)",
+      "/en",
+    ]);
+  });
+
+  it("matchHeaders matches i18n header rules like Next.js after normalisation", async () => {
+    // Ported from Next.js resolve-routes.ts: unprefixed requests get the
+    // (domain-aware) default locale spliced in before headers are matched,
+    // except `/_next/*`, which stays unprefixed.
+    const { matchHeaders, applyLocaleToRoutes } =
+      await import("../packages/vinext/src/config/config-matchers.js");
+    const { normalizeDefaultLocalePathname } =
+      await import("../packages/vinext/src/server/pages-i18n.js");
+    const i18n = {
+      locales: ["en", "fr"],
+      defaultLocale: "en",
+      domains: [{ domain: "example.fr", defaultLocale: "fr" }],
+    };
+    const rules = applyLocaleToRoutes(
+      [
+        {
+          source: "/((?!api).*)",
+          headers: [
+            { key: "Set-Cookie", value: "seen=1" },
+            { key: "x-page", value: "1" },
+          ],
+        },
+        { source: "/en", headers: [{ key: "x-en-root", value: "1" }], locale: false as const },
+      ],
+      i18n,
+      "header",
+    );
+    const match = (pathname: string, hostname?: string) =>
+      matchHeaders(normalizeDefaultLocalePathname(pathname, i18n, { hostname }), rules, emptyCtx);
+    const pageHeaders = [
+      { key: "Set-Cookie", value: "seen=1" },
+      { key: "x-page", value: "1" },
+    ];
+
+    // Negative lookahead excludes API routes under every locale.
+    expect(match("/fr/api/x")).toEqual([]);
+    expect(match("/en/api/x")).toEqual([]);
+    expect(match("/api/x")).toEqual([]);
+    // Prefixed and default-locale paths match exactly once (no duplicate
+    // additive Set-Cookie from a second, unprefixed variant).
+    expect(match("/fr/about")).toEqual(pageHeaders);
+    expect(match("/about")).toEqual(pageHeaders);
+    expect(match("/about", "example.fr")).toEqual(pageHeaders);
+    // `/` is matched as `/en`, which `/:nextInternalLocale(en|fr)/((?!api).*)`
+    // does not match (verified against next@16.2.7). A `locale: false` `/en`
+    // source does, but not on a domain whose default locale is fr.
+    expect(match("/")).toEqual([{ key: "x-en-root", value: "1" }]);
+    expect(match("/", "example.fr")).toEqual([]);
+    // `/_next/*` is not locale-normalised, so locale-default rules skip it.
+    expect(match("/_next/static/chunks/main.js")).toEqual([]);
+  });
+
+  it("matchHeaders keeps the root trailing slash where Next.js restores it", async () => {
+    // Next.js re-adds the root's trailing slash after splicing in the default
+    // locale only when the raw request pathname (basePath included) ended
+    // with `/`, trailingSlash is on, and skipProxyUrlNormalize is off
+    // (resolve-routes.ts `hadTrailingSlash` + `maybeAddTrailingSlash`).
+    const { matchHeaders, applyLocaleToRoutes } =
+      await import("../packages/vinext/src/config/config-matchers.js");
+    const { normalizeDefaultLocalePathname, shouldRestoreLocaleRootTrailingSlash } =
+      await import("../packages/vinext/src/server/pages-i18n.js");
+    const i18n = { locales: ["en", "fr"], defaultLocale: "en" };
+    const trailing = { trailingSlash: true };
+    const rootPathname = (
+      rawPathname: string,
+      config: { trailingSlash: boolean; skipProxyUrlNormalize?: boolean } = trailing,
+    ) =>
+      normalizeDefaultLocalePathname("/", i18n, {
+        restoreRootTrailingSlash: shouldRestoreLocaleRootTrailingSlash(rawPathname, config),
+      });
+
+    expect(rootPathname("/")).toBe("/en/");
+    // basePath "/docs": `/docs` becomes `/docs/en`, `/docs/` becomes `/docs/en/`.
+    expect(rootPathname("/docs")).toBe("/en");
+    expect(rootPathname("/docs/")).toBe("/en/");
+    expect(rootPathname("/", { ...trailing, skipProxyUrlNormalize: true })).toBe("/en");
+    expect(rootPathname("/", { trailingSlash: false })).toBe("/en");
+    expect(
+      normalizeDefaultLocalePathname("/about/", i18n, { restoreRootTrailingSlash: true }),
+    ).toBe("/en/about/");
+
+    const rules = applyLocaleToRoutes(
+      [
+        { source: "/", headers: [{ key: "x-root", value: "1" }] },
+        { source: "/((?!api).*)", headers: [{ key: "x-page", value: "1" }] },
+      ],
+      i18n,
+      "header",
+      trailing,
+    );
+    const rootHeaders = [
+      { key: "x-root", value: "1" },
+      { key: "x-page", value: "1" },
+    ];
+    expect(matchHeaders(rootPathname("/docs/"), rules, emptyCtx)).toEqual(rootHeaders);
+    expect(matchHeaders("/fr/", rules, emptyCtx)).toEqual(rootHeaders);
+    expect(matchHeaders(rootPathname("/docs"), rules, emptyCtx)).toEqual([]);
+    expect(
+      matchHeaders(
+        rootPathname("/", { ...trailing, skipProxyUrlNormalize: true }),
+        rules,
+        emptyCtx,
+      ),
+    ).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
