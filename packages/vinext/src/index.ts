@@ -2670,6 +2670,12 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         buildEmptyOutDir =
           typeof config.build?.emptyOutDir === "boolean" ? config.build.emptyOutDir : undefined;
         isServeCommand = env.command === "serve";
+        // ipaddr.js (next/image private-IP guard) is a UMD CommonJS module that
+        // crashes the dev module runner when transformed as ESM, so dev loads
+        // it natively. Production builds must bundle it: it is vinext's own
+        // dependency, so a bare `import "ipaddr.js"` left in dist/server cannot
+        // be resolved from the app under strict layouts such as pnpm's.
+        const ipaddrSsrExternal = env.command === "serve" ? ["ipaddr.js"] : [];
         root = path.resolve(toSlash(process.cwd()), config.root ?? ".");
         if (env.command === "build") assertClientOutDirIsSeparate(root, options);
         const devCliLifecycleEnabled =
@@ -3698,7 +3704,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                       "react",
                       "react-dom",
                       "react-dom/server",
-                      "ipaddr.js",
+                      ...ipaddrSsrExternal,
                       ...(Array.isArray(config.ssr?.external) ? config.ssr.external : []),
                       ...nextServerExternal,
                     ],
@@ -4198,7 +4204,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                           ? true
                           : [
                               ...userSsrExternal,
-                              "ipaddr.js",
+                              ...ipaddrSsrExternal,
                               // Node can load the SSR React runtime natively.
                               // Keeping it out of Vite's transform graph avoids
                               // reparsing the large Flight client decoder.
@@ -4222,10 +4228,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 // https://github.com/cloudflare/vinext/issues/1103.
                 //
                 // `ipaddr.js` is imported by the next/image client shim for
-                // server-side private-IP validation. We externalize it on Node
-                // SSR via resolve.external above; excluding it from the dep
-                // optimizer prevents Vite from pre-bundling it on first request
-                // (and the resulting "new dependencies optimized" full reload).
+                // server-side private-IP validation. Node dev externalizes it via
+                // resolve.external above (production builds bundle it); excluding
+                // it from the dep optimizer prevents Vite from pre-bundling it on
+                // first request (and the resulting "new dependencies optimized"
+                // full reload).
                 // On bundled runtimes (Cloudflare/Nitro) the runtime build
                 // bundles it anyway, so excluding it from the dev optimizer
                 // is still correct — it just defers handling to the runtime
@@ -4377,18 +4384,18 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   "react",
                   "react-dom",
                   "react-dom/server",
-                  "ipaddr.js",
+                  ...ipaddrSsrExternal,
                   ...nextServerExternal,
                 ],
                 noExternal: true as const,
               },
               optimizeDeps: {
                 // `ipaddr.js` is imported by the next/image shim for
-                // private-IP validation and is externalized via
-                // resolve.external above. Excluding it from the SSR dep
-                // optimizer avoids the "new dependencies optimized" full
-                // reload the first time a Pages Router page renders an
-                // <Image>.
+                // private-IP validation and is externalized in dev via
+                // resolve.external above (production builds bundle it).
+                // Excluding it from the SSR dep optimizer avoids the "new
+                // dependencies optimized" full reload the first time a Pages
+                // Router page renders an <Image>.
                 exclude: mergeOptimizeDepsExclude(
                   incomingExclude,
                   VINEXT_OPTIMIZE_DEPS_EXCLUDE,
