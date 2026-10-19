@@ -12518,6 +12518,67 @@ describe("NextRequest API", () => {
     expect(withBasePath.buildId).toBeUndefined();
   });
 
+  it("nextUrl.locale is detected after the build ID of a raw _next/data URL", async () => {
+    // With skipProxyUrlNormalize, middleware receives the raw data URL;
+    // getNextPathnameInfo retries locale detection on the page path.
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const config = {
+      nextConfig: { i18n: { locales: ["en", "fr"], defaultLocale: "en" } },
+    };
+    const localized = new NextURL(
+      "http://localhost/_next/data/abc123/fr/blog.json",
+      undefined,
+      config,
+    );
+    expect(localized.locale).toBe("fr");
+    expect(localized.pathname).toBe("/_next/data/abc123/fr/blog.json");
+    expect(localized.href).toBe("http://localhost/_next/data/abc123/fr/blog.json");
+
+    const index = new NextURL("http://localhost/_next/data/abc123/index.json", undefined, config);
+    expect(index.locale).toBe("en");
+    expect(index.href).toBe("http://localhost/_next/data/abc123/index.json");
+  });
+
+  it("the locale of a raw _next/data URL does not select the domain", async () => {
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const url = new NextURL("https://example.com/_next/data/abc123/fr/about.json", undefined, {
+      nextConfig: {
+        i18n: {
+          locales: ["en", "fr"],
+          defaultLocale: "en",
+          domains: [
+            { domain: "example.fr", defaultLocale: "fr" },
+            { domain: "example.com", defaultLocale: "en" },
+          ],
+        },
+      },
+    });
+    expect(url.locale).toBe("fr");
+    expect(url.domainLocale?.domain).toBe("example.com");
+    expect(url.defaultLocale).toBe("en");
+  });
+
+  it("a changed locale replaces the locale segment of a raw _next/data URL", async () => {
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const config = {
+      nextConfig: { i18n: { locales: ["en", "fr", "de"], defaultLocale: "en" } },
+    };
+    const url = new NextURL("http://localhost/_next/data/abc123/fr/blog.json", undefined, config);
+    const cloned = url.clone();
+    cloned.locale = "de";
+    expect(cloned.href).toBe("http://localhost/_next/data/abc123/de/blog.json");
+    expect(cloned.clone().locale).toBe("de");
+    expect(url.href).toBe("http://localhost/_next/data/abc123/fr/blog.json");
+
+    const localeIndex = new NextURL(
+      "http://localhost/_next/data/abc123/fr.json",
+      undefined,
+      config,
+    );
+    localeIndex.locale = "en";
+    expect(localeIndex.href).toBe("http://localhost/_next/data/abc123/en.json");
+  });
+
   it("NextRequest.buildId delegates to nextUrl.buildId", async () => {
     const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
     const req = new NextRequest("http://localhost/_next/data/test-build-456/index.json");

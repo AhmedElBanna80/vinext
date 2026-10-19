@@ -493,6 +493,10 @@ export type NextURLConfig = {
   };
 };
 
+function isRawDataPathname(pathname: string): boolean {
+  return pathname.startsWith("/_next/data/") && pathname.endsWith(".json");
+}
+
 export class NextURL {
   /** Internal URL stores the pathname WITHOUT basePath or locale prefix. */
   private _url: URL;
@@ -516,6 +520,10 @@ export class NextURL {
     | undefined;
   private _headers: NextURLConfig["headers"];
   private _buildId: string | undefined;
+  /** First page segment of a raw data pathname, where its locale sits. */
+  private _dataPathSegment: string | undefined;
+  /** The locale parsed from that segment, if it is one. */
+  private _dataPathLocale: string | undefined;
 
   constructor(input: string | URL, base?: string | URL, config?: NextURLConfig) {
     this._url = new URL(input.toString(), base);
@@ -578,10 +586,16 @@ export class NextURL {
    */
   private _parseBuildId(): void {
     const { pathname } = this._url;
-    this._buildId =
-      pathname.startsWith("/_next/data/") && pathname.endsWith(".json")
-        ? pathname.slice("/_next/data/".length, -".json".length).split("/")[0]
-        : undefined;
+    if (!isRawDataPathname(pathname)) {
+      this._buildId = undefined;
+      this._dataPathSegment = undefined;
+      return;
+    }
+    const [buildId, pageSegment] = pathname
+      .slice("/_next/data/".length, -".json".length)
+      .split("/");
+    this._buildId = buildId;
+    this._dataPathSegment = pageSegment === "index" ? undefined : pageSegment;
   }
 
   /** Extract locale from pathname, stripping it from the internal URL. */
@@ -598,6 +612,14 @@ export class NextURL {
   private _analyzeI18n(): void {
     if (!this._locales || !this._configDefaultLocale) return;
     const detectedLocale = this._detectPathnameLocale(this._locales);
+    // A raw data pathname carries the locale after its build ID. Next.js
+    // detects it there, leaves the pathname as is, and doesn't let it pick
+    // the domain.
+    this._dataPathLocale = undefined;
+    if (!detectedLocale && this._buildId && this._dataPathSegment) {
+      const candidate = this._dataPathSegment.toLowerCase();
+      this._dataPathLocale = this._locales.find((l) => l.toLowerCase() === candidate);
+    }
     const detectedLocaleLower = detectedLocale?.toLowerCase();
     const hostHeader = this._headers?.host;
     const hostname = (
@@ -612,7 +634,20 @@ export class NextURL {
         domain.locales?.some((locale) => locale.toLowerCase() === detectedLocaleLower),
     );
     this._defaultLocale = this._domainLocale?.defaultLocale ?? this._configDefaultLocale;
-    this._locale = detectedLocale ?? this._defaultLocale;
+    this._locale = detectedLocale ?? this._dataPathLocale ?? this._defaultLocale;
+  }
+
+  /**
+   * A raw data pathname keeps its locale segment, replaced by the current
+   * locale once it has been changed.
+   */
+  private _formatDataPathLocale(pathname: string): string {
+    if (!this._dataPathLocale || this._locale === this._dataPathLocale) return pathname;
+    if (!this._locale || !isRawDataPathname(pathname)) return pathname;
+    const segments = pathname.slice("/_next/data/".length, -".json".length).split("/");
+    if (segments[1]?.toLowerCase() !== this._dataPathLocale.toLowerCase()) return pathname;
+    segments[1] = this._locale;
+    return "/_next/data/" + segments.join("/") + ".json";
   }
 
   /**
@@ -623,10 +658,16 @@ export class NextURL {
   private _formatPathname(): string {
     // Build prefix: basePath + locale (skip defaultLocale — Next.js omits it)
     let prefix = this._basePath;
-    const inner = this._url.pathname;
+    const inner = this._formatDataPathLocale(this._url.pathname);
     const innerLower = inner.toLowerCase();
     const isApiPath = innerLower === "/api" || innerLower.startsWith("/api/");
-    if (!isApiPath && this._locale && this._locale !== this._defaultLocale) {
+    // A raw data pathname already contains its locale.
+    if (
+      !isApiPath &&
+      !isRawDataPathname(inner) &&
+      this._locale &&
+      this._locale !== this._defaultLocale
+    ) {
       prefix += "/" + this._locale;
     }
     const composed = !prefix ? inner : inner === "/" ? prefix : prefix + inner;
