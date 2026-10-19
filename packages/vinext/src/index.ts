@@ -1575,6 +1575,17 @@ export type VinextOptions = {
    */
   disableAppRouter?: boolean;
   /**
+   * Turn off Next.js-like client chunking in App Router production builds.
+   * By default, client components that the same routes use load through one
+   * shared chunk, as they do from Next.js' per-route client entries. Set this
+   * to load each client component from its own chunk instead, for example to
+   * control chunking entirely through your own chunk groups. vinext already
+   * turns this chunking off when the client build has chunk groups other than
+   * its own (`codeSplitting.groups`, `advancedChunks` or `manualChunks`).
+   * @default false
+   */
+  disableNextLikeChunking?: boolean;
+  /**
    * Override the output directory for the RSC server bundle.
    * Absolute paths are used as-is; relative paths are resolved from the
    * Vite root. Defaults to "dist/server".
@@ -1859,6 +1870,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   const rscClassificationManifests = new Map<string, RouteClassificationManifest>();
   let rscActionOwnerRoutes: Awaited<ReturnType<typeof appRouter>> | null = null;
   let rscActionOwnerSharedRoots: string[] = [];
+  let clientReferenceGroupRoutes: Awaited<ReturnType<typeof appRouter>> | null = null;
   const serverEntryKindsByEnvironment = new Map<string, Set<string>>();
   const serverRuntimeOutputDirs = new Set<string>();
 
@@ -5117,6 +5129,8 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               rscActionOwnerSharedRoots = [globalErrorPath, globalNotFoundPath].filter(
                 (path): path is string => path !== null,
               );
+              clientReferenceGroupRoutes =
+                this.environment.config.command === "build" ? routes : null;
             }
             const generateEntry =
               id === RESOLVED_APP_REQUEST_ENTRY
@@ -8862,6 +8876,7 @@ export const loadServerActionClient = ${
         onComplete() {
           rscActionOwnerRoutes = null;
           rscActionOwnerSharedRoots = [];
+          clientReferenceGroupRoutes = null;
         },
       }),
     );
@@ -8869,7 +8884,25 @@ export const loadServerActionClient = ${
   }
   if (rscPluginPromise) {
     plugins.push(createRscReferenceValidationNormalizerPlugin());
-    plugins.push(createRscClientReferenceLoadersPlugin());
+    plugins.push(
+      createRscClientReferenceLoadersPlugin(
+        options.disableNextLikeChunking
+          ? undefined
+          : {
+              canonicalizeModuleId: canonicalize,
+              getRoutes: () => clientReferenceGroupRoutes,
+              getSharedRoots: () => rscActionOwnerSharedRoots,
+              isAlwaysLoadedClientModule(id) {
+                const chunkName = appClientManualChunks(id);
+                return chunkName === "framework" || chunkName === "vinext";
+              },
+              ownClientChunkGroups: new Set([
+                ...appClientCodeSplittingConfig.groups,
+                ...clientCodeSplittingConfig.groups,
+              ]),
+            },
+      ),
+    );
   } else if (manualUseCachePluginPromise) {
     plugins.push(manualUseCachePluginPromise);
   }
