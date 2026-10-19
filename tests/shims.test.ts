@@ -12477,13 +12477,16 @@ describe("NextRequest API", () => {
     expect(req.nextUrl.port).toBe("8080");
   });
 
-  it("nextUrl.buildId returns process.env.__VINEXT_BUILD_ID when set", async () => {
+  it("nextUrl.buildId ignores the deployment build ID", async () => {
+    // Next.js derives NextURL.buildId from the URL, never the deployment, so a
+    // Client Component reading it renders the same value during SSR and
+    // hydration (where the build ID is not defined).
     const original = process.env.__VINEXT_BUILD_ID;
     try {
       process.env.__VINEXT_BUILD_ID = "test-build-123";
-      const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-      const req = new NextRequest("http://localhost/");
-      expect(req.nextUrl.buildId).toBe("test-build-123");
+      const { NextRequest, NextURL } = await import("../packages/vinext/src/shims/server.js");
+      expect(new NextRequest("http://localhost/").nextUrl.buildId).toBeUndefined();
+      expect(new NextURL("https://example.com/").buildId).toBeUndefined();
     } finally {
       if (original === undefined) {
         delete process.env.__VINEXT_BUILD_ID;
@@ -12493,34 +12496,32 @@ describe("NextRequest API", () => {
     }
   });
 
-  it("nextUrl.buildId returns undefined when __VINEXT_BUILD_ID is not set", async () => {
-    const original = process.env.__VINEXT_BUILD_ID;
-    try {
-      delete process.env.__VINEXT_BUILD_ID;
-      const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-      const req = new NextRequest("http://localhost/");
-      expect(req.nextUrl.buildId).toBeUndefined();
-    } finally {
-      if (original !== undefined) {
-        process.env.__VINEXT_BUILD_ID = original;
-      }
-    }
+  it("nextUrl.buildId is parsed from a raw _next/data URL", async () => {
+    // With skipProxyUrlNormalize, middleware receives the raw data URL;
+    // getNextPathnameInfo still reads its build ID.
+    const { NextRequest, NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const req = new NextRequest("http://localhost/_next/data/abc123/blog/post.json");
+    expect(req.nextUrl.buildId).toBe("abc123");
+    expect(req.nextUrl.pathname).toBe("/_next/data/abc123/blog/post.json");
+    expect(req.nextUrl.href).toBe("http://localhost/_next/data/abc123/blog/post.json");
+
+    const withBasePath = new NextURL(
+      "http://localhost/docs/_next/data/abc123/index.json",
+      undefined,
+      {
+        basePath: "/docs",
+      },
+    );
+    expect(withBasePath.buildId).toBe("abc123");
+
+    withBasePath.href = "http://localhost/docs/about";
+    expect(withBasePath.buildId).toBeUndefined();
   });
 
-  it("buildId pass-through on NextRequest delegates to nextUrl.buildId", async () => {
-    const original = process.env.__VINEXT_BUILD_ID;
-    try {
-      process.env.__VINEXT_BUILD_ID = "test-build-456";
-      const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-      const req = new NextRequest("http://localhost/");
-      expect(req.buildId).toBe(req.nextUrl.buildId);
-    } finally {
-      if (original === undefined) {
-        delete process.env.__VINEXT_BUILD_ID;
-      } else {
-        process.env.__VINEXT_BUILD_ID = original;
-      }
-    }
+  it("NextRequest.buildId delegates to nextUrl.buildId", async () => {
+    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
+    const req = new NextRequest("http://localhost/_next/data/test-build-456/index.json");
+    expect(req.buildId).toBe("test-build-456");
   });
 });
 

@@ -515,6 +515,7 @@ export class NextURL {
     | NonNullable<NonNullable<NonNullable<NextURLConfig["nextConfig"]>["i18n"]>["domains"]>[number]
     | undefined;
   private _headers: NextURLConfig["headers"];
+  private _buildId: string | undefined;
 
   constructor(input: string | URL, base?: string | URL, config?: NextURLConfig) {
     this._url = new URL(input.toString(), base);
@@ -526,6 +527,7 @@ export class NextURL {
     this._trailingSlash = this._configTrailingSlash;
     this._analyzeTrailingSlash();
     this._stripBasePath();
+    this._parseBuildId();
     const i18n = config?.nextConfig?.i18n;
     if (i18n) {
       this._locales = [...i18n.locales];
@@ -567,6 +569,19 @@ export class NextURL {
     }
     this._basePath = this._configBasePath;
     this._url.pathname = stripBasePath(this._url.pathname, this._configBasePath);
+  }
+
+  /**
+   * Take the build ID from a raw `/_next/data/<buildId>/….json` pathname, as
+   * getNextPathnameInfo does. Middleware only sees one when proxy URL
+   * normalization is skipped; the pathname is left as is.
+   */
+  private _parseBuildId(): void {
+    const { pathname } = this._url;
+    this._buildId =
+      pathname.startsWith("/_next/data/") && pathname.endsWith(".json")
+        ? pathname.slice("/_next/data/".length, -".json".length).split("/")[0]
+        : undefined;
   }
 
   /** Extract locale from pathname, stripping it from the internal URL. */
@@ -656,6 +671,7 @@ export class NextURL {
     this._url.href = value;
     this._analyzeTrailingSlash();
     this._stripBasePath();
+    this._parseBuildId();
     this._analyzeI18n();
   }
 
@@ -814,13 +830,13 @@ export class NextURL {
   }
 
   /**
-   * The build ID of the Next.js application.
-   * Set from `generateBuildId` in next.config.js, or a random UUID if not configured.
-   * Can be used in middleware to detect deployment skew between client and server.
-   * Matches the Next.js API: `request.nextUrl.buildId`.
+   * Matches the Next.js API: `request.nextUrl.buildId`. Next.js derives it
+   * from the URL (only `/_next/data/<buildId>/…` paths carry one) and never
+   * from the deployment, so a Client Component reads the same value on the
+   * server and in the browser.
    */
   get buildId(): string | undefined {
-    return process.env.__VINEXT_BUILD_ID ?? undefined;
+    return this._buildId;
   }
 }
 
