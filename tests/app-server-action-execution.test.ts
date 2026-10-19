@@ -296,6 +296,9 @@ function createRscOptions(
     createRscOnErrorHandler(_request, pathname, pattern) {
       return () => `${pathname}:${pattern}`;
     },
+    createServerManifest() {
+      return {};
+    },
     createTemporaryReferenceSet() {
       return { marker: "refs" };
     },
@@ -376,6 +379,9 @@ function createRscOptions(
     setNavigationContext() {},
     toInterceptOpts(intercept) {
       return { slot: intercept.slotKey };
+    },
+    validateActionReferences() {
+      return true;
     },
     ...overrides,
     cleanPathname,
@@ -1348,7 +1354,7 @@ describe("app server action execution helpers", () => {
         createTemporaryReferenceSet() {
           return temporaryReferences;
         },
-        decodeReply(body, options) {
+        decodeReply(body, _serverManifest, options) {
           expect(body).toBe("encoded-flight-body");
           expect(options.temporaryReferences).toBe(temporaryReferences);
           return Promise.resolve(["first", "second"]);
@@ -3056,6 +3062,59 @@ describe("app server action execution helpers", () => {
     expect(response?.status).toBe(404);
     expect(response?.headers.get("x-nextjs-action-not-found")).toBe("1");
     expect(hidden).not.toHaveBeenCalled();
+  });
+
+  // React resolves each argument reference with `serverManifest[id]` and throws
+  // when the entry is missing; this decoder stands in for that lookup.
+  function createArgumentReferenceOptions(referenceIds: readonly string[], ownedIds: string[]) {
+    const action = vi.fn(() => "saved");
+    const validateActionReferences = vi.fn((actionIds: readonly string[]) =>
+      actionIds.every((actionId) => ownedIds.includes(actionId)),
+    );
+    const options = createRscOptions({
+      createServerManifest: () =>
+        new Proxy({}, { get: (_target, id) => ({ id, name: "", chunks: [] }) }),
+      decodeReply(_body, serverManifest) {
+        return referenceIds.map((referenceId) => {
+          const entry: unknown = Reflect.get(serverManifest, referenceId);
+          if (!entry) throw new Error(`Could not find the module "${referenceId}"`);
+          return () => entry;
+        });
+      },
+      loadServerAction: () => Promise.resolve(action),
+      validateActionReferences,
+    });
+    return { action, options, validateActionReferences };
+  }
+
+  it("decodes argument references to Server Actions of the current route", async () => {
+    const { action, options, validateActionReferences } = createArgumentReferenceOptions(
+      ["a#owned"],
+      ["a#owned"],
+    );
+
+    const response = await handleServerActionRscRequest(options);
+
+    expect(response?.status).toBe(200);
+    expect(validateActionReferences).toHaveBeenCalledWith(["a#owned"]);
+    expect(action).toHaveBeenCalledWith(expect.any(Function));
+  });
+
+  it("does not resolve argument references to Server Actions of another route", async () => {
+    const { action, options } = createArgumentReferenceOptions(
+      ["a#owned", "b#foreign"],
+      ["a#owned"],
+    );
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const response = await handleServerActionRscRequest(options);
+
+      expect(response?.status).toBe(500);
+      expect(action).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
   });
 
   // Reproduces the prod-build error path where the @vitejs/plugin-rsc server

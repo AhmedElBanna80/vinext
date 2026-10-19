@@ -828,7 +828,6 @@ import {
     hasServerActions
       ? `decodeAction,
   decodeFormState,
-  decodeReply,
   loadServerAction,
   createTemporaryReferenceSet,`
       : ""
@@ -836,9 +835,23 @@ import {
 } from ${JSON.stringify(
     hasServerActions ? "@vitejs/plugin-rsc/rsc" : "@vitejs/plugin-rsc/react/rsc",
   )};
-import { createClientManifest as _createClientManifest } from "@vitejs/plugin-rsc/core/rsc";
+import {
+  createClientManifest as _createClientManifest,${
+    hasServerActions
+      ? `
+  createServerManifest as _createServerManifest,`
+      : ""
+  }
+} from "@vitejs/plugin-rsc/core/rsc";
 import { prerender as _prerender } from "@vitejs/plugin-rsc/vendor/react-server-dom/static.edge";
-import { createRscPrerenderer, createRscRenderer } from ${JSON.stringify(rscStreamHintsPath)};
+${
+  hasServerActions
+    ? `// plugin-rsc's decodeReply() fixes an unscoped server manifest; React's own
+// takes the manifest, so fetch actions can scope argument references per route.
+import { decodeReply as _decodeReply } from "@vitejs/plugin-rsc/vendor/react-server-dom/server.edge";
+`
+    : ""
+}import { createRscPrerenderer, createRscRenderer } from ${JSON.stringify(rscStreamHintsPath)};
 
 const renderToReadableStream = createRscRenderer(_renderToReadableStream);
 const prerenderToReadableStream = createRscPrerenderer(async (model, options) =>
@@ -1809,6 +1822,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
     searchParams,
   }) {
     const {
+      areServerActionsOwnedByRoute: __areServerActionsOwnedByRoute,
       createForwardedActionContext: __createForwardedActionContext,
       forwardServerActionIfNeeded: __forwardServerActionIfNeeded,
     } = await __loadAppActionForwarding();
@@ -1896,8 +1910,9 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       createRscOnErrorHandler(actionRequest, actionPathname, routePattern, overrides) {
         return createRscOnErrorHandler(actionRequest, actionPathname, routePattern, overrides);
       },
+      createServerManifest: _createServerManifest,
       createTemporaryReferenceSet,
-      decodeReply,
+      decodeReply: _decodeReply,
       dispatchRedirectRequest(redirectRequest) {
         return __appRscHandler(redirectRequest, undefined);
       },
@@ -1915,6 +1930,13 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       },
       isRscRequest,
       loadServerAction,
+      validateActionReferences(__argumentActionIds) {
+        return __areServerActionsOwnedByRoute(
+          __VINEXT_ACTION_OWNERS(),
+          __argumentActionIds,
+          __actionMatch?.route.pattern ?? null,
+        );
+      },
       // Redirect targets are rendered as if the client had navigated to them,
       // so they must route on the raw pathname a real request would use.
       matchRoute(pathnameToMatch) {

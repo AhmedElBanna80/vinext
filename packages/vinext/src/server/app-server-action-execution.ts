@@ -381,8 +381,15 @@ export type HandleServerActionRscRequestOptions<
     overrides?: AppRenderErrorContextOverrides,
   ) => (error: unknown) => unknown;
   createTemporaryReferenceSet: () => TTemporaryReferences;
+  /** plugin-rsc's server manifest, which resolves any export of a server-reference module. */
+  createServerManifest: () => object;
+  /**
+   * React's `decodeReply()`. Every server reference in the arguments resolves
+   * through `serverManifest`, so the manifest bounds which functions can decode.
+   */
   decodeReply: (
     body: string | FormData,
+    serverManifest: object,
     options: DecodeServerActionReplyOptions<TTemporaryReferences>,
   ) => Promise<unknown[]> | unknown[];
   draftModeSecret: string;
@@ -400,6 +407,12 @@ export type HandleServerActionRscRequestOptions<
   isEdgeRuntime?: boolean;
   isRscRequest: boolean;
   loadServerAction: (actionId: string) => Promise<unknown>;
+  /**
+   * Whether these Server Actions belong to the current route. Next.js resolves
+   * argument references through the current page's server module map, so an
+   * action owned by another route must not decode into a callable function.
+   */
+  validateActionReferences: (actionIds: readonly string[]) => boolean;
   /**
    * Match an action redirect target. Must use *request* route identity — the
    * raw, undecoded pathname — because the target is rendered as if the client
@@ -1703,9 +1716,23 @@ export async function handleServerActionRscRequest<
       action = loadedAction;
     }
 
+    // Scope the manifest React resolves argument references through to this
+    // route's Server Actions, as Next.js scopes its server module map to the
+    // current page. React then fails to resolve any other id wherever the
+    // payload carries it, so that module never loads. A denied lookup throws
+    // because React retries a missing `module#a#b` as module `module#a` with
+    // export `b`, which would reach a non-action export of an owned module.
+    const serverManifest = new Proxy(options.createServerManifest(), {
+      get(target, id, receiver) {
+        if (typeof id === "string" && !options.validateActionReferences([id])) {
+          throw new Error(`Server reference "${id}" is not a Server Action of this route.`);
+        }
+        return Reflect.get(target, id, receiver);
+      },
+    });
     const temporaryReferences = options.createTemporaryReferenceSet();
     const args = await loadOutsideRequestScopes(() =>
-      options.decodeReply(body, { temporaryReferences }),
+      options.decodeReply(body, serverManifest, { temporaryReferences }),
     );
     let returnValue: AppServerActionReturnValue;
     let actionRedirect: AppServerActionRedirect | null = null;
