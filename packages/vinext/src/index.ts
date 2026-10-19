@@ -123,6 +123,8 @@ import {
   type ResolvedNextConfig,
 } from "./config/next-config.js";
 import { loadDotenv } from "./config/dotenv.js";
+import type { RscPluginOptions } from "@vitejs/plugin-rsc";
+import { loadOrGenerateServerActionsEncryptionKey } from "./build/server-actions-encryption-key.js";
 import {
   findOpenTelemetryPackages,
   mergeServerExternalPackages,
@@ -491,6 +493,9 @@ function scopeRscPlugin(plugin: Plugin): Plugin {
 // previous CLI contract that project dotenv values are available while that
 // config is evaluated. The plugin hook loads again later for custom envDir.
 const earlyViteCliInvocation = getViteCliInvocation();
+// The values the early pass loaded, so the config hook can replace them when
+// Vite's resolved envDir is another directory.
+let earlyDotenv: { dir: string; env: Record<string, string> } | undefined;
 const viteCliBuildConfigNodeEnv =
   earlyViteCliInvocation?.command === "build" && process.env.NODE_ENV === "test"
     ? "test"
@@ -507,7 +512,11 @@ if (earlyViteCliInvocation) {
           : "development",
     );
   }
-  loadDotenv({ root: earlyViteCliInvocation.root, mode: earlyViteCliInvocation.mode });
+  earlyDotenv = {
+    dir: path.resolve(earlyViteCliInvocation.root),
+    env: loadDotenv({ root: earlyViteCliInvocation.root, mode: earlyViteCliInvocation.mode })
+      .loadedEnv,
+  };
 }
 
 // Install the process-level error backstop at module load.
@@ -2030,6 +2039,17 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   // will resolve this before processing the plugin list.
   let rscPluginPromise: Promise<Plugin[]> | null = null;
   let manualUseCachePluginPromise: Promise<Plugin> | null = null;
+  // Set by the config hook once `.env` files are loaded. @vitejs/plugin-rsc
+  // reads `defineEncryptionKey` in its configEnvironment hook, which runs
+  // after every config hook.
+  const rscPluginOptions: RscPluginOptions = {
+    entries: {
+      rsc: VIRTUAL_RSC_ENTRY,
+      ssr: VIRTUAL_APP_SSR_ENTRY,
+      client: VIRTUAL_APP_BROWSER_ENTRY,
+    },
+  };
+  let serverActionsEncryptionKey: string | undefined;
   if (earlyAppDirExists && autoRsc) {
     if (!resolvedRscPath) {
       throw new Error(
@@ -2044,17 +2064,12 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     rscPluginPromise = rscImport
       .then(async (mod) => {
         const rsc = mod.default;
-        const plugins: Plugin[] = rsc({
-          entries: {
-            rsc: VIRTUAL_RSC_ENTRY,
-            ssr: VIRTUAL_APP_SSR_ENTRY,
-            client: VIRTUAL_APP_BROWSER_ENTRY,
-          },
-        });
+        const plugins: Plugin[] = rsc(rscPluginOptions);
         const useCachePlugin = await createUseCacheCallablePlugin({
           projectRoot: earlyBaseDir,
           cacheRuntime: pathToFileURL(resolveShimModulePath(shimsDir, "cache-callable-runtime"))
             .href,
+          getEncryptionKey: () => serverActionsEncryptionKey,
         });
         const useServerIndex = plugins.findIndex((plugin) => plugin.name === "rsc:use-server");
         if (useServerIndex === -1) {
@@ -2681,10 +2696,22 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         // env vars are available in config, server-side code, and as
         // NEXT_PUBLIC_* defines for the client bundle.
         const mode = env?.mode ?? "development";
-        if (config.envDir !== false) {
-          const envDir = config.envDir ?? root;
-          loadDotenv({ root: envDir, mode });
+        // Like Vite, resolve a relative envDir from the project root.
+        const envDir =
+          config.envDir === false
+            ? undefined
+            : config.envDir
+              ? path.resolve(root, config.envDir)
+              : root;
+        if (earlyDotenv && envDir !== earlyDotenv.dir) {
+          // Values the early pass read from another directory must not shadow
+          // this envDir's. Variables set before vinext loaded stay.
+          for (const [key, value] of Object.entries(earlyDotenv.env)) {
+            if (process.env[key] === value) Reflect.deleteProperty(process.env, key);
+          }
+          earlyDotenv = undefined;
         }
+        if (envDir) loadDotenv({ root: envDir, mode });
         // Build output always receives production defines. Preserve the
         // explicit NODE_ENV=test config-time behavior supported by the previous
         // vinext CLI, independently of Vite's mode.
@@ -2801,6 +2828,20 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           if (sharedBuildId && sharedBuildId.length > 0) {
             nextConfig = { ...nextConfig, buildId: sharedBuildId };
           }
+        }
+        if (rscPluginPromise) {
+          // Like Next.js, closure arguments of Server Actions and "use cache"
+          // functions are encrypted with this key, and a runtime
+          // NEXT_SERVER_ACTIONS_ENCRYPTION_KEY overrides it
+          // (getActionEncryptionKey in server/app-render/encryption-utils.ts).
+          // A stable key keeps them decryptable across identical rebuilds.
+          // Chosen after next.config is evaluated, as Next does, since the
+          // config may set the variable.
+          serverActionsEncryptionKey = loadOrGenerateServerActionsEncryptionKey({
+            root,
+            isBuild: env.command === "build",
+          });
+          rscPluginOptions.defineEncryptionKey = `process.env.NEXT_SERVER_ACTIONS_ENCRYPTION_KEY || ${JSON.stringify(serverActionsEncryptionKey)}`;
         }
         // Preserve an explicit test environment while Vite and Next config are
         // evaluated, then keep the actual CLI build on production semantics.
@@ -3023,7 +3064,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         // generate a separate token so RSC headers do not expose
         // generateBuildId() verbatim.
         defines["process.env.__VINEXT_RSC_COMPATIBILITY_ID"] = JSON.stringify(rscCompatibilityId);
-        defines["process.env.__VINEXT_RSC_BUILD_IDENTITY"] = JSON.stringify(rscBuildIdentity ?? "");
+        // Per-build server identity. Only server responses carry it, so the
+        // real value is a server-only define (see vinext:compiler-define-server).
+        // Baking it into the browser would rename every client chunk that
+        // reaches its module on each build, even when nothing changed.
+        defines["process.env.__VINEXT_RSC_BUILD_IDENTITY"] = JSON.stringify("");
         // Deployment ID — mirrors Next.js' configured NEXT_DEPLOYMENT_ID.
         // This remains empty when deploymentId is not configured; the separate
         // "use cache" key builder falls back to __VINEXT_BUILD_ID when needed.
@@ -7724,8 +7769,8 @@ export const loadServerActionClient = ${
     // serialized define environments, never to `client`.
     {
       name: "vinext:compiler-define-server",
-      configEnvironment(name) {
-        if (name === "client") return null;
+      configEnvironment(name, config) {
+        if (name === "client" || config.consumer === "client") return null;
 
         const serverDefines: Record<string, string> = { ...nextConfig.compilerDefineServer };
 
@@ -7764,6 +7809,10 @@ export const loadServerActionClient = ${
         if (revalidateSecret) {
           serverDefines["process.env.__VINEXT_REVALIDATE_SECRET"] =
             JSON.stringify(revalidateSecret);
+        }
+        if (rscBuildIdentity) {
+          serverDefines["process.env.__VINEXT_RSC_BUILD_IDENTITY"] =
+            JSON.stringify(rscBuildIdentity);
         }
         if (previewBuildCredentials) {
           serverDefines["process.env.__VINEXT_PREVIEW_MODE_ID"] = JSON.stringify(
