@@ -1928,8 +1928,8 @@ describe("treeshake config integration", () => {
         });
         const defaultOutput = defaultBuilder.environments.client.config.build.rolldownOptions
           .output as Record<string, unknown>;
-        expect(defaultOutput.entryFileNames).toBe("_next/static/chunks/[name]-[hash].js");
-        expect(defaultOutput.chunkFileNames).toBe("_next/static/chunks/[name]-[hash].js");
+        expect(defaultOutput.entryFileNames).toBe("_next/static/chunks/[hash].js");
+        expect(defaultOutput.chunkFileNames).toBe("_next/static/chunks/[hash].js");
         expect(defaultOutput.assetFileNames).toEqual(expect.any(Function));
 
         const builder = await createBuilder({
@@ -1938,16 +1938,16 @@ describe("treeshake config integration", () => {
           plugins: [vinext({ appDir: tmpDir })],
           logLevel: "silent",
           ...toUserConfig({
-            entryFileNames: "_next/static/chunks/[hash].js",
-            chunkFileNames: "_next/static/chunks/[hash].js",
+            entryFileNames: "_next/static/chunks/[name]-[hash].js",
+            chunkFileNames: "_next/static/chunks/[name]-[hash].js",
           }),
         });
         const output = builder.environments.client.config.build.rolldownOptions.output as Record<
           string,
           unknown
         >;
-        expect(output.entryFileNames).toBe("_next/static/chunks/[hash].js");
-        expect(output.chunkFileNames).toBe("_next/static/chunks/[hash].js");
+        expect(output.entryFileNames).toBe("_next/static/chunks/[name]-[hash].js");
+        expect(output.chunkFileNames).toBe("_next/static/chunks/[name]-[hash].js");
         // Unset names keep vinext's defaults, and chunk grouping is preserved.
         expect(output.assetFileNames).toEqual(expect.any(Function));
         expect(output.codeSplitting).toMatchObject({ minSize: 10_000 });
@@ -2202,8 +2202,8 @@ describe("treeshake config integration", () => {
           assetsInlineLimit: 0,
           rolldownOptions: {
             output: {
-              entryFileNames: "_next/static/chunks/[name]-[hash].js",
-              chunkFileNames: "_next/static/chunks/[name]-[hash].js",
+              entryFileNames: "_next/static/chunks/[hash].js",
+              chunkFileNames: "_next/static/chunks/[hash].js",
               assetFileNames: expect.any(Function),
             },
           },

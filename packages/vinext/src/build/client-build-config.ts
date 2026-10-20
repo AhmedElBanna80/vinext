@@ -1,5 +1,8 @@
+import { createHash } from "node:crypto";
 import type { UserConfig } from "vite";
 import path, { toSlash } from "pathslash";
+import { WORKER_IMAGE_METADATA_PREFIX } from "../plugins/worker-image-imports.js";
+import { stripViteModuleQuery } from "../utils/path.js";
 
 type ClientAssetFileNameInfo = {
   readonly name?: string;
@@ -26,10 +29,11 @@ const ROUTE_OWNED_CLIENT_SHIMS = new Set([
   "web-vitals",
 ]);
 
-// Next.js emits CSS under `static/css/` and CSS url() dependencies (images,
-// fonts, …) under `static/media/`, both with an 8-char content hash. Mirror
-// that layout so migrated apps keep stable, Next-shaped asset URLs.
-const NEXT_CLIENT_CSS_ASSET_FILE_NAMES = "css/[name].[hash:8][extname]";
+// Next.js emits CSS under `static/css/` as `[contenthash].css` and CSS url()
+// dependencies (images, fonts, …) under `static/media/` as
+// `[name].[hash:8][ext]`. Mirror that layout so migrated apps keep stable,
+// Next-shaped asset URLs, and CSS URLs never expose source file names.
+const NEXT_CLIENT_CSS_ASSET_FILE_NAMES = "css/[hash][extname]";
 const NEXT_CLIENT_STATIC_MEDIA_FILE_NAMES = "media/[name].[hash:8][extname]";
 
 function joinAssetFileNamePattern(assetsDir: string, pattern: string): string {
@@ -174,12 +178,59 @@ export function createClientManualChunks(shimsDir: string, preserveRouteBoundari
   };
 }
 
+/**
+ * Client JS is emitted as hash-only `<assetsDir>/chunks/[hash].js`. Rolldown
+ * names a chunk after its first module, so `[name]` would publish component
+ * and source file names in public asset URLs. Next.js doesn't put component
+ * names in production chunk URLs either: webpack names split chunks by
+ * deterministic numeric id. Users can opt back into `[name]` through their own
+ * Vite config; see createClientOutputFileNameDefaults.
+ */
 function createClientFileNameConfig(assetsDir: string) {
   const chunksDir = `${assetsDir}/chunks`;
   return {
-    entryFileNames: `${chunksDir}/[name]-[hash].js`,
-    chunkFileNames: `${chunksDir}/[name]-[hash].js`,
+    entryFileNames: `${chunksDir}/[hash].js`,
+    chunkFileNames: `${chunksDir}/[hash].js`,
   };
+}
+
+/**
+ * Web Worker output names. Workers are hash-only like client chunks, so their
+ * URLs don't publish source file names. Vite bundles each worker separately
+ * and stores the outputs by file name, so two workers' entries or chunks with
+ * identical code would share `[hash].js` and one's source map would overwrite
+ * the other's. Each name therefore also carries an opaque id derived from the
+ * chunk's module ids (root-relative for files).
+ */
+export function createWorkerFileNames(assetsDir: string, root: string) {
+  const workersDir = `${assetsDir}/workers`;
+  const fileName = (chunk: { facadeModuleId: string | null; moduleIds?: readonly string[] }) => {
+    const ids = chunk.facadeModuleId ? [chunk.facadeModuleId] : (chunk.moduleIds ?? []);
+    // Each id is serialized with a tag, so distinct ids never collide.
+    // Absolute file paths are made root-relative, keeping their query
+    // (`lazy.js?one` and `lazy.js?two` are distinct modules), and so is the
+    // image path in vinext's worker image metadata ids. Other ids are kept
+    // verbatim: path.relative would resolve a virtual id against the cwd.
+    // Names thus don't depend on where the app lives or the build was launched.
+    const chunkId = JSON.stringify(
+      ids.map((id) => {
+        const file = stripViteModuleQuery(id);
+        if (path.isAbsolute(file)) {
+          return ["file", toSlash(path.relative(root, file)) + id.slice(file.length)];
+        }
+        const imagePath = id.startsWith(WORKER_IMAGE_METADATA_PREFIX)
+          ? id.slice(WORKER_IMAGE_METADATA_PREFIX.length)
+          : undefined;
+        if (imagePath !== undefined && path.isAbsolute(imagePath)) {
+          return ["image-meta", toSlash(path.relative(root, imagePath))];
+        }
+        return ["id", id];
+      }),
+    );
+    const idHash = createHash("sha256").update(chunkId).digest("hex").slice(0, 8);
+    return `${workersDir}/${idHash}-[hash].js`;
+  };
+  return { entryFileNames: fileName, chunkFileNames: fileName };
 }
 
 /**
