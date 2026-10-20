@@ -28,7 +28,13 @@ export function generateBrowserEntry(
 ): string {
   const entryPath = resolveRuntimeEntryModule("app-browser-entry");
   const reactInstanceBootstrapPath = resolveClientRuntimeModule("react-instance-bootstrap");
-  const prefetchRoutes = toLinkPrefetchRoutes(routes);
+  // Route handler entries only feed hybrid App/Pages ownership. An App-only
+  // client learns a handler URL from its non-Flight response (a prefetch miss,
+  // then a document navigation), like Next.js, so shipping the paths would
+  // only publish the app's API surface (issue #3624).
+  const prefetchRoutes = toLinkPrefetchRoutes(routes, {
+    includeRouteHandlers: pagesPrefetchRoutes.length > 0,
+  });
   const clientRewrites = toClientRewrites(rewrites);
 
   return `import ${JSON.stringify(reactInstanceBootstrapPath)};
@@ -120,7 +126,10 @@ export function toLinkPrefetchRoute(
 }
 
 /** Project App routes together so sibling-intercept loading is applied to its target route. */
-export function toLinkPrefetchRoutes(routes: readonly AppRoute[]): VinextLinkPrefetchRoute[] {
+export function toLinkPrefetchRoutes(
+  routes: readonly AppRoute[],
+  { includeRouteHandlers = true }: { includeRouteHandlers?: boolean } = {},
+): VinextLinkPrefetchRoute[] {
   const siblingInterceptLoadingTargets: string[][] = [];
   for (const route of routes) {
     for (const intercept of route.siblingIntercepts) {
@@ -130,16 +139,19 @@ export function toLinkPrefetchRoutes(routes: readonly AppRoute[]): VinextLinkPre
     }
   }
 
-  return routes.map((route) =>
-    isLinkPrefetchRoute(route)
-      ? toLinkPrefetchRoute(
+  return routes.flatMap((route) => {
+    if (isLinkPrefetchRoute(route)) {
+      return [
+        toLinkPrefetchRoute(
           route,
           siblingInterceptLoadingTargets.some((targetParts) =>
             patternsStructurallyEquivalent(targetParts, route.patternParts),
           ),
-        )
-      : toDocumentOnlyAppRoute(route),
-  );
+        ),
+      ];
+    }
+    return includeRouteHandlers ? [toDocumentOnlyAppRoute(route)] : [];
+  });
 }
 
 /**

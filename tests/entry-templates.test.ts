@@ -39,6 +39,7 @@ import {
   type BrowserRouteManifestWire,
 } from "../packages/vinext/src/routing/browser-route-manifest.js";
 import { createValidFileMatcher } from "../packages/vinext/src/routing/file-matcher.js";
+import { matchOptimisticRouteManifestRoute } from "../packages/vinext/src/server/app-optimistic-routing.js";
 import type { AppRoute } from "../packages/vinext/src/routing/app-router.js";
 import type { MetadataFileRoute } from "../packages/vinext/src/server/metadata-routes.js";
 import { createPagesDevHydrationScript } from "../packages/vinext/src/server/pages-dev-hydration.js";
@@ -625,7 +626,6 @@ describe("App Router generated manifest construction", () => {
       writePage("(protected)/admin/layout.tsx");
       writePage("(protected)/admin/[id]/page.tsx");
       writePage("(protected)/admin/template.tsx");
-      writePage("api/status/route.ts", "export function GET() {}\n");
       writePage("feed/layout.tsx");
       writePage("feed/page.tsx");
       writePage("feed/@modal/default.tsx");
@@ -668,6 +668,293 @@ describe("App Router generated manifest construction", () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  describe("route handler paths on the client (issue #3624)", () => {
+    const PAGE = "export default function Page() {}\n";
+    const HANDLER = "export function GET() {}\n";
+
+    const DEFAULT_FILES: Record<string, string> = {
+      "layout.tsx": PAGE,
+      "page.tsx": PAGE,
+      // No page route can match these handlers' URLs.
+      "api/status/route.ts": HANDLER,
+      "api/items/[id]/route.ts": HANDLER,
+      "feed.xml/route.ts": HANDLER,
+      "blog/[slug]/page.tsx": PAGE,
+      "blog/[slug]/comments/route.ts": HANDLER,
+      // A required catch-all needs at least one segment, so it never sees `/docs`.
+      "docs/route.ts": HANDLER,
+      "docs/[...path]/page.tsx": PAGE,
+      // Page routes that also match these handlers' URLs.
+      "blog/rss/route.ts": HANDLER,
+      "docs/search/route.ts": HANDLER,
+      "shop/[[...path]]/page.tsx": PAGE,
+      "shop/cart/route.ts": HANDLER,
+      // Page routes that win every URL they share with these handlers.
+      "pricing/enterprise/page.tsx": PAGE,
+      "pricing/[plan]/route.ts": HANDLER,
+      "reports/summary/page.tsx": PAGE,
+      "reports/[...rest]/route.ts": HANDLER,
+      // A static page subtree the optimistic trie never leaves, so the
+      // catch-all page beside it never sees this handler's URL.
+      "docs/guides/intro/page.tsx": PAGE,
+      "docs/guides/private/route.ts": HANDLER,
+      // Layouts only this omitted handler reaches, including a slot-local one.
+      "internal-status/layout.tsx": PAGE,
+      "internal-status/@modal/layout.tsx": PAGE,
+      "internal-status/@modal/default.tsx": PAGE,
+      "internal-status/route.ts": HANDLER,
+    };
+
+    async function withScannedApp(
+      run: (graph: Awaited<ReturnType<typeof buildAppRouteGraph>>) => void,
+      files: Record<string, string> = DEFAULT_FILES,
+    ): Promise<void> {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-route-handler-exposure-"));
+      const appDir = path.join(tmpDir, "app");
+      for (const [relativePath, source] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(appDir, relativePath)), { recursive: true });
+        fs.writeFileSync(path.join(appDir, relativePath), source);
+      }
+      try {
+        run(await buildAppRouteGraph(appDir, createValidFileMatcher()));
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }
+
+    function readLinkPrefetchRoutes(entryCode: string) {
+      const json = /^window\.__VINEXT_LINK_PREFETCH_ROUTES__ = (.*);$/m.exec(entryCode)?.[1];
+      expect(json).toBeDefined();
+      return JSON.parse(json!) as { documentOnly?: true; patternParts: string[] }[];
+    }
+
+    const pagePatterns = [
+      "/",
+      "/blog/:slug",
+      "/docs/:path+",
+      "/docs/guides/intro",
+      "/pricing/enterprise",
+      "/reports/summary",
+      "/shop/:path*",
+    ];
+    const handlerPatterns = [
+      "/api/items/:id",
+      "/api/status",
+      "/blog/:slug/comments",
+      "/blog/rss",
+      "/docs",
+      "/docs/guides/private",
+      "/docs/search",
+      "/feed.xml",
+      "/internal-status",
+      "/pricing/:plan",
+      "/reports/:rest+",
+      "/shop/cart",
+    ];
+    const toPattern = (route: { patternParts: readonly string[] }) =>
+      `/${route.patternParts.join("/")}`;
+
+    it("leaves every route handler out of the App-only Link prefetch manifest", async () => {
+      await withScannedApp((graph) => {
+        const routes = readLinkPrefetchRoutes(generateBrowserEntry(graph.routes));
+        expect(routes.filter((route) => route.documentOnly)).toEqual([]);
+        expect(routes.map(toPattern).sort()).toEqual(pagePatterns);
+      });
+    });
+
+    it("keeps every route handler for hybrid App and Pages ownership", async () => {
+      await withScannedApp((graph) => {
+        const routes = readLinkPrefetchRoutes(
+          generateBrowserEntry(graph.routes, [
+            { canPrefetchLoadingShell: false, isDynamic: true, patternParts: [":page"] },
+          ]),
+        );
+        expect(
+          routes
+            .filter((route) => route.documentOnly)
+            .map(toPattern)
+            .sort(),
+        ).toEqual(handlerPatterns);
+      });
+    });
+
+    it("ships only the route handlers the optimistic route trie needs in the route manifest", async () => {
+      await withScannedApp((graph) => {
+        const browserRouteManifest = decodeBrowserRouteManifest(
+          readBrowserRouteManifestModule(generateBrowserRouteManifestModule(graph.routeManifest)),
+        );
+        const handlerRouteIds = new Set(
+          [...graph.routeManifest.segmentGraph.routes.values()]
+            .filter((route) => route.routeHandlerId !== null)
+            .map((route) => route.id),
+        );
+        expect(handlerRouteIds.size).toBe(handlerPatterns.length);
+        const browserHandlers = [...browserRouteManifest.segmentGraph.routes.values()]
+          .filter((route) => handlerRouteIds.has(route.id))
+          .map(toPattern)
+          .sort();
+        expect(browserHandlers).toEqual(["/blog/rss", "/docs/search", "/shop/cart"]);
+        expect(
+          [...browserRouteManifest.segmentGraph.routes.values()]
+            .filter((route) => route.pageId !== null)
+            .map(toPattern)
+            .sort(),
+        ).toEqual(pagePatterns);
+
+        // The kept handlers stop the optimistic matcher from predicting the
+        // page route they overlap; the dropped ones match nothing either way.
+        const match = (href: string) =>
+          matchOptimisticRouteManifestRoute({
+            basePath: "",
+            href,
+            routeManifest: browserRouteManifest,
+          })?.route.id ?? null;
+        expect(match("/docs/search")).toBe("route:/docs/search");
+        expect(match("/docs/intro")).toBe("route:/docs/:path+");
+        expect(match("/blog/rss")).toBe("route:/blog/rss");
+        expect(match("/shop/cart")).toBe("route:/shop/cart");
+        expect(match("/api/status")).toBeNull();
+        expect(match("/blog/hello/comments")).toBeNull();
+        expect(match("/pricing/enterprise")).toBe("route:/pricing/enterprise");
+        expect(match("/pricing/pro")).toBeNull();
+        expect(match("/reports/summary")).toBe("route:/reports/summary");
+        expect(match("/reports/2026/q3")).toBeNull();
+        expect(match("/docs/guides/intro")).toBe("route:/docs/guides/intro");
+        expect(match("/docs/guides/private")).toBeNull();
+      });
+    });
+
+    it("leaves out the layouts that only an omitted route handler reaches", async () => {
+      await withScannedApp((graph) => {
+        const moduleCode = generateBrowserRouteManifestModule(graph.routeManifest);
+        expect(moduleCode).not.toContain("internal-status");
+        expect(moduleCode).not.toContain(":plan");
+        expect(moduleCode).not.toContain(":rest");
+        expect(moduleCode).not.toContain("private");
+        const layouts = decodeBrowserRouteManifest(readBrowserRouteManifestModule(moduleCode))
+          .segmentGraph.layouts;
+        expect([...layouts.values()].map(toPattern)).toEqual(["/"]);
+      });
+    });
+
+    it("leaves out the root boundary that only an omitted route handler reaches", async () => {
+      await withScannedApp(
+        (graph) => {
+          const moduleCode = generateBrowserRouteManifestModule(graph.routeManifest);
+          expect(moduleCode).not.toContain("(ops)");
+          expect(moduleCode).not.toContain("ops-status");
+          const { rootBoundaries } = decodeBrowserRouteManifest(
+            readBrowserRouteManifestModule(moduleCode),
+          ).segmentGraph;
+          expect(rootBoundaries.size).toBe(1);
+          expect([...rootBoundaries.values()][0].treePath).toContain("(site)");
+        },
+        {
+          "(site)/layout.tsx": PAGE,
+          "(site)/page.tsx": PAGE,
+          "(ops)/layout.tsx": PAGE,
+          "(ops)/ops-status/route.ts": HANDLER,
+        },
+      );
+    });
+
+    it("ships a route handler that blocks a page match without its layouts or root boundary", async () => {
+      await withScannedApp(
+        (graph) => {
+          const moduleCode = generateBrowserRouteManifestModule(graph.routeManifest);
+          expect(moduleCode).not.toContain("(ops)");
+          const routeManifest = decodeBrowserRouteManifest(
+            readBrowserRouteManifestModule(moduleCode),
+          );
+          expect(routeManifest.segmentGraph.routes.get("route:/docs/private")).toMatchObject({
+            layoutIds: [],
+            pageId: null,
+            rootBoundaryId: null,
+            slotIds: [],
+          });
+          expect(
+            matchOptimisticRouteManifestRoute({
+              basePath: "",
+              href: "/docs/private",
+              routeManifest,
+            })?.route.id,
+          ).toBe("route:/docs/private");
+        },
+        {
+          "(site)/layout.tsx": PAGE,
+          "(site)/docs/[...path]/page.tsx": PAGE,
+          "(ops)/layout.tsx": PAGE,
+          "(ops)/docs/private/route.ts": HANDLER,
+        },
+      );
+    });
+
+    it("ships a route handler that blocks a page match without its slot bindings", async () => {
+      await withScannedApp(
+        (graph) => {
+          const handlerId = "route:/docs/private";
+          expect(graph.routeManifest.segmentGraph.routes.get(handlerId)?.slotIds).not.toEqual([]);
+          const routeManifest = decodeBrowserRouteManifest(
+            readBrowserRouteManifestModule(generateBrowserRouteManifestModule(graph.routeManifest)),
+          );
+          expect(routeManifest.segmentGraph.routes.get(handlerId)?.slotIds).toEqual([]);
+          expect(
+            [...routeManifest.segmentGraph.slotBindings.values()].filter(
+              (binding) => binding.routeId === handlerId,
+            ),
+          ).toEqual([]);
+        },
+        {
+          "(site)/layout.tsx": PAGE,
+          "(site)/docs/[...path]/page.tsx": PAGE,
+          "(ops)/layout.tsx": PAGE,
+          "(ops)/@panel/default.tsx": PAGE,
+          "(ops)/docs/private/route.ts": HANDLER,
+        },
+      );
+    });
+
+    it("keeps a route handler wherever its URLs lead the trie to a page it outranks", async () => {
+      const matchIn = (graph: Awaited<ReturnType<typeof buildAppRouteGraph>>) => {
+        const routeManifest = decodeBrowserRouteManifest(
+          readBrowserRouteManifestModule(generateBrowserRouteManifestModule(graph.routeManifest)),
+        );
+        return (href: string) =>
+          matchOptimisticRouteManifestRoute({ basePath: "", href, routeManifest })?.route.id ??
+          null;
+      };
+      // `/hooks/settings` names the page's static segment, and the handler's
+      // static `hooks` outranks the page's dynamic `[lang]`.
+      await withScannedApp(
+        (graph) => {
+          expect(matchIn(graph)("/hooks/settings")).toBe("route:/hooks/:event");
+        },
+        {
+          "layout.tsx": PAGE,
+          "page.tsx": PAGE,
+          "[lang]/settings/page.tsx": PAGE,
+          "hooks/[event]/route.ts": HANDLER,
+        },
+      );
+      // The trie never leaves the static `files` subtree, but a two-segment
+      // remainder fails inside it and falls back to the root catch-all.
+      await withScannedApp(
+        (graph) => {
+          const match = matchIn(graph);
+          expect(match("/en/files/a/b")).toBe("route:/:lang/files/:path+");
+          expect(match("/en/files/a")).toBe("route:/:lang/files/:name");
+        },
+        {
+          "layout.tsx": PAGE,
+          "page.tsx": PAGE,
+          "[lang]/files/[name]/page.tsx": PAGE,
+          "[lang]/files/[...path]/route.ts": HANDLER,
+          "[...all]/page.tsx": PAGE,
+        },
+      );
+    });
   });
 
   it("constructs route module imports and route entries from the scanned app shape", () => {
