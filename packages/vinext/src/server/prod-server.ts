@@ -601,6 +601,21 @@ function disablePrerenderKeepAliveTimeout(server: Server, purpose: ProdServerOpt
   if (purpose === "prerender") server.keepAliveTimeout = 0;
 }
 
+// Resolves with the bound port, or rejects with the listen error (e.g.
+// EADDRINUSE). Without an "error" listener the failure escapes to the
+// socket-error backstop, which logs and absorbs it on a running server, so
+// startup never settles and `vinext start` exits 0 instead of failing.
+function listen(server: Server, port: number, host: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      const addr = server.address();
+      resolve(typeof addr === "object" && addr ? addr.port : port);
+    });
+  });
+}
+
 function logProdServerStarted(host: string, port: number, purpose: ProdServerOptions["purpose"]) {
   const url = `http://${host}:${port}`;
   if (purpose === "prerender") {
@@ -2258,17 +2273,8 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   });
   disablePrerenderKeepAliveTimeout(server, purpose);
 
-  await new Promise<void>((resolve) => {
-    server.listen(port, host, () => {
-      const addr = server.address();
-      const actualPort = typeof addr === "object" && addr ? addr.port : port;
-      if (!silent) logProdServerStarted(host, actualPort, purpose);
-      resolve();
-    });
-  });
-
-  const addr = server.address();
-  const actualPort = typeof addr === "object" && addr ? addr.port : port;
+  const actualPort = await listen(server, port, host);
+  if (!silent) logProdServerStarted(host, actualPort, purpose);
   return { server, port: actualPort };
 }
 
@@ -2325,17 +2331,8 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
   const server = createServer(handler);
   disablePrerenderKeepAliveTimeout(server, purpose);
 
-  await new Promise<void>((resolve) => {
-    server.listen(port, host, () => {
-      const addr = server.address();
-      const actualPort = typeof addr === "object" && addr ? addr.port : port;
-      if (!silent) logProdServerStarted(host, actualPort, purpose);
-      resolve();
-    });
-  });
-
-  const addr = server.address();
-  const actualPort = typeof addr === "object" && addr ? addr.port : port;
+  const actualPort = await listen(server, port, host);
+  if (!silent) logProdServerStarted(host, actualPort, purpose);
   return { server, port: actualPort };
 }
 
