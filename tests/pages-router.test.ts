@@ -4673,6 +4673,157 @@ describe("Virtual server entry generation", () => {
     }
   });
 
+  it("dev Pages client assets re-resolve only edited modules until tsconfig.json changes", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-pages-app-css-reuse-"));
+    const fixture = writePagesAppGlobalCssFixture(tmpDir);
+    // The assets module resolves each import of the modules it reads.
+    const resolveImporters: string[] = [];
+    const testServer = await createServer({
+      root: tmpDir,
+      configFile: false,
+      plugins: [
+        {
+          name: "record-resolve-importers",
+          enforce: "pre",
+          resolveId(_source, importer) {
+            if (importer) resolveImporters.push(toSlash(importer));
+            return null;
+          },
+        },
+        vinext({ appDir: tmpDir }),
+      ],
+      server: { port: 0, cors: false },
+      logLevel: "silent",
+    });
+    const readAppManifest = async () => {
+      const assetsModule = await testServer.ssrLoadModule("virtual:vinext-pages-client-assets");
+      return (assetsModule.default as { ssrManifest?: Record<string, string[]> }).ssrManifest?.[
+        fixture.appPath
+      ];
+    };
+    const resolvedFrom = (file: string) =>
+      resolveImporters.some((importer) => importer.endsWith(file));
+
+    try {
+      expect(await readAppManifest()).toEqual(fixture.appManifestAssets);
+      expect(resolvedFrom("/lib/transitive.ts")).toBe(true);
+
+      resolveImporters.length = 0;
+      fs.writeFileSync(fixture.appPath, fs.readFileSync(fixture.appPath, "utf-8") + "\n");
+      testServer.watcher.emit("change", fixture.appPath);
+
+      expect(await readAppManifest()).toEqual(fixture.appManifestAssets);
+      expect(resolvedFrom("/pages/_app.tsx")).toBe(true);
+      expect(resolvedFrom("/lib/reexport.ts")).toBe(false);
+      expect(resolvedFrom("/lib/transitive.ts")).toBe(false);
+
+      // Like Vite, which invalidates every module when a tsconfig.json changes.
+      resolveImporters.length = 0;
+      testServer.watcher.emit("change", path.join(tmpDir, "tsconfig.json"));
+
+      expect(await readAppManifest()).toEqual(fixture.appManifestAssets);
+      expect(resolvedFrom("/lib/transitive.ts")).toBe(true);
+    } finally {
+      await testServer.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("dev Pages client assets follow an imported stylesheet being created and deleted", async () => {
+    // Module ids are real paths, so run from a symlinked root, where the
+    // watcher reports other paths.
+    const realDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-pages-app-css-created-"));
+    const linkDir = `${realDir}-link`;
+    fs.symlinkSync(realDir, linkDir);
+    const fixture = writePagesAppGlobalCssFixture(linkDir);
+    const latePath = path.join(linkDir, "styles", "late.css");
+    fs.writeFileSync(
+      path.join(linkDir, "lib", "transitive.ts"),
+      'import "../styles/late.css";\n' +
+        'import transitiveStyles from "../styles/transitive.module.css";\n' +
+        "export const transitiveClassName = transitiveStyles.transitiveText;\n",
+    );
+    const testServer = await createServer({
+      root: linkDir,
+      configFile: false,
+      plugins: [vinext({ appDir: linkDir })],
+      server: { port: 0, cors: false },
+      logLevel: "silent",
+    });
+    const readAppManifest = async () => {
+      const assetsModule = await testServer.ssrLoadModule("virtual:vinext-pages-client-assets");
+      return (assetsModule.default as { ssrManifest?: Record<string, string[]> }).ssrManifest?.[
+        fixture.appPath
+      ];
+    };
+
+    try {
+      expect(await readAppManifest()).toEqual(fixture.appManifestAssets);
+
+      fs.writeFileSync(latePath, ".late-css { color: green; }\n");
+      testServer.watcher.emit("add", latePath);
+      expect(await readAppManifest()).toEqual([
+        "styles/global style.css",
+        "styles/app.module.css",
+        "styles/late.css",
+        "styles/transitive.module.css",
+      ]);
+
+      fs.rmSync(latePath);
+      testServer.watcher.emit("unlink", latePath);
+      expect(await readAppManifest()).toEqual(fixture.appManifestAssets);
+    } finally {
+      await testServer.close();
+      fs.rmSync(linkDir);
+      fs.rmSync(realDir, { recursive: true, force: true });
+    }
+  });
+
+  it("dev Pages client assets follow an imported stylesheet symlink being retargeted", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-pages-app-css-retarget-"));
+    const fixture = writePagesAppGlobalCssFixture(tmpDir);
+    const themePath = path.join(tmpDir, "styles", "theme.css");
+    fs.mkdirSync(path.join(tmpDir, "themes"));
+    fs.writeFileSync(path.join(tmpDir, "themes", "light.css"), ".light { color: white; }\n");
+    fs.writeFileSync(path.join(tmpDir, "themes", "dark.css"), ".dark { color: black; }\n");
+    fs.symlinkSync(path.join(tmpDir, "themes", "light.css"), themePath);
+    fs.writeFileSync(
+      path.join(tmpDir, "lib", "transitive.ts"),
+      'import "../styles/theme.css";\n' +
+        'import transitiveStyles from "../styles/transitive.module.css";\n' +
+        "export const transitiveClassName = transitiveStyles.transitiveText;\n",
+    );
+    const testServer = await createServer({
+      root: tmpDir,
+      configFile: false,
+      plugins: [vinext({ appDir: tmpDir })],
+      server: { port: 0, cors: false },
+      logLevel: "silent",
+    });
+    const readAppManifest = async () => {
+      const assetsModule = await testServer.ssrLoadModule("virtual:vinext-pages-client-assets");
+      return (assetsModule.default as { ssrManifest?: Record<string, string[]> }).ssrManifest?.[
+        fixture.appPath
+      ];
+    };
+
+    try {
+      expect(await readAppManifest()).toContain("themes/light.css");
+
+      fs.rmSync(themePath);
+      testServer.watcher.emit("unlink", themePath);
+      fs.symlinkSync(path.join(tmpDir, "themes", "dark.css"), themePath);
+      testServer.watcher.emit("add", themePath);
+
+      const manifest = await readAppManifest();
+      expect(manifest).toContain("themes/dark.css");
+      expect(manifest).not.toContain("themes/light.css");
+    } finally {
+      await testServer.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("dev Pages client assets do not treat Less as a built-in Next.js stylesheet", async () => {
     // Next.js built-in CSS rules cover css/scss/sass, not less:
     // .nextjs-ref/packages/next/src/build/webpack/config/blocks/css/index.ts regexLikeCss.

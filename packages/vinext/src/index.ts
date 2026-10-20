@@ -309,7 +309,11 @@ import {
   getPreviewBuildCredentials,
   type PreviewBuildCredentials,
 } from "./build/preview-credentials.js";
-import { createModuleDependencyCache } from "./build/module-dependency-cache.js";
+import {
+  createModuleDependencyCache,
+  ModuleDependencyStore,
+  type ModuleDependencyEntry,
+} from "./build/module-dependency-cache.js";
 import { resolvePostcssStringPlugins } from "./plugins/postcss.js";
 import {
   buildSassPreprocessorOptions,
@@ -409,6 +413,7 @@ import { resolvePluginReactPath } from "./utils/plugin-react-version.js";
 import { assertPluginRscVersion, needsAppReactServerDom } from "./utils/plugin-rsc-version.js";
 import { getReactUpgradeDeps, reactUpgradeRequiredMessage } from "./utils/react-version.js";
 import {
+  canonicalizeFilePath,
   isPathInside,
   isPathInsideOrEqual,
   stripJsExtension,
@@ -861,25 +866,32 @@ type DevPagesModuleDependency =
   | { type: "stylesheet"; asset: string }
   | { type: "script"; id: string };
 
-function createDevPagesModuleDependencyReader(root: string, resolve: ResolveFromImporter) {
-  return createModuleDependencyCache(collectModuleDependencies);
+function createDevPagesModuleDependencyReader(
+  root: string,
+  resolve: ResolveFromImporter,
+  store: ModuleDependencyStore<DevPagesModuleDependency>,
+) {
+  return createModuleDependencyCache((modulePath) =>
+    store.read(modulePath, collectModuleDependencies),
+  );
 
   async function collectModuleDependencies(
     modulePath: string,
-  ): Promise<DevPagesModuleDependency[]> {
+  ): Promise<ModuleDependencyEntry<DevPagesModuleDependency>> {
+    const dependencies: DevPagesModuleDependency[] = [];
+    const entry = { dependencies, resolvedFiles: [] as string[], cacheable: true };
     const cleanModulePath = stripViteModuleQuery(modulePath);
-    if (!path.isAbsolute(cleanModulePath) || !fs.existsSync(cleanModulePath)) return [];
+    if (!path.isAbsolute(cleanModulePath) || !fs.existsSync(cleanModulePath)) return entry;
 
     let code: string;
     try {
       code = fs.readFileSync(cleanModulePath, "utf-8");
     } catch {
-      return [];
+      return { ...entry, cacheable: false };
     }
     const record = parseModuleRecord(code, parserLanguageForScript(cleanModulePath));
-    if (!record) return [];
+    if (!record) return entry;
 
-    const dependencies: DevPagesModuleDependency[] = [];
     for (const specifier of runtimeStaticDependencySpecifiers(
       code,
       record,
@@ -890,7 +902,11 @@ function createDevPagesModuleDependencyReader(root: string, resolve: ResolveFrom
       // resolve to the shim instead of real Next.js, which the Worker dep
       // optimizer would otherwise discover and re-bundle during startup.
       const resolved = await resolve(specifier, cleanModulePath, { skipSelf: false });
-      if (!resolved?.id) continue;
+      if (!resolved?.id) {
+        entry.cacheable = false;
+        continue;
+      }
+      entry.resolvedFiles.push(stripViteModuleQuery(resolved.id));
 
       if (isStylesheetSpecifier(specifier) || isStylesheetSpecifier(resolved.id)) {
         const asset = resolvedStylesheetToDevManifestAsset(root, resolved.id);
@@ -903,7 +919,7 @@ function createDevPagesModuleDependencyReader(root: string, resolve: ResolveFrom
         dependencies.push({ type: "script", id: resolved.id });
       }
     }
-    return dependencies;
+    return entry;
   }
 }
 
@@ -1859,6 +1875,12 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   const pagesClientAssetsOutputDirs = new Set<string>();
   // Output-root-relative path of each build environment's client assets module.
   const pagesClientAssetsExternalTargets = new Map<string, ReadonlyMap<string, string>>();
+  // Dev dependency lists behind the Pages client assets module. Each
+  // environment resolves imports with its own conditions.
+  const devPagesModuleDependencyStores = new Map<
+    string,
+    ModuleDependencyStore<DevPagesModuleDependency>
+  >();
   // Workers must keep this module inside their deployable output directory.
   const resolvePagesClientAssetsOutputDir = (environmentName: string, outputDir: string): string =>
     !selectedMultiStageOutput && !hasAppDir && !hasCloudflarePlugin && environmentName === "ssr"
@@ -5115,9 +5137,15 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               ...(appFilePath ? [appFilePath] : []),
               ...pagesRoutes.map((route) => route.filePath),
             ];
+            let dependencyStore = devPagesModuleDependencyStores.get(this.environment.name);
+            if (!dependencyStore) {
+              dependencyStore = new ModuleDependencyStore();
+              devPagesModuleDependencyStores.set(this.environment.name, dependencyStore);
+            }
             const getModuleDependencies = createDevPagesModuleDependencyReader(
               root,
               this.resolve.bind(this),
+              dependencyStore,
             );
             for (const moduleFilePath of moduleFilePaths) {
               const stylesheetAssets = await collectDevPagesAppStylesheetAssets(
@@ -5998,6 +6026,9 @@ export const loadServerActionClient = ${
         // Like `next dev`, the dev server logs uncaught errors from app code
         // and keeps serving. See socket-error-backstop.ts.
         installSocketErrorBackstop({ runningServer: true });
+        // Dependency lists from a previous server may have been resolved with
+        // other config, such as next.config aliases.
+        devPagesModuleDependencyStores.clear();
 
         const devBuildId = nextConfig?.buildId ?? process.env.__VINEXT_BUILD_ID ?? "development";
 
@@ -6128,6 +6159,34 @@ export const loadServerActionClient = ${
             if (mod) env.moduleGraph.invalidateModule(mod);
           }
           pagesRunner?.clearCache();
+        }
+
+        function invalidatePagesModuleDependencies(
+          filePath: string,
+          event: "create" | "update" | "delete",
+        ) {
+          if (devPagesModuleDependencyStores.size === 0) return;
+          // Vite invalidates every module when a tsconfig.json changes.
+          if (path.basename(filePath) === "tsconfig.json") {
+            devPagesModuleDependencyStores.clear();
+            return;
+          }
+          // Module ids are real paths, while chokidar reports paths under the
+          // watched root, which can be a symlink. A deleted file has no real
+          // path left, but its directory does.
+          const files = new Set([
+            toSlash(filePath),
+            canonicalizeFilePath(filePath),
+            path.join(canonicalizeFilePath(path.dirname(filePath)), path.basename(filePath)),
+          ]);
+          // Imports resolve through a file symlink to its target, and a deleted
+          // link no longer says what that was. A deleted file an import could
+          // load that matches no entry may have been such a link, so drop all.
+          const unmappedDelete =
+            event === "delete" && (isScriptModuleId(filePath) || isStylesheetSpecifier(filePath));
+          for (const store of devPagesModuleDependencyStores.values()) {
+            if (!store.invalidate([...files], event) && unmappedDelete) store.clear();
+          }
         }
 
         function invalidatePagesClientAssetsModule() {
@@ -6334,6 +6393,7 @@ export const loadServerActionClient = ${
         }
 
         server.watcher.on("add", (filePath: string) => {
+          invalidatePagesModuleDependencies(filePath, "create");
           invalidatePagesMiddlewareMatcher(filePath);
           updatePublicFileRoute(filePath, true);
           let routeChanged = false;
@@ -6369,6 +6429,7 @@ export const loadServerActionClient = ${
           }
         });
         server.watcher.on("change", (filePath: string) => {
+          invalidatePagesModuleDependencies(filePath, "update");
           invalidatePagesMiddlewareMatcher(filePath);
           if (
             hasPagesDir &&
@@ -6396,6 +6457,7 @@ export const loadServerActionClient = ${
           }
         });
         server.watcher.on("unlink", (filePath: string) => {
+          invalidatePagesModuleDependencies(filePath, "delete");
           invalidatePagesMiddlewareMatcher(filePath);
           updatePublicFileRoute(filePath, false);
           let routeChanged = false;
