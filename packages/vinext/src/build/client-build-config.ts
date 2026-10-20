@@ -174,12 +174,95 @@ export function createClientManualChunks(shimsDir: string, preserveRouteBoundari
   };
 }
 
-export function createClientFileNameConfig(assetsDir: string) {
+function createClientFileNameConfig(assetsDir: string) {
   const chunksDir = `${assetsDir}/chunks`;
   return {
     entryFileNames: `${chunksDir}/[name]-[hash].js`,
     chunkFileNames: `${chunksDir}/[name]-[hash].js`,
   };
+}
+
+/**
+ * vinext's client output file names, limited to the ones the incoming client
+ * environment config leaves unset. Vite merges `config` hook results over the
+ * user's config, so vinext applies these from `configEnvironment` instead: by
+ * then the user's top-level `build` and `environments.client.build` are merged
+ * into the client environment, and a user-provided pattern wins.
+ *
+ * Returns null for array-shaped output, which cannot be augmented without Vite
+ * concatenating a second output entry. Array-shaped client output is advanced
+ * config vinext doesn't support: Vite also appends vinext's own client output
+ * object (code splitting) to the user's array, producing an extra bundle.
+ */
+export function createClientOutputFileNameDefaults(
+  output: VinextBuildBundlerOptions["output"],
+  assetsDir: string,
+) {
+  if (Array.isArray(output)) return null;
+  const configured = output ?? {};
+  const { entryFileNames, chunkFileNames } = createClientFileNameConfig(assetsDir);
+  return {
+    ...(configured.entryFileNames === undefined ? { entryFileNames } : {}),
+    ...(configured.chunkFileNames === undefined ? { chunkFileNames } : {}),
+    ...(configured.assetFileNames === undefined
+      ? { assetFileNames: createClientAssetFileNames(assetsDir) }
+      : {}),
+  };
+}
+
+/** Entry, chunk and asset file names from a (non-array) bundler output config. */
+export function getOutputFileNames(
+  output: VinextBuildBundlerOptions["output"],
+): Pick<VinextBuildOutput, "entryFileNames" | "chunkFileNames" | "assetFileNames"> {
+  if (!output || Array.isArray(output)) return {};
+  const { entryFileNames, chunkFileNames, assetFileNames } = output;
+  return { entryFileNames, chunkFileNames, assetFileNames };
+}
+
+/**
+ * User-provided client file name patterns vinext cannot serve correctly:
+ * - outside `assetsDir`: built-asset URLs, immutable caching and
+ *   precompression all assume client output lives there;
+ * - without `[hash]`: everything under `assetsDir` is served
+ *   `immutable`, so an unhashed URL would pin stale code for a year;
+ * - JS not ending in `.js`: client metadata and Pages Router script
+ *   tags only recognize `.js` chunks;
+ * - assets not ending in `[extname]` (or `.[ext]`): CSS without its real
+ *   extension is served as `application/octet-stream` and rejected by browsers.
+ * - asset basenames not starting with `[name].` or `[name]-`: restoring CSS
+ *   `url()` assets deduplicated across builds swaps the source stem at the
+ *   start of the emitted basename (see css-url-assets.ts), so any other
+ *   placement or delimiter drops the hash from the restored sibling.
+ * This is a guard against common mistakes, not full validation: function
+ * patterns and array-shaped output are advanced config left to the user to
+ * keep within these rules.
+ */
+export function findUnsupportedClientOutputFileNames(
+  output: VinextBuildBundlerOptions["output"],
+  assetsDir: string,
+): string[] {
+  if (!output || Array.isArray(output)) return [];
+  const unsupported: string[] = [];
+  for (const key of ["entryFileNames", "chunkFileNames", "assetFileNames"] as const) {
+    const value = output[key];
+    if (typeof value !== "string") continue;
+    const problems = [
+      !value.startsWith(`${assetsDir}/`) && `outside "${assetsDir}/"`,
+      !value.includes("[hash") && "no [hash]",
+      key !== "assetFileNames" && !value.endsWith(".js") && 'not ".js"',
+      key === "assetFileNames" &&
+        !value.endsWith("[extname]") &&
+        !value.endsWith(".[ext]") &&
+        "not ending in [extname]",
+      key === "assetFileNames" &&
+        !/^\[name\][.-]/.test(value.slice(value.lastIndexOf("/") + 1)) &&
+        'basename not starting with "[name]." or "[name]-"',
+    ].filter(Boolean);
+    if (problems.length > 0) {
+      unsupported.push(`${key}: ${JSON.stringify(value)} (${problems.join(", ")})`);
+    }
+  }
+  return unsupported;
 }
 
 export function createClientCodeSplittingConfig(
