@@ -1152,14 +1152,18 @@ export function createAppBrowserNavigationController(
         // NavigationCommitSignal removes this render from the pending map
         // before the cache tee reaches EOF. A retained optimistic subtree can
         // otherwise leave the fully received candidate uncommitted; publish it
-        // synchronously only as that terminal recovery path.
+        // again only as that terminal recovery path. The update must stay a
+        // transition: the cache tee can end while the payload is still
+        // resolving (a client module still loading, or a busy main thread),
+        // and a sync render that suspends replaces the visible page with the
+        // nearest Suspense fallback.
         void options.navigationResponseCompletion.then(
           () => {
             if (!isCurrentNavigation(options.navId) || !hasBrowserRouterState()) return;
             const pendingCommit = pendingNavigationCommits.get(renderId);
             const committedState = pendingCommit?.committedState;
             if (!committedState) return;
-            flushSync(() => {
+            startTransition(() => {
               getBrowserRouterStateSetter()(committedState);
             });
           },
