@@ -14,6 +14,7 @@ import {
 import {
   ErrorBoundary,
   ForbiddenBoundary,
+  HttpAccessFallbackPassthrough,
   GlobalErrorBoundary,
   NotFoundBoundary,
   RedirectBoundary,
@@ -1659,10 +1660,54 @@ export function buildAppPageElements<
   const notFoundComponent =
     configuredNotFoundComponent ??
     (defaultNotFoundOwnerLayoutId === null ? DEFAULT_NOT_FOUND_COMPONENT : null);
+  // The route's not-found/forbidden/unauthorized file is the nearest one walking
+  // up from the page. Next.js hands each segment's file to that segment's
+  // children LayoutRouter, so a file beside an ancestor layout catches the
+  // page's signal in place of every layout below that segment. The page-level
+  // boundary passes the signal up to that layout's boundary, which clears on
+  // the route reset key. It stays in the tree so the element shape above a
+  // preserved children slot never depends on which route owns the file.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/create-component-tree.tsx
+  const resolveLayoutOwnedBoundaryTreePosition = (
+    module: TModule | null | undefined,
+    treePosition: number | null | undefined,
+    getLayoutModule: (
+      entry: AppPageLayoutEntry<TModule, TErrorModule>,
+    ) => TModule | null | undefined,
+  ): number | null => {
+    if (getDefaultExport(module) === null || treePosition == null) return null;
+    if (treePosition >= routeSegments.length) return null;
+    const layoutEntry = layoutEntriesByTreePosition.get(treePosition);
+    return layoutEntry && getLayoutModule(layoutEntry) === module ? treePosition : null;
+  };
+  const notFoundOwnerTreePosition = resolveLayoutOwnedBoundaryTreePosition(
+    options.route.notFound,
+    options.route.notFoundTreePosition,
+    (entry) => entry.notFoundModule,
+  );
+  const forbiddenOwnerTreePosition = resolveLayoutOwnedBoundaryTreePosition(
+    options.route.forbidden,
+    options.route.forbiddenTreePosition,
+    (entry) => entry.forbiddenModule,
+  );
+  const unauthorizedOwnerTreePosition = resolveLayoutOwnedBoundaryTreePosition(
+    options.route.unauthorized,
+    options.route.unauthorizedTreePosition,
+    (entry) => entry.unauthorizedModule,
+  );
   if (notFoundComponent) {
     const NotFoundComponent = notFoundComponent;
     routeChildren = (
-      <NotFoundBoundary resetKey={routeResetKey} fallback={<NotFoundComponent />}>
+      <NotFoundBoundary
+        resetKey={routeResetKey}
+        fallback={
+          notFoundOwnerTreePosition === null ? (
+            <NotFoundComponent />
+          ) : (
+            <HttpAccessFallbackPassthrough status={404} />
+          )
+        }
+      >
         {routeChildren}
       </NotFoundBoundary>
     );
@@ -1673,7 +1718,16 @@ export function buildAppPageElements<
   if (forbiddenComponent) {
     const ForbiddenComponent = forbiddenComponent;
     routeChildren = (
-      <ForbiddenBoundary resetKey={routeResetKey} fallback={<ForbiddenComponent />}>
+      <ForbiddenBoundary
+        resetKey={routeResetKey}
+        fallback={
+          forbiddenOwnerTreePosition === null ? (
+            <ForbiddenComponent />
+          ) : (
+            <HttpAccessFallbackPassthrough status={403} />
+          )
+        }
+      >
         {routeChildren}
       </ForbiddenBoundary>
     );
@@ -1685,7 +1739,16 @@ export function buildAppPageElements<
   if (unauthorizedComponent) {
     const UnauthorizedComponent = unauthorizedComponent;
     routeChildren = (
-      <UnauthorizedBoundary resetKey={routeResetKey} fallback={<UnauthorizedComponent />}>
+      <UnauthorizedBoundary
+        resetKey={routeResetKey}
+        fallback={
+          unauthorizedOwnerTreePosition === null ? (
+            <UnauthorizedComponent />
+          ) : (
+            <HttpAccessFallbackPassthrough status={401} />
+          )
+        }
+      >
         {routeChildren}
       </UnauthorizedBoundary>
     );
@@ -1738,7 +1801,10 @@ export function buildAppPageElements<
       if (layoutNotFoundComponent) {
         const LayoutNotFoundComponent = layoutNotFoundComponent;
         segmentChildren = (
-          <NotFoundBoundary resetKey={segmentResetKey} fallback={<LayoutNotFoundComponent />}>
+          <NotFoundBoundary
+            resetKey={treePosition === notFoundOwnerTreePosition ? routeResetKey : segmentResetKey}
+            fallback={<LayoutNotFoundComponent />}
+          >
             {segmentChildren}
           </NotFoundBoundary>
         );
@@ -1748,7 +1814,10 @@ export function buildAppPageElements<
       if (layoutForbiddenComponent) {
         const LayoutForbiddenComponent = layoutForbiddenComponent;
         segmentChildren = (
-          <ForbiddenBoundary resetKey={segmentResetKey} fallback={<LayoutForbiddenComponent />}>
+          <ForbiddenBoundary
+            resetKey={treePosition === forbiddenOwnerTreePosition ? routeResetKey : segmentResetKey}
+            fallback={<LayoutForbiddenComponent />}
+          >
             {segmentChildren}
           </ForbiddenBoundary>
         );
@@ -1759,7 +1828,9 @@ export function buildAppPageElements<
         const LayoutUnauthorizedComponent = layoutUnauthorizedComponent;
         segmentChildren = (
           <UnauthorizedBoundary
-            resetKey={segmentResetKey}
+            resetKey={
+              treePosition === unauthorizedOwnerTreePosition ? routeResetKey : segmentResetKey
+            }
             fallback={<LayoutUnauthorizedComponent />}
           >
             {segmentChildren}

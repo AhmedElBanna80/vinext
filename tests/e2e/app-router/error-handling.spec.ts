@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { waitForAppRouterHydration } from "../helpers";
 
 const BASE = "http://localhost:4174";
 
@@ -125,6 +126,87 @@ test.describe("Not Found", () => {
     const response = await page.goto(`${BASE}/notfound-test`);
     expect(response?.status()).toBe(404);
     await expect(page.locator("h1")).toContainText("404");
+  });
+
+  // https://github.com/cloudflare/vinext/issues/4092
+  test("client-side notFound() renders an ancestor not-found in place of the layouts below it", async ({
+    page,
+  }) => {
+    await page.goto(`${BASE}/nextjs-compat/not-found-ancestor-boundary`);
+    await waitForAppRouterHydration(page);
+    // A full page load would render the document fallback instead.
+    await page.evaluate(() => {
+      (window as Window & { __clientNavMarker?: boolean }).__clientNavMarker = true;
+    });
+
+    await page.getByRole("link", { name: "Missing" }).click();
+    await expect(page.locator("#not-found-ancestor-boundary-nf")).toBeVisible();
+    await expect(page.locator("#not-found-ancestor-boundary-layout")).toBeVisible();
+    await expect(page.locator("#not-found-ancestor-boundary-section")).toHaveCount(0);
+
+    // A sibling under the same child layout clears the fallback.
+    await page.getByRole("link", { name: "Present" }).click();
+    await expect(page.locator("#not-found-ancestor-boundary-page")).toHaveText(
+      "Section page: present",
+    );
+    await expect(page.locator("#not-found-ancestor-boundary-section")).toBeVisible();
+    await expect(page.locator("#not-found-ancestor-boundary-nf")).toHaveCount(0);
+
+    // The section layout owns no boundary, and its state survives siblings
+    // whose nearest not-found file differs while the owner's reset key changes.
+    const counter = page.locator("#not-found-ancestor-boundary-counter");
+    await counter.click();
+    await counter.click();
+    await expect(counter).toHaveText("count:2");
+    await page.getByRole("link", { name: "Own" }).click();
+    await expect(page.locator("#not-found-ancestor-boundary-own")).toBeVisible();
+    await expect(counter).toHaveText("count:2");
+    await page.getByRole("link", { name: "Present" }).click();
+    await expect(page.locator("#not-found-ancestor-boundary-page")).toBeVisible();
+    await expect(counter).toHaveText("count:2");
+
+    expect(
+      await page.evaluate(
+        () => (window as Window & { __clientNavMarker?: boolean }).__clientNavMarker,
+      ),
+    ).toBe(true);
+  });
+
+  test("a notFound() streamed after the shell renders the ancestor not-found in place of the layouts below it", async ({
+    page,
+  }) => {
+    const response = await page.goto(
+      `${BASE}/nextjs-compat/not-found-ancestor-boundary/section/slow`,
+      { waitUntil: "commit" },
+    );
+    // The document streamed the loading shell, so the server's not-found
+    // render never ran and the client boundary placed the fallback.
+    expect(response?.status()).toBe(200);
+    expect(await response?.text()).toContain("not-found-ancestor-boundary-loading");
+    await expect(page.locator("#not-found-ancestor-boundary-nf")).toBeVisible();
+    await expect(page.locator("#not-found-ancestor-boundary-layout")).toBeVisible();
+    await expect(page.locator("#not-found-ancestor-boundary-section")).toHaveCount(0);
+  });
+
+  test("a slot navigation keeps the preserved children page mounted", async ({ page }) => {
+    // /slots owns its not-found.tsx beside the page; the /slots/settings slot
+    // route sees it as an ancestor layout's file. The page-level boundary
+    // above the preserved children page must keep its type across the two.
+    await page.goto(`${BASE}/nextjs-compat/not-found-ancestor-boundary/slots`);
+    await waitForAppRouterHydration(page);
+    await expect(page.locator("#not-found-ancestor-boundary-team")).toBeVisible();
+    const counter = page.locator("#not-found-ancestor-boundary-slots-counter");
+    await counter.click();
+    await counter.click();
+    await expect(counter).toHaveText("count:2");
+
+    await page.getByRole("link", { name: "Slot settings" }).click();
+    await expect(page.locator("#not-found-ancestor-boundary-team-settings")).toBeVisible();
+    await expect(counter).toHaveText("count:2");
+
+    await page.getByRole("link", { name: "Slots home" }).click();
+    await expect(page.locator("#not-found-ancestor-boundary-team")).toBeVisible();
+    await expect(counter).toHaveText("count:2");
   });
 });
 

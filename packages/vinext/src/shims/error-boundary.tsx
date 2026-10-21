@@ -11,6 +11,7 @@ import DefaultGlobalError from "./default-global-error.js";
 import { handleAppNavigationFailure } from "../client/app-nav-failure-handler.js";
 import { VINEXT_DEV_ERROR_RECOVERY_EVENT } from "../utils/dev-error-recovery-event.js";
 import { isNavigationSignalError } from "../utils/navigation-signal.js";
+import { forbidden, notFound, unauthorized } from "./navigation-errors.js";
 
 export type ErrorBoundaryProps = {
   fallback: React.ComponentType<{ error: unknown; reset: () => void }>;
@@ -413,6 +414,18 @@ class NotFoundBoundaryInner extends React.Component<
     }
     return this.props.children;
   }
+}
+
+/**
+ * Fallback for a page-level access boundary whose file belongs to an ancestor
+ * layout. Rethrowing from the fallback hands the signal to the next boundary
+ * up, so that layout's copy renders in place of the layouts below it while the
+ * page-level boundary keeps the element shape sibling routes share.
+ */
+export function HttpAccessFallbackPassthrough({ status }: { status: 401 | 403 | 404 }): never {
+  if (status === 403) forbidden();
+  if (status === 401) unauthorized();
+  notFound();
 }
 
 /**

@@ -317,6 +317,24 @@ describe("Next.js compat: not-found", () => {
     expect(body).toContain("layout-page parent boundary");
   });
 
+  // ── notFound() from a page below a child layout ─────────────
+  // An ancestor segment's not-found.tsx is the boundary of that segment's
+  // children, so it replaces every layout below it, not just the page. The
+  // server's not-found render already did; this keeps it matching the client
+  // tree that #4092 fixed, which the e2e spec covers.
+  // https://github.com/cloudflare/vinext/issues/4092
+
+  it("page notFound(): ancestor not-found replaces the child layout", async () => {
+    const { res, html } = await fetchHtml(
+      baseUrl,
+      "/nextjs-compat/not-found-ancestor-boundary/section/missing",
+    );
+    expect(res.status).toBe(404);
+    expect(html).toContain("not-found-ancestor-boundary-layout");
+    expect(html).toContain("Not Found (ancestor boundary)");
+    expect(html).not.toContain("not-found-ancestor-boundary-section");
+  });
+
   // ── RSC (client-side navigation) not-found ──────────────────
   // When navigating client-side, the request goes to .rsc endpoint.
   // The RSC response must contain valid flight data with not-found content.

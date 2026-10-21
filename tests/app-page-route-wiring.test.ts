@@ -4249,6 +4249,87 @@ describe("app page route wiring helpers", () => {
     expect(findElementByTypeName(nestedLayoutSlot.props.children, "NotFoundBoundary")).toBeNull();
   });
 
+  // https://github.com/cloudflare/vinext/issues/4092
+  it("hands the page's access signals to the ancestor layout that owns the file", () => {
+    // Next.js hands a segment's not-found/forbidden/unauthorized file to that
+    // segment's children LayoutRouter, so it replaces every layout below it.
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/create-component-tree.tsx
+    function SectionNotFound() {
+      return createElement("p", null, "Section not found");
+    }
+    function SectionForbidden() {
+      return createElement("p", null, "Section forbidden");
+    }
+    function SectionUnauthorized() {
+      return createElement("p", null, "Section unauthorized");
+    }
+    const notFoundModule: AppPageModule = { default: SectionNotFound };
+    const forbiddenModule: AppPageModule = { default: SectionForbidden };
+    const unauthorizedModule: AppPageModule = { default: SectionUnauthorized };
+    const build = (boundaryTreePosition: number, layoutBoundaries: boolean) =>
+      buildAppPageElements({
+        element: createElement(PageProbe),
+        makeThenableParams(params) {
+          return Promise.resolve(params);
+        },
+        matchedParams: {},
+        route: {
+          error: null,
+          errors: [null, null, null],
+          forbidden: forbiddenModule,
+          forbiddenTreePosition: boundaryTreePosition,
+          forbiddens: layoutBoundaries ? [null, forbiddenModule, null] : [null, null, null],
+          layoutTreePositions: [0, 1, 2],
+          layouts: [{ default: RootLayout }, { default: GroupLayout }, { default: GroupLayout }],
+          loading: null,
+          notFound: notFoundModule,
+          notFoundTreePosition: boundaryTreePosition,
+          notFounds: layoutBoundaries ? [null, notFoundModule, null] : [null, null, null],
+          routeSegments: ["section", "child"],
+          slots: {},
+          templateTreePositions: [],
+          templates: [],
+          unauthorized: unauthorizedModule,
+          unauthorizedTreePosition: boundaryTreePosition,
+          unauthorizeds: layoutBoundaries ? [null, unauthorizedModule, null] : [null, null, null],
+        },
+        routePath: "/section/child",
+        rootNotFoundModule: null,
+      })["route:/section/child"];
+    // The same files beside the page wrap it at the leaf.
+    const leafEntry = build(2, false);
+    const routeEntry = build(1, true);
+    const sectionLayoutSlot = findSlotById(routeEntry, "layout:/section");
+    const childLayoutSlot = findSlotById(routeEntry, "layout:/section/child");
+    if (!sectionLayoutSlot || !childLayoutSlot) throw new Error("Expected both layout slots");
+
+    for (const [boundaryName, fallbackName] of [
+      ["NotFoundBoundary", "SectionNotFound"],
+      ["ForbiddenBoundary", "SectionForbidden"],
+      ["UnauthorizedBoundary", "SectionUnauthorized"],
+    ]) {
+      // The page-level boundary stays, so the element shape matches routes
+      // whose file sits beside the page, but hands the signal to the layout.
+      const pageBoundary = findElementByTypeName(childLayoutSlot.props.children, boundaryName);
+      if (!pageBoundary) throw new Error(`Expected a page-level ${boundaryName}`);
+      expect(getElementTypeName((pageBoundary.props.fallback as ReactElement).type)).toBe(
+        "HttpAccessFallbackPassthrough",
+      );
+      const leafBoundary = findElementByTypeName(leafEntry, boundaryName);
+      if (!leafBoundary) throw new Error(`Expected a page-level ${boundaryName}`);
+      expect(getElementTypeName((leafBoundary.props.fallback as ReactElement).type)).toBe(
+        fallbackName,
+      );
+      const boundary = findElementByTypeName(sectionLayoutSlot.props.children, boundaryName);
+      if (!boundary) throw new Error(`Expected ${boundaryName} above the child layout`);
+      expect(getElementTypeName((boundary.props.fallback as ReactElement).type)).toBe(fallbackName);
+      expect(findSlotById(boundary.props.children, "layout:/section/child")).not.toBeNull();
+      // The boundary still clears on the route's own reset key, as it does
+      // when it wraps the page, so a deeper navigation leaves the fallback.
+      expect(boundary.props.resetKey).toBe(leafBoundary.props.resetKey);
+    }
+  });
+
   it("nests per-segment NotFoundBoundary inside the template wrapper", () => {
     function RootNotFound() {
       return createElement("div", { "data-not-found": "root" }, "Not Found");
