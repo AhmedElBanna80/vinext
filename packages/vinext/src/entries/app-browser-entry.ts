@@ -26,10 +26,11 @@ export function generateBrowserEntry(
     fallback: [],
   },
   locales: readonly string[] = [],
+  isRenderedDynamically?: (route: AppRoute) => boolean,
 ): string {
   const entryPath = resolveRuntimeEntryModule("app-browser-entry");
   const reactInstanceBootstrapPath = resolveClientRuntimeModule("react-instance-bootstrap");
-  const prefetchRoutes = toLinkPrefetchRoutes(routes);
+  const prefetchRoutes = toLinkPrefetchRoutes(routes, isRenderedDynamically);
   // Route handlers only feed hybrid App/Pages ownership. An App-only client
   // learns a handler URL from its non-Flight response (a prefetch miss, then a
   // document navigation), like Next.js, so it gets none (issue #3624).
@@ -125,18 +126,26 @@ export function toLinkPrefetchRoute(
       interceptTargetsRoute(intercept.targetPattern, route) &&
       (intercept.loadingPaths?.length ?? 0) > 0,
   ),
+  rendersDynamically = false,
 ): VinextLinkPrefetchRoute {
   return {
     canPrefetchLoadingShell: hasLoadingBoundary(route, hasSiblingInterceptLoading),
     patternParts: [...route.patternParts],
     isDynamic: route.isDynamic,
+    ...(rendersDynamically ? { rendersDynamically: true } : {}),
     ...(requiresDynamicNavigationRequest(route) ? { requiresDynamicNavigationRequest: true } : {}),
     ...((route.rootParamNames?.length ?? 0) > 0 ? { hasRootParams: true } : {}),
   };
 }
 
-/** Project App routes together so sibling-intercept loading is applied to its target route. */
-export function toLinkPrefetchRoutes(routes: readonly AppRoute[]): VinextLinkPrefetchRoute[] {
+/**
+ * Project App routes together so sibling-intercept loading is applied to its
+ * target route. `isRenderedDynamically` reads each route's segment config.
+ */
+export function toLinkPrefetchRoutes(
+  routes: readonly AppRoute[],
+  isRenderedDynamically?: (route: AppRoute) => boolean,
+): VinextLinkPrefetchRoute[] {
   const siblingInterceptLoadingTargets: string[][] = [];
   for (const route of routes) {
     for (const intercept of route.siblingIntercepts) {
@@ -152,6 +161,7 @@ export function toLinkPrefetchRoutes(routes: readonly AppRoute[]): VinextLinkPre
       siblingInterceptLoadingTargets.some((targetParts) =>
         patternsStructurallyEquivalent(targetParts, route.patternParts),
       ),
+      isRenderedDynamically?.(route) ?? false,
     ),
   );
 }

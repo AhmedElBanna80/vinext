@@ -102,3 +102,19 @@ export function classifyAppPageRouteStaticEligibility(
   });
   return eligible ? "eligible" : "ineligible";
 }
+
+/**
+ * Whether the route's segment config rules out static generation, so Next.js
+ * renders it on every request. An "unreadable" route or a source that can't be
+ * read counts as not dynamic.
+ */
+export function isAppPageRouteRenderedDynamically(
+  route: AppRoute,
+  readMdxEsm: ((source: string) => string) | null,
+): boolean {
+  try {
+    return classifyAppPageRouteStaticEligibility(route, readMdxEsm) === "ineligible";
+  } catch {
+    return false;
+  }
+}

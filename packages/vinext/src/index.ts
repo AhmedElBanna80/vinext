@@ -63,6 +63,7 @@ import {
   CACHEABILITY_REQUEST_PROJECTION_MODULE,
 } from "./server/cacheability-manifest.js";
 import { PREGENERATED_CONCRETE_PATHS_MODULE } from "./server/pregenerated-concrete-paths.js";
+import { isAppPageRouteRenderedDynamically } from "./build/app-page-static-eligibility.js";
 import { rewriteOutputRootExternals } from "./build/output-root-externals.js";
 
 import { installSocketErrorBackstop } from "./server/socket-error-backstop.js";
@@ -5336,11 +5337,24 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   }),
                 )
               : [];
+            // Only production viewport prefetches read whether a route is
+            // rendered dynamically, and Cache Components segment config
+            // can't say (see `rendersDynamically`), so neither classifies
+            // routes.
+            const classifyDynamicRoutes =
+              this.environment.config.command === "build" && !nextConfig?.cacheComponents;
+            const readMdxEsm =
+              classifyDynamicRoutes && pageExtensionsIncludeMdx(nextConfig?.pageExtensions ?? [])
+                ? await loadMdxEsmReader(root)
+                : null;
             return generateBrowserEntry(
               graph.routes,
               pagesPrefetchRoutes,
               nextConfig.rewrites,
               nextConfig.i18n?.locales,
+              classifyDynamicRoutes
+                ? (route) => isAppPageRouteRenderedDynamically(route, readMdxEsm)
+                : undefined,
             );
           }
           if (id === RESOLVED_APP_ROUTE_MANIFEST && hasAppDir) {

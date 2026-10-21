@@ -44,6 +44,17 @@ export type AppRoutePrefetchPolicy = {
   dynamicStaleTime: "verbatim" | "full-prefetch" | "ignore";
   fallbackTtl: "dynamic" | "static";
   prefetchShellFirst: boolean;
+  /**
+   * How a re-prefetch after a whole-cache invalidation replaces a prefetch
+   * that renders the page of a route Next.js renders dynamically
+   * (`rendersDynamically`): the full navigation payload or, for an href with
+   * search params, the page with empty search params. The caller applies it
+   * only to such a request. An automatic Next.js prefetch of such a route
+   * stops at the route tree or the nearest loading boundary instead.
+   *  - "skip": no loading boundary, so nothing is fetched until intent.
+   *  - "loading-shell": fetch the route's loading shell.
+   */
+  invalidationPrefetch?: "loading-shell" | "skip";
   /** Fetch the route tree before the concrete page segment. */
   requiresRouteTreePrefetch?: true;
   shouldPrefetch: boolean;
@@ -135,6 +146,9 @@ export function resolveAutoAppRoutePrefetch(href: string): AppRoutePrefetchPolic
     dynamicStaleTime: cacheForNavigation ? "verbatim" : "ignore",
     fallbackTtl: "static",
     prefetchShellFirst: requiresRouteTreePrefetch || hasSearchParams || !route.isDynamic,
+    ...(route.rendersDynamically === true
+      ? { invalidationPrefetch: route.canPrefetchLoadingShell ? "loading-shell" : "skip" }
+      : {}),
     ...(requiresRouteTreePrefetch ? { requiresRouteTreePrefetch: true } : {}),
     shouldPrefetch: true,
   };

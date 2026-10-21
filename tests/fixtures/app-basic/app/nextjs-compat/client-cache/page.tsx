@@ -24,6 +24,12 @@ export default function ClientCacheHome() {
       <Link href="/nextjs-compat/client-cache/no-loading/1" id="client-cache-no-loading-auto">
         Auto prefetch without loading
       </Link>
+      <Link href="/nextjs-compat/client-cache-full-render/1" id="client-cache-full-render-auto">
+        Auto prefetch of a dynamic page without loading or parallel slots
+      </Link>
+      <Link href="/nextjs-compat/client-cache-static-param/1" id="client-cache-static-param-auto">
+        Auto prefetch of a statically generated dynamic page
+      </Link>
       <Link
         href="/nextjs-compat/client-cache-late-dynamic"
         prefetch={true}

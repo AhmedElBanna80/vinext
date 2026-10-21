@@ -256,6 +256,57 @@ test.describe("Next.js compat: client cache", () => {
     );
   });
 
+  for (const { name, selector } of [
+    { name: "a revalidatePath Server Action", selector: "#client-cache-revalidate-action" },
+    { name: "router.refresh()", selector: "#client-cache-invalidate" },
+  ]) {
+    test(`${name} defers dynamic full-render link prefetches to intent (#4083)`, async ({
+      page,
+    }) => {
+      const fullRenderTarget = "/nextjs-compat/client-cache-full-render/1";
+      const otherLinkTargets = [
+        `${ROOT}/0`,
+        `${ROOT}/1`,
+        `${ROOT}/default-stale/1`,
+        `${ROOT}/no-loading/1`,
+        "/nextjs-compat/client-cache-late-dynamic",
+        "/nextjs-compat/client-cache-static-param/1",
+      ];
+      const requests = trackRscRequests(page);
+      await openHome(page);
+      // The automatic prefetch of a dynamic route without a loading boundary
+      // or parallel slots renders the whole page.
+      await expect
+        .poll(() => requestsFor(requests, fullRenderTarget).filter((r) => !r.partial).length)
+        .toBe(1);
+      // Let every initial prefetch go out so later requests are re-prefetches.
+      for (const pathname of otherLinkTargets) {
+        await expect.poll(() => requestsFor(requests, pathname).length).toBeGreaterThan(0);
+      }
+
+      requests.length = 0;
+      await page.click(selector);
+
+      // The other visible links are re-prefetched after the invalidation, as in
+      // Next.js, including the statically generated dynamic page. Re-running
+      // the force-dynamic page's full-render prefetch would cost a server render
+      // per visible link on every invalidation, so it waits for intent. Wait
+      // for every other re-prefetch, then allow time for any request still in
+      // the prefetch fetch queue before asserting the full render never went
+      // out.
+      for (const pathname of otherLinkTargets) {
+        await expect.poll(() => requestsFor(requests, pathname).length).toBeGreaterThan(0);
+      }
+      await page.waitForTimeout(500);
+      expect(requestsFor(requests, fullRenderTarget)).toEqual([]);
+
+      await page.hover("#client-cache-full-render-auto");
+      await expect.poll(() => requestsFor(requests, fullRenderTarget).length).toBe(1);
+      await page.click("#client-cache-full-render-auto");
+      await expect(page.locator("#client-cache-full-render-id")).toHaveText("1");
+    });
+  }
+
   test("a pending prefetch that becomes dynamic uses the completed dynamic bound", async ({
     page,
   }) => {

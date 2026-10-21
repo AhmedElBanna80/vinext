@@ -17,6 +17,7 @@ import {
   toLinkPrefetchRoutes,
 } from "../packages/vinext/src/entries/app-browser-entry.js";
 import { buildAppRscManifestCode } from "../packages/vinext/src/entries/app-rsc-manifest.js";
+import { isAppPageRouteRenderedDynamically } from "../packages/vinext/src/build/app-page-static-eligibility.js";
 import {
   generateAppRequestRscEntry,
   generateAppResponseRscEntry,
@@ -543,6 +544,78 @@ describe("App Router generated manifest construction", () => {
     } satisfies AppRoute;
 
     expect(toLinkPrefetchRoute(route).canPrefetchLoadingShell).toBe(true);
+  });
+
+  it("marks routes whose segment config rules out static generation as rendered dynamically", () => {
+    const appDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-link-prefetch-dynamic-"));
+    try {
+      const writeSource = (relativePath: string, code: string) => {
+        const filePath = path.join(appDir, relativePath);
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, code);
+        return filePath;
+      };
+      const layoutPath = writeSource(
+        "layout.tsx",
+        "export default function Layout({ children }) { return children; }",
+      );
+      const pageRoute = (
+        pattern: string,
+        isDynamic: boolean,
+        pageSource: string,
+        layouts = [layoutPath],
+      ): AppRoute => {
+        const patternParts = pattern.split("/").filter(Boolean);
+        return {
+          ...minimalAppRoutes[0],
+          pattern,
+          patternParts,
+          routeSegments: patternParts.map((part) =>
+            part.startsWith(":") ? `[${part.slice(1)}]` : part,
+          ),
+          pagePath: writeSource(`${patternParts.join("/")}/page.tsx`, pageSource),
+          layouts,
+          layoutTreePositions: layouts.map((_, index) => index),
+          isDynamic,
+          params: patternParts.filter((part) => part.startsWith(":")).map((part) => part.slice(1)),
+        };
+      };
+      const page = "export default function Page() { return null; }";
+      const accountLayoutPath = writeSource(
+        "account/layout.tsx",
+        "export const revalidate = 0;\nexport default function Layout({ children }) { return children; }",
+      );
+      const routes = [
+        pageRoute("/settings", false, `export const dynamic = "force-dynamic";\n${page}`),
+        pageRoute("/account", false, page, [layoutPath, accountLayoutPath]),
+        pageRoute("/about", false, page),
+        pageRoute("/products/:id", true, page),
+        pageRoute(
+          "/posts/:slug",
+          true,
+          `export function generateStaticParams() { return []; }\n${page}`,
+        ),
+      ];
+
+      const prefetchRoutes = toLinkPrefetchRoutes(routes, (route) =>
+        isAppPageRouteRenderedDynamically(route, null),
+      );
+      expect(
+        prefetchRoutes.map(({ patternParts, rendersDynamically }) => [
+          patternParts.join("/"),
+          rendersDynamically,
+        ]),
+      ).toEqual([
+        ["settings", true],
+        ["account", true],
+        ["about", undefined],
+        ["products/:id", true],
+        ["posts/:slug", undefined],
+      ]);
+      expect(toLinkPrefetchRoutes(routes).some((route) => route.rendersDynamically)).toBe(false);
+    } finally {
+      fs.rmSync(appDir, { force: true, recursive: true });
+    }
   });
 
   it("marks root-param routes for concrete route-tree prefetching", () => {

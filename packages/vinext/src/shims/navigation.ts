@@ -1135,7 +1135,7 @@ export function invalidatePrefetchCache(): void {
     fireRetainedPrefetchInvalidation(retained);
   }
   if (!isServer) {
-    getNavigationRuntime()?.functions.pingVisibleLinks?.();
+    getNavigationRuntime()?.functions.pingVisibleLinks?.("cache-invalidation");
   }
 }
 

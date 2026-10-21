@@ -423,6 +423,69 @@ describe("Link App Router prefetch mode", () => {
     }
   });
 
+  it("tells invalidation re-prefetches how to replace a dynamically rendered page", () => {
+    const originalWindow = globalThis.window;
+    (globalThis as any).window = {
+      location: {
+        href: "http://localhost/blog",
+        origin: "http://localhost",
+      },
+      __VINEXT_LINK_PREFETCH_ROUTES__: [
+        {
+          canPrefetchLoadingShell: false,
+          patternParts: ["dashboard"],
+          isDynamic: false,
+          rendersDynamically: true,
+        },
+        { canPrefetchLoadingShell: false, patternParts: ["about"], isDynamic: false },
+        {
+          canPrefetchLoadingShell: false,
+          patternParts: ["products", ":id"],
+          isDynamic: true,
+          rendersDynamically: true,
+        },
+        { canPrefetchLoadingShell: false, patternParts: ["posts", ":slug"], isDynamic: true },
+        {
+          canPrefetchLoadingShell: true,
+          patternParts: ["blog", ":slug"],
+          isDynamic: true,
+          rendersDynamically: true,
+        },
+        {
+          canPrefetchLoadingShell: false,
+          patternParts: ["teams", ":team", "dashboard"],
+          isDynamic: true,
+          rendersDynamically: true,
+          requiresDynamicNavigationRequest: true,
+        },
+      ],
+    };
+
+    try {
+      const invalidationPrefetch = (href: string) =>
+        resolveAutoAppRoutePrefetch(href).invalidationPrefetch;
+      // Routes whose segment config rules out static generation: without a
+      // loading boundary, nothing replaces a page render.
+      expect(invalidationPrefetch("/dashboard")).toBe("skip");
+      expect(invalidationPrefetch("/dashboard?tab=usage")).toBe("skip");
+      expect(invalidationPrefetch("/products/1")).toBe("skip");
+      expect(invalidationPrefetch("/products/1?tab=reviews")).toBe("skip");
+      expect(invalidationPrefetch("/teams/vercel/dashboard?tab=members")).toBe("skip");
+      // A route with a loading boundary falls back to its loading shell.
+      expect(invalidationPrefetch("/blog/hello?ref=home")).toBe("loading-shell");
+      expect(invalidationPrefetch("/blog/hello")).toBe("loading-shell");
+      // Statically generated routes are unchanged.
+      expect(invalidationPrefetch("/about")).toBeUndefined();
+      expect(invalidationPrefetch("/posts/hello")).toBeUndefined();
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = originalWindow;
+      }
+    }
+  });
+
   it("shell-prefetches dynamic routes that require fresh navigation and routes with loading boundaries", () => {
     const originalWindow = globalThis.window;
     (globalThis as any).window = {
