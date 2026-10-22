@@ -1,7 +1,7 @@
 /// <reference types="@vitejs/plugin-rsc/types" />
 
 import "./server-globals.js";
-import type { ReactNode } from "react";
+import type { ReactElement, ReactNode } from "react";
 import type { ReactFormState } from "react-dom/client";
 import {
   preinitModule,
@@ -32,6 +32,11 @@ import { isOpenRedirectShaped, repeatedSlashRedirectResponse } from "./open-redi
 import { notFoundResponse } from "./http-error-responses.js";
 import { withScriptNonce } from "vinext/shims/script-nonce-context";
 import { withAppRouterTree } from "vinext/shims/app-router-tree-context";
+import {
+  CAUGHT_NOT_FOUND_BOUNDARIES_GLOBAL,
+  withCaughtNotFoundBoundaries,
+  type CaughtNotFoundBoundaries,
+} from "vinext/shims/caught-not-found-boundaries";
 import {
   BeforeInteractiveContext,
   type BeforeInteractiveInlineScript,
@@ -72,6 +77,7 @@ import {
 } from "./app-client-reference-preloader.js";
 import {
   createStreamedClientReferences,
+  resetStreamedClientReferences,
   renderStreamedStylesheets,
   runWithStreamedClientReferences,
   wrapClientReferenceRequire,
@@ -468,6 +474,12 @@ export async function handleSsr(
      */
     isCacheCandidate?: boolean;
     fallbackToErrorDocumentOnShellError?: boolean;
+    /**
+     * The parallel slot not-found boundaries that catch the error that
+     * rejected the shell, or null when none catches it. The document then
+     * renders again from the same payload with them caught.
+     */
+    resolveCaughtNotFoundBoundaries?: (error: unknown) => readonly string[] | null;
     dynamicStaleTimeSeconds?: number;
     getInitialNavigationCacheMetadata?: () => InitialNavigationCacheMetadata;
   },
@@ -776,22 +788,69 @@ export async function handleSsr(
         let htmlStream: ReadableStream<Uint8Array>;
         let renderComplete = Promise.resolve();
         let shellErrorRecovered = false;
+        let caughtShellError: unknown;
+        let caughtBoundaries: CaughtNotFoundBoundaries | null = null;
         let shouldDelayInitialHtmlPull = false;
+        // Fizz has no error boundaries, so a parallel slot's notFound() rejects
+        // the shell. The root to render the document again with, from the same
+        // payload, with the slot boundaries that catch it on the client
+        // rendering their fallback, or null when any copy isn't caught in its
+        // slot. No server component runs again.
+        const prepareCaughtNotFoundRoot = (error: unknown): ReactElement | null => {
+          const caughtNotFoundBoundaries =
+            options?.resolveCaughtNotFoundBoundaries?.(error) ?? null;
+          if (!caughtNotFoundBoundaries || caughtNotFoundBoundaries.length === 0) return null;
+          // Decode the payload again inside this render, so that it hints the
+          // client references' stylesheets and modules to this document, like
+          // the render it replaces. A fallback shell's stays open, as its SSR
+          // stream does, so the references its aborted prerender omitted stay
+          // suspended. Without the payload's bytes, the shell's error goes on
+          // to the fallback above the slot's layout.
+          const replayedRscStream = rscEmbed.replay({
+            keepOpen: pprFallbackShellSignal !== undefined,
+          });
+          if (!replayedRscStream) return null;
+          ssrStream = replayedRscStream;
+          flightRoot = null;
+          beforeInteractiveInlineScripts.length = 0;
+          clearServerInsertedHTML();
+          resetStreamedClientReferences(streamedReferences, routeReferences);
+          const boundaries: CaughtNotFoundBoundaries = {
+            ids: new Set(caughtNotFoundBoundaries),
+            rendered: new Set(),
+          };
+          caughtBoundaries = boundaries;
+          return withCaughtNotFoundBoundaries(boundaries, ssrRoot);
+        };
         if (pprFallbackShellSignal) {
           const prerender = await loadStaticPrerender();
-          const htmlAbortController = new AbortController();
-          const pendingHtml = runWithStreamedClientReferences(streamedReferences, () =>
-            prerender(ssrRoot, {
-              ...renderOptions,
-              signal: htmlAbortController.signal,
-            }),
-          );
-          // Known limitation: unlike Next.js, nothing waits for modules that are
-          // still loading. A next/dynamic() without `loading` whose import is
-          // pending here has no Suspense boundary of its own, so it suspends to
-          // the nearest one; with no loading.js above it, the shell is empty.
-          setTimeout(() => htmlAbortController.abort(), 0);
-          htmlStream = (await pendingHtml).prelude;
+          const prerenderFallbackShell = async (
+            root: ReactElement,
+          ): Promise<ReadableStream<Uint8Array>> => {
+            const htmlAbortController = new AbortController();
+            const pendingHtml = runWithStreamedClientReferences(streamedReferences, () =>
+              prerender(root, {
+                ...renderOptions,
+                signal: htmlAbortController.signal,
+              }),
+            );
+            // Known limitation: unlike Next.js, nothing waits for modules that
+            // are still loading. A next/dynamic() without `loading` whose import
+            // is pending here has no Suspense boundary of its own, so it
+            // suspends to the nearest one; with no loading.js above it, the
+            // shell is empty.
+            setTimeout(() => htmlAbortController.abort(), 0);
+            return (await pendingHtml).prelude;
+          };
+          try {
+            htmlStream = await prerenderFallbackShell(ssrRoot);
+          } catch (error) {
+            const caughtRoot = prepareCaughtNotFoundRoot(error);
+            if (!caughtRoot) throw error;
+            // A slot's not-found boundary that throws replaces the 404.
+            htmlStream = await prerenderFallbackShell(caughtRoot);
+            caughtShellError = error;
+          }
         } else {
           let streamingHtmlStream: Awaited<ReturnType<typeof renderToReadableStream>> | undefined;
           try {
@@ -811,15 +870,33 @@ export async function handleSsr(
             htmlStream = streamingHtmlStream;
           } catch (error) {
             void streamingHtmlStream?.cancel().catch(() => {});
-            if (
+            const caughtRoot = prepareCaughtNotFoundRoot(error);
+            if (caughtRoot) {
+              let caughtHtmlStream: Awaited<ReturnType<typeof renderToReadableStream>> | undefined;
+              try {
+                caughtHtmlStream = await runWithStreamedClientReferences(streamedReferences, () =>
+                  renderToReadableStream(caughtRoot, renderOptions),
+                );
+                if (options?.waitForAllReady === true) await caughtHtmlStream.allReady;
+              } catch (caughtRenderError) {
+                // A slot's not-found boundary that throws replaces the 404.
+                void caughtHtmlStream?.cancel().catch(() => {});
+                throw caughtRenderError;
+              }
+              renderComplete = caughtHtmlStream.allReady;
+              shouldDelayInitialHtmlPull = options?.waitForAllReady !== true;
+              caughtShellError = error;
+              htmlStream = caughtHtmlStream;
+            } else if (
               options?.fallbackToErrorDocumentOnShellError !== true ||
               options?.waitForAllReady === true ||
               typeof (error as { digest?: unknown } | null)?.digest === "string"
             ) {
               throw error;
+            } else {
+              shellErrorRecovered = true;
+              htmlStream = renderSsrErrorDocumentShell(bootstrapModuleUrl, options?.scriptNonce);
             }
-            shellErrorRecovered = true;
-            htmlStream = renderSsrErrorDocumentShell(bootstrapModuleUrl, options?.scriptNonce);
           }
         }
 
@@ -894,6 +971,12 @@ export async function handleSsr(
             options?.formState ?? null,
             insertedHTML +
               errorMetaHTML +
+              (caughtBoundaries === null
+                ? ""
+                : createInlineScriptTag(
+                    `self.${CAUGHT_NOT_FOUND_BOUNDARIES_GLOBAL}=${safeJsonStringify([...caughtBoundaries.rendered])}`,
+                    options?.scriptNonce,
+                  )) +
               getTraceMetaHTML() +
               initialDevServerErrorHTML +
               // The transform inlines Fizz's stylesheet links before it adds
@@ -957,6 +1040,7 @@ export async function handleSsr(
           renderComplete,
           capturedRscData: options?.capturedRscDataRef?.value ?? null,
           shellErrorRecovered,
+          ...(caughtShellError === undefined ? {} : { caughtShellError }),
           linkHeader: reactLinkHeader,
         };
       } catch (error) {
