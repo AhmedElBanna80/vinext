@@ -2000,6 +2000,12 @@ describe("App Router Production server (startProdServer)", () => {
     expect(location).toContain("/about");
   });
 
+  it("answers a config redirect with its statusCode (production)", async () => {
+    const res = await fetch(`${baseUrl}/config-redirect-status-code`, { redirect: "manual" });
+    expect(res.status).toBe(301);
+    expect(res.headers.get("location")).toMatch(/\/about$/);
+  });
+
   // Issue #1529: an RSC client navigation that hits a next.config.js redirect
   // must keep the cache-busting `_rsc` query on the redirect Location so the
   // browser's auto-followed request to the destination is still treated as an

@@ -2354,6 +2354,12 @@ export const config = { matcher: "${matcher}" };
     expect(res.headers.get("location")).toBe("/about");
   });
 
+  it("answers a next.config.js redirect with its statusCode", async () => {
+    const res = await fetch(`${baseUrl}/status-code-redirect`, { redirect: "manual" });
+    expect(res.status).toBe(301);
+    expect(res.headers.get("location")).toBe("/about");
+  });
+
   // Ported from Next.js:
   // test/e2e/app-dir/rewrites-redirects/rewrites-redirects.test.ts
   // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/rewrites-redirects/rewrites-redirects.test.ts
@@ -9580,6 +9586,12 @@ describe("Production server next.config.js features (Pages Router)", () => {
     const res = await fetch(`${prodUrl}/old-about`, { redirect: "manual" });
     expect(res.status).toBe(308); // permanent redirect
     expect(res.headers.get("location")).toContain("/about");
+  });
+
+  it("answers a next.config.js redirect with its statusCode in production", async () => {
+    const res = await fetch(`${prodUrl}/status-code-redirect`, { redirect: "manual" });
+    expect(res.status).toBe(301);
+    expect(res.headers.get("location")).toBe("/about");
   });
 
   it("applies redirects with repeated dynamic params in production", async () => {

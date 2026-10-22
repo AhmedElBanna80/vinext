@@ -80,6 +80,13 @@ const nextConfig: NextConfig = {
         destination: "/about",
         permanent: true,
       },
+      // Used by E2E: config-redirect.spec.ts and Vitest:
+      // app-router-production-server.test.ts (statusCode answers as is)
+      {
+        source: "/config-redirect-status-code",
+        destination: "/about",
+        statusCode: 301,
+      },
       // Used by E2E: config-redirect.spec.ts (non-permanent → 307)
       {
         source: "/config-redirect-query",

@@ -13925,7 +13925,7 @@ describe("matchRedirect locale-static index", () => {
     const result = matchRedirect("/en/security", redirects, emptyCtx);
     expect(result).not.toBeNull();
     expect(result!.destination).toBe("/en/security-dest");
-    expect(result!.permanent).toBe(false);
+    expect(result!.statusCode).toBe(307);
   });
 
   it("matches a slash-ending source against a canonical slashed pathname", async () => {
@@ -14063,7 +14063,7 @@ describe("matchRedirect locale-static index", () => {
     });
     expect(withLocalePrefix).toEqual({
       destination: "/target/forced",
-      permanent: false,
+      statusCode: 307,
       destinationQuery: [],
     });
 
@@ -14075,7 +14075,7 @@ describe("matchRedirect locale-static index", () => {
     });
     expect(withoutLocalePrefix).toEqual({
       destination: "/target/forced",
-      permanent: false,
+      statusCode: 307,
       destinationQuery: [],
     });
   });
@@ -14090,7 +14090,7 @@ describe("matchRedirect locale-static index", () => {
     const result = matchRedirect("/other", redirects, emptyCtx);
     expect(result).not.toBeNull();
     expect(result!.destination).toBe("/other-dest");
-    expect(result!.permanent).toBe(true);
+    expect(result!.statusCode).toBe(308);
   });
 });
 
@@ -15866,7 +15866,7 @@ describe("matchRedirect destination param substitution", () => {
     const { matchRedirect } = await import("../packages/vinext/src/config/config-matchers.js");
     const redirects = [{ source: "/post/:id", destination: "/api/:id/:id", permanent: false }];
     const result = matchRedirect("/post/123", redirects, emptyCtx);
-    expect(result).toEqual({ destination: "/api/123/123", permanent: false, destinationQuery: [] });
+    expect(result).toEqual({ destination: "/api/123/123", statusCode: 307, destinationQuery: [] });
   });
 
   it("replaces adjacent params separated by literal characters in redirect destinations", async () => {
@@ -15877,7 +15877,7 @@ describe("matchRedirect destination param substitution", () => {
     const result = matchRedirect("/legacy/2024/06", redirects, emptyCtx);
     expect(result).toEqual({
       destination: "/archive/2024-06",
-      permanent: true,
+      statusCode: 308,
       destinationQuery: [],
     });
   });
@@ -15892,7 +15892,7 @@ describe("matchRedirect destination param substitution", () => {
       },
     ];
     const result = matchRedirect("/en/docs", redirects, emptyCtx);
-    expect(result).toEqual({ destination: "/en/en/docs", permanent: false, destinationQuery: [] });
+    expect(result).toEqual({ destination: "/en/en/docs", statusCode: 307, destinationQuery: [] });
   });
 
   it("substitutes named captures from has conditions into redirect destinations", async () => {
@@ -15913,7 +15913,7 @@ describe("matchRedirect destination param substitution", () => {
     });
     expect(result).toEqual({
       destination: "/home?authorized=yes",
-      permanent: false,
+      statusCode: 307,
       destinationQuery: [["authorized", "authorized", "yes"]],
     });
   });
@@ -15937,7 +15937,7 @@ describe("matchRedirect destination param substitution", () => {
     ]) {
       expect(matchRedirect(pathname, redirects, emptyCtx)).toEqual({
         destination: `/login?next=${next}&safe=1`,
-        permanent: false,
+        statusCode: 307,
         // The template query is parsed before substitution, so `next` stays
         // one value for the request query merge.
         destinationQuery: [

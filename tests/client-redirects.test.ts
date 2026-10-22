@@ -105,6 +105,6 @@ describe("client redirects", () => {
     // rule is the one the server would apply too.
     expect(
       matchClientRedirect("/docs/intro", redirects, browserContext("from=link"), basePathState),
-    ).toMatchObject({ destination: "/v2/intro", permanent: false });
+    ).toMatchObject({ destination: "/v2/intro", statusCode: 307 });
   });
 });

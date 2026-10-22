@@ -57,6 +57,20 @@ test.describe("Config Redirects (OpenNext compat)", () => {
     expect(res.headers()["location"]).toContain("/about?from=config");
   });
 
+  // Next.js answers `statusCode || (permanent ? 308 : 307)` (getRedirectStatus
+  // in lib/redirect-status.ts), so a `statusCode: 301` rule answers 301.
+  test("statusCode redirect returns that status", async ({ page, request }) => {
+    const res = await request.get(`${BASE}/config-redirect-status-code`, {
+      maxRedirects: 0,
+    });
+    expect(res.status()).toBe(301);
+    expect(res.headers()["location"]).toMatch(/\/about$/);
+
+    await page.goto(`${BASE}/config-redirect-status-code`);
+    await page.waitForURL(/\/about$/);
+    await expect(page.getByText("About", { exact: true })).toBeVisible();
+  });
+
   // Ref: opennextjs-cloudflare config.redirect.test.ts — parameterized redirect
   test("parameterized redirect preserves slug", async ({ request }) => {
     const res = await request.get(`${BASE}/old-blog/hello-world`, {

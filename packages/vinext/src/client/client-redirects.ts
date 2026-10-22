@@ -18,7 +18,7 @@ type ClientRedirectFields = Pick<NextRedirect, "basePath" | "locale" | "source">
 export type ClientRedirect =
   | (ClientRedirectFields & {
       destination: string;
-      permanent: boolean;
+      permanent?: boolean;
       requiresServerEvaluation?: never;
     })
   | (ClientRedirectFields & {

@@ -182,7 +182,13 @@ export type HasCondition = {
 export type NextRedirect = {
   source: string;
   destination: string;
-  permanent: boolean;
+  /** `true` answers 308, `false` 307. Ignored when `statusCode` is set. */
+  permanent?: boolean;
+  /**
+   * Explicit redirect status, taking precedence over `permanent` as in Next.js
+   * `getRedirectStatus` (lib/redirect-status.ts).
+   */
+  statusCode?: 301 | 302 | 303 | 307 | 308;
   has?: HasCondition[];
   missing?: HasCondition[];
   /**
@@ -1791,6 +1797,36 @@ function validateConfigConditions(
   }
 }
 
+const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
+
+/**
+ * Fail config loading on a redirect without a valid status, with the rules of
+ * Next.js's checkRedirect (load-custom-routes.ts): `statusCode` must be one of
+ * the redirect statuses, and `permanent` a boolean when it is absent.
+ */
+function validateRedirectStatuses(redirects: ReadonlyArray<NextRedirect>): void {
+  const invalid: string[] = [];
+  for (const redirect of redirects) {
+    const parts: string[] = [];
+    if (redirect.statusCode && !REDIRECT_STATUS_CODES.has(redirect.statusCode)) {
+      parts.push("`statusCode` is not undefined or valid statusCode");
+    }
+    if (typeof redirect.permanent !== "boolean" && !redirect.statusCode) {
+      parts.push("`permanent` is not set to `true` or `false`");
+    }
+    if (parts.length > 0) {
+      invalid.push(`  ${describeSource(redirect.source)}: ${parts.join(", ")}`);
+    }
+  }
+  if (invalid.length > 0) {
+    throw new Error(
+      `Invalid next.config.js redirect${invalid.length === 1 ? "" : "s"}:\n` +
+        `${invalid.join("\n")}\n` +
+        `Valid redirect statusCode values are ${[...REDIRECT_STATUS_CODES].join(", ")}`,
+    );
+  }
+}
+
 /** JSON for a config value, or its type when JSON cannot serialize it. */
 function describeConfigValue(value: unknown): string {
   try {
@@ -1975,6 +2011,7 @@ export async function resolveNextConfig(
     validateConfigSources("redirect", redirects);
     validateConfigSources("rewrite", allRewrites);
     validateConfigConditions("redirect", redirects);
+    validateRedirectStatuses(redirects);
     validateConfigConditions("rewrite", allRewrites);
 
     // Like Next.js' checkCustomRoutes (packages/next/src/lib/load-custom-routes.ts),

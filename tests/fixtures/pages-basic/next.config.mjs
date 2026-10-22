@@ -23,6 +23,12 @@ const nextConfig = {
         destination: "/about",
         permanent: true,
       },
+      // Used by Vitest: pages-router.test.ts (statusCode answers as is)
+      {
+        source: "/status-code-redirect",
+        destination: "/about",
+        statusCode: 301,
+      },
       {
         source: "/repeat-redirect/:id",
         destination: "/docs/:id/:id",

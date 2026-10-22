@@ -529,7 +529,7 @@ function stripTrailingSlashForConfigMatch(value: string): string {
  */
 export type RedirectMatch = {
   destination: string;
-  permanent: boolean;
+  statusCode: number;
   destinationQuery: RedirectDestinationQueryPart[];
 };
 
@@ -794,7 +794,8 @@ function resolveRedirectMatch(
   return {
     // Collapse protocol-relative URLs (e.g. //evil.com from decoded %2F in catch-all params).
     destination: substituteAndSanitizeDestination(redirect.destination, params, "redirect"),
-    permanent: redirect.permanent,
+    // Next.js getRedirectStatus (lib/redirect-status.ts).
+    statusCode: redirect.statusCode || (redirect.permanent ? 308 : 307),
     destinationQuery: substituteRedirectDestinationQuery(redirect.destination, params),
   };
 }

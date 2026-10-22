@@ -720,6 +720,37 @@ describe("next.config.js source validation", () => {
     ).resolves.toBeDefined();
   });
 
+  it("rejects a redirect without a valid status like Next.js", async () => {
+    // checkRedirect in Next.js's load-custom-routes.ts fails the build for each
+    // of these.
+    for (const status of [
+      { statusCode: 404 },
+      { statusCode: 600 },
+      { statusCode: 404, permanent: true },
+      {},
+      { permanent: "true" },
+    ]) {
+      await expect(
+        resolveNextConfig({
+          redirects: () => [{ source: "/x", destination: "/y", ...status }],
+        } as never),
+        JSON.stringify(status),
+      ).rejects.toThrow('Invalid next.config.js redirect:\n  "/x": `');
+    }
+
+    // `statusCode` stands in for `permanent`, and takes precedence over it.
+    const { redirects } = await resolveNextConfig({
+      redirects: () => [
+        { source: "/a", destination: "/y", statusCode: 301 },
+        { source: "/b", destination: "/y", statusCode: 302, permanent: true },
+      ],
+    } as never);
+    const statusOf = (pathname: string) =>
+      matchRedirect(pathname, redirects, requestContextFromRequest(new Request("http://x/")))
+        ?.statusCode;
+    expect([statusOf("/a"), statusOf("/b")]).toEqual([301, 302]);
+  });
+
   it("reports a missing route entry instead of crashing on it", async () => {
     for (const type of ["redirect", "rewrite", "header"]) {
       await expect(
