@@ -99,7 +99,6 @@ import {
   readTrustedPrerenderRouteParamsFromHeaders,
   serializePrerenderRouteParamsHeader,
 } from "./prerender-route-params.js";
-import { seedMemoryCacheFromPrerender as seedMemoryCacheFromPrerenderFallback } from "./seed-cache.js";
 import { installSocketErrorBackstop } from "./socket-error-backstop.js";
 import {
   trustProxy,
@@ -1450,6 +1449,15 @@ export async function startProdServer(options: ProdServerOptions = {}) {
   // the build process.
   installSocketErrorBackstop({ runningServer: options.purpose !== "prerender" });
 
+  // Like `vinext start` and `next start`, default to production so React and
+  // the other packages the server bundles import load their production
+  // builds. Custom entries, including the generated standalone server.js,
+  // call this directly. Build-time servers run inside the build, which has
+  // already chosen NODE_ENV.
+  if (options.purpose !== "prerender" && !process.env.NODE_ENV) {
+    Reflect.set(process.env, "NODE_ENV", "production");
+  }
+
   const {
     port = process.env.PORT ? parseInt(process.env.PORT) : 3000,
     host = "0.0.0.0",
@@ -1650,6 +1658,14 @@ function resolveAppRouterHandler(
 }
 
 type AppRouterPrerenderSeeder = (serverDir: string) => Promise<number>;
+
+// Loaded on demand: seed-cache imports React, which picks its development or
+// production build when first loaded, so it must not load before
+// startProdServer has chosen NODE_ENV.
+async function seedMemoryCacheFromPrerenderFallback(serverDir: string): Promise<number> {
+  const { seedMemoryCacheFromPrerender } = await import("./seed-cache.js");
+  return seedMemoryCacheFromPrerender(serverDir);
+}
 type AppRouterPrerenderSeederExport = (serverDir: string) => unknown;
 
 function isAppRouterPrerenderSeederExport(value: unknown): value is AppRouterPrerenderSeederExport {
