@@ -110,7 +110,7 @@ function preloadImageResource(input: {
   });
 }
 
-const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
+const ImageImpl = forwardRef<HTMLImageElement, ImageProps>(function Image(
   {
     src: srcProp,
     alt,
@@ -512,5 +512,10 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
     />
   );
 });
+
+// Annotated so declaration emit references ImageProps by name and keeps its
+// @deprecated tags (https://github.com/vercel/next.js/pull/98597).
+const Image: React.ForwardRefExoticComponent<ImageProps & React.RefAttributes<HTMLImageElement>> =
+  ImageImpl;
 
 export default Image;
