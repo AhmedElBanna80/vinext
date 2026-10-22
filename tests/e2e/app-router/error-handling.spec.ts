@@ -356,6 +356,31 @@ test.describe("Not Found", () => {
     await expect(page.locator("#not-found-sibling-intercept-source-nf")).toHaveCount(0);
   });
 
+  test("a sibling intercepting layout's notFound() reaches the source segment's not-found", async ({
+    page,
+  }) => {
+    await page.goto(`${BASE}/nextjs-compat/not-found-sibling-intercept`);
+    await waitForAppRouterHydration(page);
+
+    // The (.)item/[id] layout's signal skips the not-found inside it, and with
+    // none above it in the intercepting route, Next.js renders the source
+    // segment's not-found in place of the intercepting route.
+    await page.getByRole("link", { name: "Layout not found" }).click();
+    await expect(page).toHaveURL(/\/not-found-sibling-intercept\/item\/layout-missing$/);
+    await expect(
+      page.locator("#not-found-sibling-intercept-layout #not-found-sibling-intercept-source-nf"),
+    ).toBeVisible();
+    await expect(page.locator("#not-found-sibling-intercept-intercept-layout")).toHaveCount(0);
+    await expect(page.locator("#not-found-sibling-intercept-intercept-nf")).toHaveCount(0);
+
+    // It clears when the intercepted navigation moves on to another item.
+    await page.getByRole("link", { name: "Item 1" }).click();
+    await expect(page.locator("#not-found-sibling-intercept-intercepted")).toHaveText(
+      "Intercepted item: 1",
+    );
+    await expect(page.locator("#not-found-sibling-intercept-source-nf")).toHaveCount(0);
+  });
+
   test("a parallel slot's notFound() renders the same boundary in the document and on navigation", async ({
     page,
   }) => {

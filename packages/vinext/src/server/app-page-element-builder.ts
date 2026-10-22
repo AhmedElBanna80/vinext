@@ -72,6 +72,67 @@ import {
 } from "./app-render-dependency.js";
 import { isPromiseLike } from "../utils/promise.js";
 
+type SiblingInterceptPageOutcome =
+  | { error: unknown }
+  | { result: React.ReactNode | Promise<React.ReactNode> }
+  | { suspended: true };
+
+/**
+ * A sibling intercepting page that renders beside its intercepting layouts,
+ * as Next.js renders each segment. The source route's layouts wait for the
+ * page, so `Starter` invokes it ahead of the layouts, even when one of them
+ * never renders its children, and `Outlet` renders its result where the
+ * innermost layout renders its children.
+ */
+function createSiblingInterceptPageSlot(
+  invokePage: () => React.ReactNode | Promise<React.ReactNode>,
+  hasPageLoadingBoundary: boolean,
+): { Outlet: AppPageComponent; Starter: AppPageComponent } {
+  let outcome: SiblingInterceptPageOutcome | null = null;
+  let settle!: () => void;
+  const settled = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  function Starter(): null {
+    try {
+      const result = invokePage();
+      // A layout that leaves out its children never renders the result.
+      if (isPromiseLike(result)) Promise.resolve(result).catch(() => {});
+      outcome = { result };
+    } catch (error) {
+      if (!isAppRenderSuspension(error)) {
+        outcome = { error };
+      } else if (hasPageLoadingBoundary) {
+        // The page's loading UI lives inside the intercepting layouts, so the
+        // outlet retries the page under it. The page has already released its
+        // render dependency for that UI.
+        outcome = { suspended: true };
+      } else {
+        // Without loading UI, React retries the page here, ahead of the
+        // layouts, which releases its render dependency once it renders.
+        throw error;
+      }
+    }
+    settle();
+    return null;
+  }
+  function readOutcome(
+    current: SiblingInterceptPageOutcome,
+  ): React.ReactNode | Promise<React.ReactNode> {
+    if ("error" in current) throw current.error;
+    return "result" in current ? current.result : invokePage();
+  }
+  function Outlet(): React.ReactNode | Promise<React.ReactNode> {
+    // The starter suspends only without loading UI, so it never settles as
+    // suspended after the outlet has rendered.
+    return outcome ? readOutcome(outcome) : settled.then(() => readOutcome(outcome!));
+  }
+  return {
+    Outlet: Outlet as unknown as AppPageComponent,
+    Starter: Starter as unknown as AppPageComponent,
+  };
+}
+
 function resolveInterceptLayoutParams(
   branchSegments: readonly string[],
   layoutSegments: readonly string[],
@@ -621,6 +682,22 @@ export async function buildPageElements<
       return createElement(PageComponent, withUseCachePageMarker(PageComponent, invocationProps));
     }
 
+    return createElement(
+      createPageInvoker(
+        PageComponent,
+        props,
+        renderDependency,
+        slotLayoutIndex,
+      ) as unknown as AppPageComponent,
+    );
+  };
+  // A server page's invocation, which releases its render dependency.
+  const createPageInvoker = (
+    PageComponent: AppPageComponent,
+    props: Readonly<Record<string, unknown>>,
+    renderDependency?: AppPageRenderDependency | null,
+    slotLayoutIndex?: number,
+  ) => {
     const PageInvoker = () => {
       const invocationProps: Record<string, unknown> = { ...props };
       if (searchParams) {
@@ -687,7 +764,7 @@ export async function buildPageElements<
         throw slotLayoutIndex === undefined ? error : tagAppPageSlotError(error, slotLayoutIndex);
       }
     };
-    return createElement(PageInvoker as unknown as AppPageComponent);
+    return PageInvoker;
   };
   const pageSearchParamsThenable = searchParams ? makeThenableParams(pageSearchParams) : undefined;
 
@@ -707,10 +784,19 @@ export async function buildPageElements<
     metadataOutlet: React.ReactNode,
   ): ReturnType<typeof createElement> | null => {
     if (!isSiblingIntercept || !EffectivePageComponent) return null;
+    const pageSlot =
+      pageRenderDependency && opts?.interceptLayouts?.some((layoutModule) => layoutModule?.default)
+        ? createSiblingInterceptPageSlot(
+            createPageInvoker(EffectivePageComponent, pageProps, pageRenderDependency),
+            hasPageLoadingBoundary,
+          )
+        : null;
     let element: ReturnType<typeof createElement> = createElement(
       Fragment,
       null,
-      createPageElement(EffectivePageComponent, pageProps, pageRenderDependency),
+      pageSlot
+        ? createElement(pageSlot.Outlet)
+        : createPageElement(EffectivePageComponent, pageProps, pageRenderDependency),
       metadataOutlet,
     );
 
@@ -811,7 +897,9 @@ export async function buildPageElements<
         );
       }
     }
-    return element;
+    return pageSlot
+      ? createElement(Fragment, null, createElement(pageSlot.Starter), element)
+      : element;
   };
 
   return traceCreateComponentTree(() => {
