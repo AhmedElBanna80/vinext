@@ -191,6 +191,42 @@ describe("Next.js compat: metadata", () => {
     );
   });
 
+  // ── OpenGraph videos and audio ───────────────────────────────
+  // Next.js accepts a single entry or an array, where each entry is a string,
+  // a URL, or a descriptor. Expected tags were captured from next@16.2.7, which
+  // renders video and audio URLs as written, without applying metadataBase.
+
+  function ogMediaTags(html: string): string[] {
+    return Array.from(
+      html.matchAll(/<meta\s+property="(og:(?:video|audio)[^"]*)"\s+content="([^"]*)"/g),
+      (match) => `${match[1]}=${match[2]}`,
+    );
+  }
+
+  it("should render a single og:video descriptor and a single og:audio URL", async () => {
+    const { html } = await fetchHtml(baseUrl, "/nextjs-compat/metadata-opengraph-video-audio");
+    expect(ogMediaTags(html)).toEqual([
+      "og:video=/video.mp4",
+      "og:video:secure_url=/secure-video.mp4",
+      "og:video:type=video/mp4",
+      "og:video:width=800",
+      "og:video:height=600",
+      "og:audio=/audio.mp3",
+    ]);
+  });
+
+  it("should render og:video and og:audio lists of strings, URLs and descriptors", async () => {
+    const { html } = await fetchHtml(baseUrl, "/nextjs-compat/metadata-opengraph-video-audio/list");
+    expect(ogMediaTags(html)).toEqual([
+      "og:video=/video-1.mp4",
+      "og:video=https://example.com/video-2.mp4",
+      "og:video=https://example.com/video-3.mp4",
+      "og:audio=/audio-1.mp3",
+      "og:audio:type=audio/mpeg",
+      "og:audio=https://example.com/audio-2.mp3",
+    ]);
+  });
+
   // ── Twitter ──────────────────────────────────────────────────
   // Next.js: 'should support twitter card summary_large_image'
   // Source: https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata/metadata.test.ts#L308-L323
