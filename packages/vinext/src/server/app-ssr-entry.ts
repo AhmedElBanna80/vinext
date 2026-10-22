@@ -69,7 +69,7 @@ import {
   createStreamedClientReferences,
   renderStreamedStylesheets,
   runWithStreamedClientReferences,
-  wrapClientReferenceRequireForStreaming,
+  wrapClientReferenceRequire,
 } from "./app-streamed-client-references.js";
 import { RSC_FORM_STATE_GLOBAL } from "../client/browser-globals.js";
 import { isPprFallbackShellAbortError } from "vinext/shims/ppr-fallback-shell";
@@ -226,13 +226,17 @@ function renderSsrErrorDocumentShell(
   );
 }
 
-// Streamed references load through a wrapped loader, which must see every
-// load from the first. The build fills `async` in as chunks render; should it
-// ever not (a plugin rewrote the placeholder first), nothing streams.
-if (Array.isArray(routeClientReferences?.async) && routeClientReferences.async.length > 0) {
-  const { async, references } = routeClientReferences;
-  wrapClientReferenceRequireForStreaming(
-    new Set(async.map((index) => references[index]!)),
+// Client references load through a wrapped loader, which must see every load
+// from the first. It hints their scripts with the render's nonce, and streams
+// the references whose modules evaluate asynchronously. The build fills
+// `async` in as chunks render; should it ever not (a plugin rewrote the
+// placeholder first), nothing streams. Development hints no scripts.
+if (process.env.NODE_ENV === "production") {
+  const async = routeClientReferences?.async;
+  wrapClientReferenceRequire(
+    new Set(
+      Array.isArray(async) ? async.map((index) => routeClientReferences!.references[index]!) : [],
+    ),
     (id) => (clientReferences as Record<string, (() => Promise<unknown>) | undefined>)[id],
   );
 }
@@ -346,7 +350,7 @@ function buildModulePreloadHtml(bootstrapModuleUrl?: string, nonce?: string): st
 
 function buildHeadInjectionHtml(
   navContext: NavigationContext,
-  bootstrapModuleUrl: string | undefined,
+  bootstrapPreloadUrl: string | undefined,
   formState: ReactFormState | null,
   insertedHTML: string,
   fontHTML: string,
@@ -384,7 +388,7 @@ function buildHeadInjectionHtml(
     rscMetadataScript +
     rscCompatibilityScript +
     formStateScript +
-    buildModulePreloadHtml(bootstrapModuleUrl, scriptNonce) +
+    buildModulePreloadHtml(bootstrapPreloadUrl, scriptNonce) +
     insertedHTML +
     fontHTML
   );
@@ -505,7 +509,10 @@ export async function handleSsr(
     const routeReferences = options?.pprFallbackShellSignal
       ? undefined
       : resolveRouteClientReferences(routeClientReferences, options?.preloadRoutePattern);
-    const streamedReferences = createStreamedClientReferences(routeReferences);
+    const streamedReferences = createStreamedClientReferences(
+      routeReferences,
+      options?.scriptNonce,
+    );
     await clientReferencePreloader.preload(
       routeReferences?.references,
       streamedReferences?.streamed,
@@ -748,10 +755,12 @@ export async function handleSsr(
         if (pprFallbackShellSignal) {
           const prerender = await loadStaticPrerender();
           const htmlAbortController = new AbortController();
-          const pendingHtml = prerender(ssrRoot, {
-            ...renderOptions,
-            signal: htmlAbortController.signal,
-          });
+          const pendingHtml = runWithStreamedClientReferences(streamedReferences, () =>
+            prerender(ssrRoot, {
+              ...renderOptions,
+              signal: htmlAbortController.signal,
+            }),
+          );
           // Known limitation: unlike Next.js, nothing waits for modules that are
           // still loading. A next/dynamic() without `loading` whose import is
           // pending here has no Suspense boundary of its own, so it suspends to
@@ -855,7 +864,8 @@ export async function handleSsr(
             hidesQuery
               ? { ...ssrNavigationContext, searchParams: new URLSearchParams() }
               : ssrNavigationContext,
-            bootstrapModuleUrl,
+            // React preloads the bootstrap module of a document it renders.
+            shellErrorRecovered ? bootstrapModuleUrl : undefined,
             options?.formState ?? null,
             insertedHTML +
               errorMetaHTML +

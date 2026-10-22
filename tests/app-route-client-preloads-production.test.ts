@@ -25,11 +25,21 @@ function stylesheetHrefs(html: string): string[] {
   );
 }
 
+/** A document's modulepreload links, in document order. */
+function modulepreloadTags(html: string): string[] {
+  return html.match(/<link\b[^>]*\brel="modulepreload"[^>]*>/g) ?? [];
+}
+
 /** The hrefs of a document's modulepreload links, sorted. */
 function modulepreloadHrefs(html: string): string[] {
-  return (html.match(/<link\b[^>]*\brel="modulepreload"[^>]*>/g) ?? [])
+  return modulepreloadTags(html)
     .map((tag) => tag.match(/\bhref="([^"]+)"/)![1]!)
     .sort();
+}
+
+/** The modulepreload links without the fixture's CSP nonce. */
+function unnoncedModulepreloads(html: string): string[] {
+  return modulepreloadTags(html).filter((tag) => !tag.includes('nonce="vinext-test-nonce"'));
 }
 
 /** A response's first chunk and its whole body. */
@@ -214,6 +224,8 @@ describe("App Router production SSR route client reference preloads", () => {
     const panelJs = clientFileHref(".js", "streamed-panel");
     expect(modulepreloadHrefs(cold.first)).toContain(panelJs);
     expect(modulepreloadHrefs(cold.first)).toEqual(modulepreloadHrefs(warm.first));
+    expect(unnoncedModulepreloads(cold.html)).toEqual([]);
+    expect(unnoncedModulepreloads(warm.html)).toEqual([]);
     const clientDir = path.join(fixtureDir, "dist", "client");
     const cssFile = (rule: string) =>
       fs
@@ -340,5 +352,27 @@ describe("App Router production SSR route client reference preloads", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toContain('data-testid="shared-note"');
     expect((globalThis as SharedEvaluationMarker).__vinextSharedClientEvaluated).toBe(true);
+  });
+
+  it("hints every script once, with the CSP nonce", async () => {
+    // plugin-rsc hints a client component's scripts without the nonce, which
+    // the fixture's `script-src 'nonce-…'` policy blocks.
+    for (const route of [
+      "/",
+      "/dynamic",
+      "/streamed/also",
+      "/layout-streamed/nested",
+      "/shared/one",
+    ]) {
+      for (const pass of ["first", "second"]) {
+        const html = await (await fetch(`${baseUrl}${route}`)).text();
+        const hrefs = modulepreloadHrefs(html);
+        expect(hrefs.length, `${route} (${pass})`).toBeGreaterThan(1);
+        expect(unnoncedModulepreloads(html), `${route} (${pass})`).toEqual([]);
+        // next/dynamic links the widget's chunk again, as plugin-rsc hints it.
+        if (route !== "/dynamic")
+          expect(new Set(hrefs).size, `${route} (${pass})`).toBe(hrefs.length);
+      }
+    }
   });
 });

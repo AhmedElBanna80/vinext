@@ -1454,9 +1454,11 @@ describe("App Router Production server (startProdServer)", () => {
         );
 
         const html = await res.text();
+        // Client-reference script hints leave `as` out and keep plugin-rsc's crossOrigin.
         const dynamicScriptPreloads = (html.match(/<link\b[^>]*>/g) ?? []).filter(
           (tag) =>
             /\bfetchpriority="low"/i.test(tag) &&
+            tag.includes('as="script"') &&
             tag.includes('nonce="vinext-test-nonce"') &&
             tag.includes("https://cdn.example.com/_next/static/chunks/"),
         );

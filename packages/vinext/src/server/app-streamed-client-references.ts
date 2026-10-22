@@ -1,5 +1,6 @@
 /**
- * Stream the client references an SSR render may show before they load.
+ * Stream the client references an SSR render may show before they load, and
+ * hint every client reference's scripts with the render's CSP nonce.
  *
  * A render waits for its route's client references before it starts, except
  * those whose modules evaluate asynchronously (top-level await). Like Next.js,
@@ -13,6 +14,10 @@
  * Turbopack build does: just before the first reference after it links its
  * own, or after the shell's stylesheets when none does. Its scripts link as the
  * Flight stream names it.
+ *
+ * plugin-rsc hints a client module's scripts without the render's nonce, which
+ * a nonce-based CSP blocks. React keeps the first hint for each script, so a
+ * render with a nonce hints them first, with the nonce, as Next.js does.
  */
 import * as ReactDOM from "react-dom";
 import { setOnClientReference } from "@vitejs/plugin-rsc/ssr";
@@ -26,6 +31,8 @@ type ClientReferenceLoader = () => Promise<unknown>;
 
 /** A render's streamed references, and the stylesheets the render linked. */
 export type StreamedClientReferences = {
+  /** The render's CSP nonce for the scripts it hints. */
+  nonce: string | undefined;
   streamed: ReadonlySet<string>;
   /** Each of the route's references' position in import order. */
   positions: ReadonlyMap<string, number>;
@@ -45,12 +52,13 @@ const renderStorage = getOrCreateAls<StreamedClientReferences>("vinext.streamedC
 
 // Mirrors plugin-rsc's preloadDeps(), which leaves the client entry's own
 // scripts at the default priority; the render has preinitialized those already.
-function linkScripts(deps: AssetDeps): void {
+function linkScripts(deps: AssetDeps, nonce: string | undefined): void {
   // React copies every option onto the link; its types leave out fetchPriority.
   const options = {
     as: "script",
     crossOrigin: "",
     fetchPriority: "low",
+    nonce,
   } as ReactDOM.PreloadModuleOptions;
   for (const href of deps.js) ReactDOM.preloadModule(href, options);
 }
@@ -76,11 +84,11 @@ function linkStreamedStylesheetsBefore(render: StreamedClientReferences, id: str
 
 /**
  * Wrap plugin-rsc's client-reference loader before any client reference
- * loads; a build with references to stream calls this as its SSR entry starts.
- * `asyncIds` are the references any route may stream, and `getLoader` returns
- * a reference's own loader from the client-references module.
+ * loads; a production build calls this as its SSR entry starts. `asyncIds` are
+ * the references any route may stream, and `getLoader` returns a reference's
+ * own loader from the client-references module.
  */
-export function wrapClientReferenceRequireForStreaming(
+export function wrapClientReferenceRequire(
   asyncIds: ReadonlySet<string>,
   getLoader: (id: string) => ClientReferenceLoader | undefined,
 ): void {
@@ -101,7 +109,7 @@ export function wrapClientReferenceRequireForStreaming(
     const render = renderStorage.getStore();
     if (render?.streamed.has(id)) {
       const deps = referenceDeps.get(id);
-      if (deps) linkScripts(deps);
+      if (deps) linkScripts(deps, render.nonce);
     }
     let loading = loads.get(id);
     if (!loading) {
@@ -118,6 +126,9 @@ export function wrapClientReferenceRequireForStreaming(
                   return Reflect.get(exports as object, key);
                 }
                 linkStreamedStylesheetsBefore(render, id);
+                // plugin-rsc hints the module's scripts as it's read, after this.
+                const deps = referenceDeps.get(id);
+                if (render.nonce && deps && key in target) linkScripts(deps, render.nonce);
               }
               return Reflect.get(target, key, receiver);
             },
@@ -133,13 +144,15 @@ export function wrapClientReferenceRequireForStreaming(
 
 export function createStreamedClientReferences(
   route: RouteClientReferenceSet | undefined,
+  nonce: string | undefined,
 ): StreamedClientReferences | null {
-  if (!route || route.streamed.length === 0) return null;
-  const streamed = new Set(route.streamed);
+  const streamed = new Set(route?.streamed);
+  if (streamed.size === 0 && !nonce) return null;
   return {
+    nonce,
     streamed,
-    positions: new Map(route.references.map((id, index) => [id, index])),
-    unlinked: route.references.filter((id) => streamed.has(id)),
+    positions: new Map(route?.references.map((id, index) => [id, index])),
+    unlinked: route?.references.filter((id) => streamed.has(id)) ?? [],
     linkedStylesheets: new Set(),
   };
 }
