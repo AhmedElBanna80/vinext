@@ -19,7 +19,7 @@ import { renderSsrErrorMetaTags } from "./app-ssr-error-meta.js";
 import { isPromiseLike } from "../utils/promise.js";
 import { formatNextRedirectDigest } from "./app-rsc-redirect-flight.js";
 import { runWithConnectionProbe } from "vinext/shims/headers";
-import { isThrownNavigationError } from "vinext/shims/navigation-errors";
+import { isHTTPAccessFallbackError, isThrownNavigationError } from "vinext/shims/navigation-errors";
 
 export type { LayoutFlags };
 
@@ -61,6 +61,40 @@ export function tagAppPageMetadataError<T>(error: T): T {
   return error;
 }
 
+/**
+ * Marker we tag onto an error a parallel slot's page or default component
+ * threw, holding the index of the layout that renders the slot. Next.js
+ * attaches HTTP access fallback boundaries only to each segment's `children`,
+ * so a slot's `notFound()` is caught by the boundary above that layout, not
+ * by the route's deepest boundary as the page's is.
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/create-component-tree.tsx
+ */
+const APP_PAGE_SLOT_ERROR_LAYOUT_INDEX = Symbol.for("vinext.appPage.slotErrorLayoutIndex");
+
+export function tagAppPageSlotError<T>(error: T, layoutIndex: number): T {
+  // Only an HTTP access fallback reads the tag. A thrown error can be shared
+  // across slots, renders and requests (a module-scoped rejected promise), so
+  // each throw gets its own tagged copy instead of marking the shared error.
+  if (!isHTTPAccessFallbackError(error)) return error;
+  const source = error as object;
+  const tagged = Object.setPrototypeOf(
+    new Error(String(Reflect.get(source, "message"))),
+    Object.getPrototypeOf(source),
+  );
+  Object.defineProperties(tagged, {
+    ...Object.getOwnPropertyDescriptors(source),
+    stack: { value: Reflect.get(source, "stack"), configurable: true, writable: true },
+    [APP_PAGE_SLOT_ERROR_LAYOUT_INDEX]: { value: layoutIndex },
+  });
+  return tagged as T;
+}
+
+function getAppPageSlotErrorLayoutIndex(error: unknown): number | null {
+  if (!error || typeof error !== "object") return null;
+  const layoutIndex: unknown = Reflect.get(error, APP_PAGE_SLOT_ERROR_LAYOUT_INDEX);
+  return typeof layoutIndex === "number" ? layoutIndex : null;
+}
+
 export type AppPageSpecialError =
   | {
       kind: "redirect";
@@ -69,7 +103,13 @@ export type AppPageSpecialError =
       type?: "push" | "replace";
       fromMetadata?: boolean;
     }
-  | { kind: "http-access-fallback"; statusCode: number; fromMetadata?: boolean };
+  | {
+      kind: "http-access-fallback";
+      statusCode: number;
+      fromMetadata?: boolean;
+      /** Set when a parallel slot threw it: the layout rendering the outermost such slot. */
+      slotLayoutIndex?: number;
+    };
 
 export type AppPageFontPreload = {
   href: string;
@@ -242,7 +282,8 @@ export function resolveAppPageSpecialError(error: unknown): AppPageSpecialError 
  * generateMetadata() threw it comes from the errors the RSC render threw with
  * that digest. When the page threw one too, the page's decides. An error a
  * client component threw during SSR is the page's, since generateMetadata()
- * runs only in the RSC render.
+ * runs only in the RSC render. A notFound() / forbidden() / unauthorized()
+ * a parallel slot's page threw is caught above the layout rendering it.
  */
 export function resolveAppPageShellSpecialError(
   error: unknown,
@@ -256,7 +297,18 @@ export function resolveAppPageShellSpecialError(
     renderedSpecialErrors.every(
       (rendered) => resolveAppPageSpecialError(rendered)?.fromMetadata === true,
     );
-  return fromMetadata ? { ...specialError, fromMetadata: true } : specialError;
+  if (fromMetadata) return { ...specialError, fromMetadata: true };
+  if (specialError.kind !== "http-access-fallback") return specialError;
+  // The boundary above a slot's layout is never below the page's, so the
+  // outermost slot's replaces the page's when both threw.
+  let slotLayoutIndex: number | null = null;
+  for (const rendered of renderedSpecialErrors) {
+    const layoutIndex = getAppPageSlotErrorLayoutIndex(rendered);
+    if (layoutIndex !== null && (slotLayoutIndex === null || layoutIndex < slotLayoutIndex)) {
+      slotLayoutIndex = layoutIndex;
+    }
+  }
+  return slotLayoutIndex === null ? specialError : { ...specialError, slotLayoutIndex };
 }
 
 /**

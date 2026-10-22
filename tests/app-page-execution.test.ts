@@ -6,6 +6,7 @@ import {
   probeAppPageLayouts,
   resolveAppPageShellSpecialError,
   resolveAppPageSpecialError,
+  tagAppPageSlotError,
   teeAppPageRscStreamForCapture,
 } from "../packages/vinext/src/server/app-page-execution.js";
 import { parseNextRedirectDigest } from "../packages/vinext/src/server/next-error-digest.js";
@@ -88,6 +89,63 @@ describe("app page execution helpers", () => {
       kind: "http-access-fallback",
       statusCode: 404,
     });
+  });
+
+  it("resolves a shell's access fallback a parallel slot threw to the outermost slot's layout", () => {
+    // Next.js attaches HTTP access fallback boundaries only to each segment's
+    // `children`, so a slot's notFound() is caught above its layout, which is
+    // never below the boundary that catches the page's.
+    const digest = "NEXT_HTTP_ERROR_FALLBACK;404";
+    const decoded = Object.assign(new Error(digest), { digest });
+    const fromInnerSlot = tagAppPageSlotError(Object.assign(new Error(digest), { digest }), 2);
+    const fromOuterSlot = tagAppPageSlotError(Object.assign(new Error(digest), { digest }), 1);
+    const fromPage = Object.assign(new Error(digest), { digest });
+
+    expect(resolveAppPageShellSpecialError(decoded, [fromInnerSlot])).toEqual({
+      kind: "http-access-fallback",
+      statusCode: 404,
+      slotLayoutIndex: 2,
+    });
+    expect(
+      resolveAppPageShellSpecialError(decoded, [fromPage, fromInnerSlot, fromOuterSlot]),
+    ).toEqual({
+      kind: "http-access-fallback",
+      statusCode: 404,
+      slotLayoutIndex: 1,
+    });
+    expect(resolveAppPageShellSpecialError(decoded, [fromPage])).toEqual({
+      kind: "http-access-fallback",
+      statusCode: 404,
+    });
+    // Slots, renders and requests can share one thrown error, such as a
+    // module-scoped rejected promise, so each throw tags its own copy.
+    const shared = Object.freeze(Object.assign(new Error(digest), { digest }));
+    const fromRootSlot = tagAppPageSlotError(shared, 0);
+    expect(fromRootSlot).not.toBe(shared);
+    expect(fromRootSlot).toBeInstanceOf(Error);
+    expect(fromRootSlot).toMatchObject({ digest, message: digest, stack: shared.stack });
+    expect(resolveAppPageShellSpecialError(decoded, [shared])).toEqual({
+      kind: "http-access-fallback",
+      statusCode: 404,
+    });
+    expect(
+      resolveAppPageShellSpecialError(decoded, [tagAppPageSlotError(shared, 2)]),
+    ).toMatchObject({ slotLayoutIndex: 2 });
+    expect(
+      resolveAppPageShellSpecialError(decoded, [
+        tagAppPageSlotError(shared, 3),
+        tagAppPageSlotError(shared, 1),
+      ]),
+    ).toMatchObject({ slotLayoutIndex: 1 });
+    expect(
+      resolveAppPageShellSpecialError(decoded, [tagAppPageSlotError(fromRootSlot, 2)]),
+    ).toMatchObject({ slotLayoutIndex: 2 });
+
+    const redirectDigest = "NEXT_REDIRECT;replace;%2Ftarget;307";
+    const redirect = Object.assign(new Error(redirectDigest), { digest: redirectDigest });
+    expect(
+      resolveAppPageShellSpecialError(redirect, [tagAppPageSlotError(redirect, 1)]),
+    ).not.toHaveProperty("slotLayoutIndex");
   });
 
   it("parses redirect and access-fallback digests", () => {
