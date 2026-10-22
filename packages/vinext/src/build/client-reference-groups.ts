@@ -60,6 +60,7 @@ function interceptEntryIds(intercept: ClientReferenceGroupIntercept): string[] {
     intercept.notFoundPath,
     intercept.forbiddenPath,
     intercept.unauthorizedPath,
+    ...(intercept.notFoundPaths ?? []),
   ].filter((value): value is string => typeof value === "string");
 }
 

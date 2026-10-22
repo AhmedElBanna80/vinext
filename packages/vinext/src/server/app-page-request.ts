@@ -86,8 +86,11 @@ type AppPageInterceptMatch<TPage = unknown> = {
   interceptLoadings?: readonly unknown[] | null;
   interceptLoadingTreePositions?: readonly number[] | null;
   interceptNotFoundBranchSegments?: readonly string[] | null;
+  interceptNotFounds?: readonly unknown[] | null;
+  interceptNotFoundTreePositions?: readonly number[] | null;
   __loadInterceptLayouts?: readonly (() => Promise<unknown>)[] | null;
   __loadInterceptLoadings?: readonly (() => Promise<unknown>)[] | null;
+  __loadInterceptNotFounds?: readonly (() => Promise<unknown>)[] | null;
   matchedParams: AppPageParams;
   sourceMatchedParams?: AppPageParams;
   page: TPage;
@@ -742,7 +745,11 @@ async function resolveAppPageInterceptState<TRoute, TPage, TInterceptOpts>(
   await loadAppInterceptPage(intercept);
   await loadAppInterceptNotFound(intercept);
   await loadAppInterceptAccessFallbacks(intercept);
-  if (intercept.__loadInterceptLayouts || intercept.__loadInterceptLoadings) {
+  if (
+    intercept.__loadInterceptLayouts ||
+    intercept.__loadInterceptLoadings ||
+    intercept.__loadInterceptNotFounds
+  ) {
     await loadAppInterceptLayouts(intercept);
   }
 

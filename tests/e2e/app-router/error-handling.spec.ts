@@ -398,6 +398,82 @@ test.describe("Not Found", () => {
     await expect(page.locator("#not-found-layout-segment-crew-nf")).toHaveCount(0);
     await expect(page.locator("#not-found-layout-segment-roles-nf")).toHaveCount(0);
   });
+
+  test("a parallel slot's own not-found catches its notFound() inside the slot on navigation", async ({
+    page,
+  }) => {
+    await page.goto(`${BASE}/nextjs-compat/not-found-slot-own/team/ok`);
+    await waitForAppRouterHydration(page);
+    await expect(page.locator("#slot-own-team")).toHaveText("Team ok");
+
+    // Like Next.js, the @team slot's not-found.tsx catches its page's signal,
+    // and the route's layout and page keep rendering beside it.
+    await page.getByRole("link", { name: "Team missing" }).click();
+    await expect(page).toHaveURL(/\/team\/missing$/);
+    await expect(page.locator("#slot-own-team-slot #slot-own-team-nf")).toBeVisible();
+    await expect(page.locator("#slot-own-main")).toBeVisible();
+    await expect(page.locator("#slot-own-segment-nf")).toHaveCount(0);
+    await expect(page.locator("#slot-own-root-nf")).toHaveCount(0);
+
+    // A nested slot page without its own file is caught by the slot root's.
+    await page.getByRole("link", { name: "Members missing" }).click();
+    await expect(page).toHaveURL(/\/team\/missing\/members$/);
+    await expect(page.locator("#slot-own-main-members")).toBeVisible();
+    await expect(page.locator("#slot-own-team-slot #slot-own-team-nf")).toBeVisible();
+    await expect(page.locator("#slot-own-root-nf")).toHaveCount(0);
+
+    // A nested slot layout's own notFound() skips the not-found inside it and
+    // reaches the slot root's.
+    await page.getByRole("link", { name: "Roster missing" }).click();
+    await expect(page).toHaveURL(/\/team\/missing\/roster$/);
+    await expect(page.locator("#slot-own-main-roster")).toBeVisible();
+    await expect(page.locator("#slot-own-team-slot #slot-own-team-nf")).toBeVisible();
+    await expect(page.locator("#slot-own-roster-nf")).toHaveCount(0);
+    await expect(page.locator("#slot-own-segment-nf")).toHaveCount(0);
+
+    // It clears when the slot renders again.
+    await page.getByRole("link", { name: "Team ok" }).click();
+    await expect(page.locator("#slot-own-team")).toHaveText("Team ok");
+    await expect(page.locator("#slot-own-team-nf")).toHaveCount(0);
+  });
+
+  test("a slot intercept below a slot segment keeps that segment's layout and not-found", async ({
+    page,
+  }) => {
+    await page.goto(`${BASE}/nextjs-compat/not-found-slot-own/team/ok/roster`);
+    await waitForAppRouterHydration(page);
+
+    await page.getByRole("link", { name: "Player missing" }).click();
+    await expect(page).toHaveURL(/\/team\/ok\/roster\/player\/missing$/);
+    await expect(
+      page.locator("#slot-own-team-slot #slot-own-roster-layout #slot-own-roster-nf"),
+    ).toBeVisible();
+    await expect(page.locator("#slot-own-team-nf")).toHaveCount(0);
+
+    await page.getByRole("link", { name: "Player ok" }).click();
+    await expect(page.locator("#slot-own-roster-layout #slot-own-roster-player")).toHaveText(
+      "Player ok",
+    );
+    await expect(page.locator("#slot-own-roster-nf")).toHaveCount(0);
+  });
+
+  test("an intercepting modal's own not-found catches its notFound() inside the modal", async ({
+    page,
+  }) => {
+    await page.goto(`${BASE}/nextjs-compat/not-found-slot-own`);
+    await waitForAppRouterHydration(page);
+
+    await page.getByRole("link", { name: "Item missing" }).click();
+    await expect(page).toHaveURL(/\/item\/missing$/);
+    await expect(page.locator("#slot-own-modal #slot-own-modal-nf")).toBeVisible();
+    // The source page stays behind the modal.
+    await expect(page.locator("#slot-own-home")).toBeVisible();
+    await expect(page.locator("#slot-own-root-nf")).toHaveCount(0);
+
+    await page.getByRole("link", { name: "Item ok" }).click();
+    await expect(page.locator("#slot-own-modal-item")).toHaveText("Modal item ok");
+    await expect(page.locator("#slot-own-modal-nf")).toHaveCount(0);
+  });
 });
 
 test.describe("Forbidden & Unauthorized", () => {

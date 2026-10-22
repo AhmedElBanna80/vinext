@@ -134,6 +134,8 @@ export type AppPageRouteWiringSlot<
   ownerTreePosition?: number | null;
   notFound?: TModule | null;
   notFoundTreePosition?: number | null;
+  notFounds?: readonly (TModule | null | undefined)[] | null;
+  notFoundTreePositions?: readonly number[] | null;
   page?: TModule | null;
   routeSegments?: readonly string[] | null;
   /**
@@ -218,6 +220,9 @@ export type AppPageSlotOverride<TModule extends AppPageModule = AppPageModule> =
   layoutModules?: readonly (TModule | null | undefined)[] | null;
   loadingModules?: readonly (TModule | null | undefined)[] | null;
   loadingTreePositions?: readonly number[] | null;
+  /** The intercepting route's not-found.tsx files and their branch tree positions. */
+  notFoundModules?: readonly (TModule | null | undefined)[] | null;
+  notFoundTreePositions?: readonly number[] | null;
   /**
    * The page module to render for this slot. Optional — when omitted, the
    * slot's existing `page` is used (e.g. when the override only changes the
@@ -1541,8 +1546,10 @@ export function buildAppPageElements<
       if (slotOverride?.props) {
         Object.assign(slotProps, slotOverride.props);
       }
-      // The slot's notFound(), forbidden() and unauthorized() are caught above
-      // its layout, so the server's fallback needs to know which one.
+      // On the server, the slot's notFound(), forbidden() and unauthorized()
+      // are caught above the layout that renders it (a root layout re-renders
+      // around its own boundary instead, for not-found or when it is a client
+      // component), so the fallback needs to know which layout.
       slotElement = options.createPageElement
         ? options.createPageElement(
             slotComponent!,
@@ -1633,11 +1640,27 @@ export function buildAppPageElements<
     }
 
     const slotErrorComponent = getErrorBoundaryExport(slot.error);
+    // Each not-found.tsx in the slot's branch belongs to its own segment, so,
+    // as in Next.js, it catches notFound() from inside that segment's layout,
+    // and a layout's own notFound() reaches the boundary of the segment above.
+    const branchNotFounds = new Map<number, AppPageComponent>();
+    const slotNotFoundModules = hasSlotTreeOverride
+      ? slotOverride?.notFoundModules
+      : slot.notFounds;
+    const slotNotFoundTreePositions = hasSlotTreeOverride
+      ? slotOverride?.notFoundTreePositions
+      : slot.notFoundTreePositions;
+    for (const [index, notFoundModule] of (slotNotFoundModules ?? []).entries()) {
+      const component = getDefaultExport(notFoundModule);
+      const treePosition = slotNotFoundTreePositions?.[index];
+      if (component && treePosition !== undefined) branchNotFounds.set(treePosition, component);
+    }
     const branchTreePositions = Array.from(
       new Set([
         ...branchLayouts.keys(),
         ...branchLoadings.keys(),
         ...(slotErrorComponent ? [0] : []),
+        ...branchNotFounds.keys(),
         ...nestedBfcacheSegments.flatMap((segment) =>
           segment.treePosition === null ? [] : [segment.treePosition],
         ),
@@ -1678,6 +1701,18 @@ export function buildAppPageElements<
           <Suspense key={loadingResetKey || slotResetKey} fallback={<LoadingComponent />}>
             {slotElement}
           </Suspense>
+        );
+      }
+
+      const SlotNotFoundComponent = branchNotFounds.get(treePosition);
+      if (SlotNotFoundComponent) {
+        slotElement = (
+          <NotFoundBoundary
+            resetKey={resolveAppPageTemplateStateKey(branchSegments, treePosition, slotParams)}
+            fallback={<SlotNotFoundComponent />}
+          >
+            {slotElement}
+          </NotFoundBoundary>
         );
       }
 

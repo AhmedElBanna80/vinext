@@ -1003,7 +1003,7 @@ describe("buildPageElements", () => {
     function InterceptNotFound(): React.ReactNode {
       return React.createElement("p", null, "Intercept not found");
     }
-    const build = async (layoutTreePosition: number, notFoundTreePosition: number) => {
+    const build = async (layoutTreePosition: number, notFoundTreePositions: number[]) => {
       const layoutSegments = ["(.)photo", "[id]"].slice(0, layoutTreePosition);
       const result = await buildPageElements(
         createBaseOptions({
@@ -1018,8 +1018,10 @@ describe("buildPageElements", () => {
             interceptBranchSegments: ["(.)photo", "[id]"],
             interceptLayouts: [createSyntheticPageModule(InterceptLayout)],
             interceptLayoutSegments: [layoutSegments],
-            interceptNotFound: createSyntheticPageModule(InterceptNotFound),
-            interceptNotFoundTreePosition: notFoundTreePosition,
+            interceptNotFounds: notFoundTreePositions.map(() =>
+              createSyntheticPageModule(InterceptNotFound),
+            ),
+            interceptNotFoundTreePositions: notFoundTreePositions,
             interceptPage: createSyntheticPageModule(() => null),
             interceptParams: { id: "1" },
             interceptSlotKey: SIBLING_PAGE_INTERCEPT_SLOT_KEY,
@@ -1042,11 +1044,16 @@ describe("buildPageElements", () => {
     };
 
     // Beside the page, below the (.)photo layout: the layout stays.
-    const beside = await build(1, 2);
+    const beside = await build(1, [2]);
     expect(findElementOfType(beside.layout.props.children, NotFoundBoundary)).toBe(beside.boundary);
     // At (.)photo, above a layout in [id]: that layout is replaced.
-    const above = await build(2, 1);
+    const above = await build(2, [1]);
     expect(findElementOfType(above.boundary.props.children, InterceptLayout)).toBe(above.layout);
+    // With a not-found in both segments, each boundary sits in its own
+    // segment, so the outer one also catches the [id] layout's notFound().
+    const nested = await build(2, [1, 2]);
+    expect(findElementOfType(nested.boundary.props.children, InterceptLayout)).toBe(nested.layout);
+    expect(findElementOfType(nested.layout.props.children, NotFoundBoundary)).not.toBeNull();
   });
 
   it("wraps a sibling intercepting page in its own forbidden and unauthorized boundaries", async () => {
@@ -1082,8 +1089,8 @@ describe("buildPageElements", () => {
           interceptForbiddenTreePosition: 2,
           interceptLayouts: [createSyntheticPageModule(InterceptLayout)],
           interceptLayoutSegments: [["(.)photo"]],
-          interceptNotFound: createSyntheticPageModule(InterceptNotFound),
-          interceptNotFoundTreePosition: 2,
+          interceptNotFounds: [createSyntheticPageModule(InterceptNotFound)],
+          interceptNotFoundTreePositions: [2],
           interceptPage: createSyntheticPageModule(() => null),
           interceptParams: { id: "1" },
           interceptSlotKey: SIBLING_PAGE_INTERCEPT_SLOT_KEY,

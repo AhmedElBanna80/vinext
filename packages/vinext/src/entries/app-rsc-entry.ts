@@ -380,6 +380,8 @@ function buildAppRequestRouteMetadata(routes: AppRoute[]): unknown[] {
             interceptBranchSegments: intercept.branchSegments ?? [],
             interceptLoadings: [],
             interceptLoadingTreePositions: intercept.loadingTreePositions ?? [],
+            interceptNotFounds: [],
+            interceptNotFoundTreePositions: intercept.notFoundTreePositions ?? [],
             interceptNotFoundBranchSegments:
               intercept.notFoundBranchSegments ?? intercept.branchSegments ?? [],
             page: null,
@@ -401,6 +403,8 @@ function buildAppRequestRouteMetadata(routes: AppRoute[]): unknown[] {
       interceptBranchSegments: intercept.branchSegments ?? [],
       interceptLoadings: [],
       interceptLoadingTreePositions: intercept.loadingTreePositions ?? [],
+      interceptNotFounds: [],
+      interceptNotFoundTreePositions: intercept.notFoundTreePositions ?? [],
       interceptNotFoundBranchSegments:
         intercept.notFoundBranchSegments ?? intercept.branchSegments ?? [],
       page: null,
@@ -1993,6 +1997,8 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
           interceptForbiddenTreePosition: intercept.forbiddenTreePosition,
           interceptUnauthorized: intercept.unauthorized,
           interceptUnauthorizedTreePosition: intercept.unauthorizedTreePosition,
+          interceptNotFounds: intercept.interceptNotFounds,
+          interceptNotFoundTreePositions: intercept.interceptNotFoundTreePositions,
           interceptSlotId: intercept.slotId,
           interceptSlotKey: intercept.slotKey,
           interceptSourceMatchedUrl: interceptionContext,

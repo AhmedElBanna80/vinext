@@ -1293,6 +1293,78 @@ describe("App Router generated manifest construction", () => {
     expect(routeEntry).toContain("interceptLoadingTreePositions: [1]");
   });
 
+  it("emits positional not-found modules for named slots and intercepted branches", () => {
+    const route = {
+      ...minimalAppRoutes[0],
+      parallelSlots: [
+        {
+          id: "slot:modal:/",
+          key: "modal@modal",
+          name: "modal",
+          ownerDir: "/tmp/test/app/@modal",
+          ownerTreePath: "/",
+          ownerTreePosition: 0,
+          hasPage: true,
+          pagePath: "/tmp/test/app/@modal/nested/page.tsx",
+          defaultPath: null,
+          layoutPath: null,
+          configLayoutPaths: [],
+          configLayoutTreePositions: [],
+          loadingPath: null,
+          errorPath: null,
+          notFoundPath: "/tmp/test/app/@modal/nested/not-found.tsx",
+          notFoundTreePosition: 1,
+          notFoundPaths: [
+            "/tmp/test/app/@modal/not-found.tsx",
+            "/tmp/test/app/@modal/nested/not-found.tsx",
+          ],
+          notFoundTreePositions: [0, 1],
+          interceptingRoutes: [
+            {
+              convention: ".",
+              targetPattern: "/photo/:id",
+              sourceMatchPattern: "/",
+              pagePath: "/tmp/test/app/@modal/(.)photo/[id]/page.tsx",
+              layoutPaths: [],
+              notFoundPaths: ["/tmp/test/app/@modal/(.)photo/not-found.tsx"],
+              notFoundTreePositions: [1],
+              params: ["id"],
+            },
+          ],
+          layoutIndex: 0,
+          routeSegments: ["nested"],
+        },
+      ],
+      siblingIntercepts: [
+        {
+          convention: ".",
+          targetPattern: "/item/:id",
+          sourceMatchPattern: "/",
+          pagePath: "/tmp/test/app/(.)item/[id]/page.tsx",
+          layoutPaths: [],
+          notFoundPaths: ["/tmp/test/app/(.)item/[id]/not-found.tsx"],
+          notFoundTreePositions: [2],
+          params: ["id"],
+        },
+      ],
+    } satisfies AppRoute;
+
+    const manifest = buildAppRscManifestCode({ routes: [route] });
+    const imports = manifest.imports.join("\n");
+    const routeEntry = manifest.routeEntries[0];
+
+    expect(imports).toContain("/tmp/test/app/@modal/not-found.tsx");
+    expect(imports).toContain("/tmp/test/app/@modal/nested/not-found.tsx");
+    expect(imports).toContain("/tmp/test/app/@modal/(.)photo/not-found.tsx");
+    expect(imports).toContain("/tmp/test/app/(.)item/[id]/not-found.tsx");
+    expect(routeEntry).toContain("__loadNotFounds: [load_");
+    expect(routeEntry).toContain("notFoundTreePositions: [0,1]");
+    expect(routeEntry).toContain("interceptNotFounds: [null]");
+    expect(routeEntry).toContain("__loadInterceptNotFounds: [load_");
+    expect(routeEntry).toContain("interceptNotFoundTreePositions: [1]");
+    expect(routeEntry).toContain("interceptNotFoundTreePositions: [2]");
+  });
+
   it("derives route-miss root boundaries when the app has no root page", () => {
     const routes = [
       {

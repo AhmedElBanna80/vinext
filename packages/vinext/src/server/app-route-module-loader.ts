@@ -51,6 +51,8 @@ type LazyLoadableIntercept = {
   __loadInterceptLayouts?: LazyModuleLoaderArray | null;
   interceptLoadings?: readonly unknown[] | null;
   __loadInterceptLoadings?: LazyModuleLoaderArray | null;
+  interceptNotFounds?: readonly unknown[] | null;
+  __loadInterceptNotFounds?: LazyModuleLoaderArray | null;
   __loadState?: {
     page?: unknown;
     pageLoading?: Promise<unknown> | null;
@@ -73,6 +75,7 @@ type LazyLoadableSlot = {
   loadings?: readonly unknown[];
   error?: unknown;
   notFound?: unknown;
+  notFounds?: readonly unknown[];
   __loadPage?: LazyModuleThunk | null;
   __loadDefault?: LazyModuleThunk | null;
   __loadLayout?: LazyModuleThunk | null;
@@ -81,6 +84,7 @@ type LazyLoadableSlot = {
   __loadLoadings?: LazyModuleLoaderArray | null;
   __loadError?: LazyModuleThunk | null;
   __loadNotFound?: LazyModuleThunk | null;
+  __loadNotFounds?: LazyModuleLoaderArray | null;
   /** Hydrated only after an intercept matches, not with the slot's base modules. */
   intercepts?: LazyLoadableIntercept[];
 };
@@ -251,6 +255,7 @@ export function loadAppInterceptLayouts(
   const loads: Promise<unknown>[] = [];
   pushArrayLoads(loads, intercept.interceptLayouts, intercept.__loadInterceptLayouts);
   pushArrayLoads(loads, intercept.interceptLoadings, intercept.__loadInterceptLoadings);
+  pushArrayLoads(loads, intercept.interceptNotFounds, intercept.__loadInterceptNotFounds);
   if (loads.length === 0) return Promise.resolve(intercept.interceptLayouts ?? []);
 
   const loading = shareIsolatePromise(
@@ -312,6 +317,7 @@ export function ensureAppRouteModulesLoaded<TRoute extends LazyLoadableRoute>(
     pushArrayLoads(loads, slot.loadings, slot.__loadLoadings);
     pushFieldLoad(loads, slot as Record<string, unknown>, "error", slot.__loadError);
     pushFieldLoad(loads, slot as Record<string, unknown>, "notFound", slot.__loadNotFound);
+    pushArrayLoads(loads, slot.notFounds, slot.__loadNotFounds);
   }
 
   if (loads.length === 0) {

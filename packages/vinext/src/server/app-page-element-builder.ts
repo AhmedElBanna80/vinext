@@ -150,6 +150,8 @@ export type AppPageInterceptOptions<TModule extends AppPageModule = AppPageModul
   interceptForbiddenTreePosition?: number | null;
   interceptUnauthorized?: TModule | null;
   interceptUnauthorizedTreePosition?: number | null;
+  interceptNotFounds?: readonly (TModule | null | undefined)[] | null;
+  interceptNotFoundTreePositions?: readonly number[] | null;
   interceptPage?: TModule | null;
   interceptParams?: AppPageParams | null;
   interceptSlotId?: string | null;
@@ -726,13 +728,20 @@ export async function buildPageElements<
       const treePosition = opts?.interceptLoadingTreePositions?.[index];
       if (treePosition !== undefined) loadingIndexesByTreePosition.set(treePosition, index);
     }
-    // The intercepting route's nearest not-found.tsx, forbidden.tsx and
-    // unauthorized.tsx belong to its own segments, as in Next.js, so they
-    // catch the intercepting page's signals inside that segment's layout,
-    // before the source route's boundaries. Innermost first, in Next.js's
-    // per-segment order: NotFound, then Forbidden, then Unauthorized.
+    // Each not-found.tsx in the intercepting route, and its nearest
+    // forbidden.tsx and unauthorized.tsx, belong to their own segments, as in
+    // Next.js, so they catch the intercepting page's signals inside that
+    // segment's layout, before the source route's boundaries. Innermost first,
+    // in Next.js's per-segment order: NotFound, then Forbidden, then
+    // Unauthorized.
+    const notFoundsByTreePosition = new Map<number, NonNullable<TModule["default"]>>();
+    for (const [index, notFoundModule] of (opts?.interceptNotFounds ?? []).entries()) {
+      const treePosition = opts?.interceptNotFoundTreePositions?.[index];
+      if (notFoundModule?.default && treePosition !== undefined) {
+        notFoundsByTreePosition.set(treePosition, notFoundModule.default);
+      }
+    }
     const accessBoundaries = [
-      [opts?.interceptNotFound, opts?.interceptNotFoundTreePosition, NotFoundBoundary],
       [opts?.interceptForbidden, opts?.interceptForbiddenTreePosition, ForbiddenBoundary],
       [opts?.interceptUnauthorized, opts?.interceptUnauthorizedTreePosition, UnauthorizedBoundary],
     ] as const;
@@ -744,6 +753,7 @@ export async function buildPageElements<
         ...layoutIndexesByTreePosition.keys(),
         ...loadingIndexesByTreePosition.keys(),
         ...accessBoundaryTreePositions,
+        ...notFoundsByTreePosition.keys(),
       ]),
     ).sort((left, right) => left - right);
 
@@ -754,6 +764,14 @@ export async function buildPageElements<
         loadingIndex === undefined ? null : opts?.interceptLoadings?.[loadingIndex]?.default;
       if (LoadingComponent) {
         element = createElement(Suspense, { fallback: createElement(LoadingComponent) }, element);
+      }
+      const NotFoundComponent = notFoundsByTreePosition.get(treePosition);
+      if (NotFoundComponent) {
+        element = createElement(NotFoundBoundary, {
+          fallback: createElement(NotFoundComponent),
+          // oxlint-disable-next-line react/no-children-prop
+          children: element,
+        });
       }
       for (const [module, boundaryTreePosition, AccessBoundary] of accessBoundaries) {
         const FallbackComponent = module?.default;
@@ -883,6 +901,8 @@ function buildSlotOverrides<TModule extends AppPageModule, TErrorModule extends 
       layoutSegments: opts.interceptLayoutSegments ?? null,
       loadingModules: opts.interceptLoadings || null,
       loadingTreePositions: opts.interceptLoadingTreePositions ?? null,
+      notFoundModules: opts.interceptNotFounds ?? null,
+      notFoundTreePositions: opts.interceptNotFoundTreePositions ?? null,
       pageModule: opts.interceptPage,
       params: opts.interceptParams || routeParams,
       routeSegments: resolveInterceptedSlotSegments(

@@ -88,6 +88,7 @@ describe("collectClientReferenceRouteSignatures", () => {
         "/grid.tsx",
         "/denied.tsx",
         "/sign-in.tsx",
+        "/missing.tsx",
       ]),
       getModuleInfo: moduleInfo({
         "/repo/app/global-error.tsx": ["/retry.tsx"],
@@ -97,6 +98,7 @@ describe("collectClientReferenceRouteSignatures", () => {
         "/repo/app/@modal/(.)photo/forbidden.tsx": ["/denied.tsx"],
         "/repo/app/@modal/(.)photo/unauthorized.tsx": ["/sign-in.tsx"],
         "/repo/app/photos/@drawer/(.)photo/page.tsx": ["/drawer.tsx"],
+        "/repo/app/photos/@drawer/not-found.tsx": ["/missing.tsx"],
       }),
       root: "/repo",
       routes: [
@@ -108,6 +110,7 @@ describe("collectClientReferenceRouteSignatures", () => {
                 {
                   layoutPaths: [],
                   notFoundPath: null,
+                  notFoundPaths: ["/repo/app/photos/@drawer/not-found.tsx"],
                   pagePath: "/repo/app/photos/@drawer/(.)photo/page.tsx",
                 },
               ],
@@ -133,6 +136,7 @@ describe("collectClientReferenceRouteSignatures", () => {
       "/denied.tsx": "app/@modal/(.)photo/page.tsx",
       "/sign-in.tsx": "app/@modal/(.)photo/page.tsx",
       "/drawer.tsx": "app/photos/@drawer/(.)photo/page.tsx",
+      "/missing.tsx": "app/photos/@drawer/(.)photo/page.tsx",
       "/retry.tsx": "app/global-error.tsx",
       "/search.tsx": "app/global-not-found.tsx",
     });

@@ -151,6 +151,8 @@ type AppPageDispatchIntercept<TPage = unknown> = {
   interceptLoadings?: readonly unknown[] | null;
   interceptLoadingTreePositions?: readonly number[] | null;
   interceptNotFoundBranchSegments?: readonly string[] | null;
+  interceptNotFounds?: readonly unknown[] | null;
+  interceptNotFoundTreePositions?: readonly number[] | null;
   notFound?: unknown;
   notFoundTreePosition?: number | null;
   forbidden?: unknown;
@@ -184,6 +186,8 @@ type AppPageDispatchInterceptOptions<TPage = unknown> = {
   interceptForbiddenTreePosition?: number | null;
   interceptUnauthorized?: unknown;
   interceptUnauthorizedTreePosition?: number | null;
+  interceptNotFounds?: readonly unknown[] | null;
+  interceptNotFoundTreePositions?: readonly number[] | null;
   interceptPage: TPage;
   interceptParams: AppPageParams;
   interceptSlotId?: string | null;
@@ -690,6 +694,8 @@ function toInterceptOptions(
     interceptForbiddenTreePosition: intercept.forbiddenTreePosition,
     interceptUnauthorized: intercept.unauthorized,
     interceptUnauthorizedTreePosition: intercept.unauthorizedTreePosition,
+    interceptNotFounds: intercept.interceptNotFounds,
+    interceptNotFoundTreePositions: intercept.interceptNotFoundTreePositions,
     interceptPage: intercept.page,
     interceptParams: intercept.matchedParams,
     interceptSlotId: intercept.slotId ?? null,

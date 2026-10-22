@@ -51,8 +51,11 @@ type AppRscInterceptForMatching = {
   interceptLoadings?: readonly unknown[];
   interceptLoadingTreePositions?: readonly number[];
   interceptNotFoundBranchSegments?: readonly string[];
+  interceptNotFounds?: readonly unknown[];
+  interceptNotFoundTreePositions?: readonly number[];
   __loadInterceptLayouts?: readonly (() => Promise<unknown>)[] | null;
   __loadInterceptLoadings?: readonly (() => Promise<unknown>)[] | null;
+  __loadInterceptNotFounds?: readonly (() => Promise<unknown>)[] | null;
   page: unknown;
   __pageLoader?: (() => Promise<unknown>) | null;
   notFound?: unknown;
@@ -78,8 +81,11 @@ type AppRscSiblingInterceptForMatching = {
   interceptLoadings?: readonly unknown[];
   interceptLoadingTreePositions?: readonly number[];
   interceptNotFoundBranchSegments?: readonly string[];
+  interceptNotFounds?: readonly unknown[];
+  interceptNotFoundTreePositions?: readonly number[];
   __loadInterceptLayouts?: readonly (() => Promise<unknown>)[] | null;
   __loadInterceptLoadings?: readonly (() => Promise<unknown>)[] | null;
+  __loadInterceptNotFounds?: readonly (() => Promise<unknown>)[] | null;
   page: unknown;
   // Sibling intercept pages are lazy-loaded (manifest emits `page: null` plus a
   // `__pageLoader`) so the intercepting page's CSS chunk stays isolated in
@@ -144,8 +150,11 @@ type AppRscInterceptLookupEntry = {
   interceptLoadings?: readonly unknown[];
   interceptLoadingTreePositions?: readonly number[];
   interceptNotFoundBranchSegments?: readonly string[];
+  interceptNotFounds?: readonly unknown[];
+  interceptNotFoundTreePositions?: readonly number[];
   __loadInterceptLayouts?: readonly (() => Promise<unknown>)[] | null;
   __loadInterceptLoadings?: readonly (() => Promise<unknown>)[] | null;
+  __loadInterceptNotFounds?: readonly (() => Promise<unknown>)[] | null;
   page: unknown;
   __pageLoader?: (() => Promise<unknown>) | null;
   notFound: unknown;
@@ -542,6 +551,9 @@ function createInterceptLookup<Route extends AppRscRouteForMatching>(
             interceptLoadings: intercept.interceptLoadings,
             interceptLoadingTreePositions: intercept.interceptLoadingTreePositions,
             interceptNotFoundBranchSegments: intercept.interceptNotFoundBranchSegments,
+            interceptNotFounds: intercept.interceptNotFounds,
+            interceptNotFoundTreePositions: intercept.interceptNotFoundTreePositions,
+            __loadInterceptNotFounds: intercept.__loadInterceptNotFounds,
             __loadInterceptLayouts: intercept.__loadInterceptLayouts,
             __loadInterceptLoadings: intercept.__loadInterceptLoadings,
             page: intercept.page,
@@ -585,6 +597,9 @@ function createInterceptLookup<Route extends AppRscRouteForMatching>(
           interceptLoadings: intercept.interceptLoadings,
           interceptLoadingTreePositions: intercept.interceptLoadingTreePositions,
           interceptNotFoundBranchSegments: intercept.interceptNotFoundBranchSegments,
+          interceptNotFounds: intercept.interceptNotFounds,
+          interceptNotFoundTreePositions: intercept.interceptNotFoundTreePositions,
+          __loadInterceptNotFounds: intercept.__loadInterceptNotFounds,
           __loadInterceptLayouts: intercept.__loadInterceptLayouts,
           __loadInterceptLoadings: intercept.__loadInterceptLoadings,
           page: intercept.page,
