@@ -1778,10 +1778,10 @@ export function buildAppPageElements<
   // Building bottom-up means NotFoundBoundary must wrap first, then Forbidden, Unauthorized, Error.
   // The page-level boundaries render the route's nearest file, walking up from
   // the page. When that file belongs to an ancestor segment, the segment's own
-  // boundary catches the page's signal in place of every layout below it, and
-  // clears on the route reset key. The page-level boundary passes the signal up
-  // to it. It stays in the tree so the element shape above a preserved children
-  // slot never depends on which route owns the file.
+  // boundary catches the page's signal in place of every layout below it. The
+  // page-level boundary passes the signal up to it. It stays in the tree so the
+  // element shape above a preserved children slot never depends on which route
+  // owns the file.
   const resolveAccessBoundaryOwner = (
     boundaries: ReadonlyMap<number, AppPageAccessBoundary<TModule>>,
     pageModule: TModule | null,
@@ -1925,23 +1925,28 @@ export function buildAppPageElements<
     // Building bottom-up means Loading must wrap the leaf subtree first, then
     // access/error boundaries, Template, and finally the Layout slot.
     const accessBoundaries = [
-      [notFoundBoundaries, notFoundOwnerTreePosition, NotFoundBoundary],
-      [forbiddenBoundaries, forbiddenOwnerTreePosition, ForbiddenBoundary],
-      [unauthorizedBoundaries, unauthorizedOwnerTreePosition, UnauthorizedBoundary],
+      [notFoundBoundaries, NotFoundBoundary],
+      [forbiddenBoundaries, ForbiddenBoundary],
+      [unauthorizedBoundaries, UnauthorizedBoundary],
     ] as const;
-    for (const [boundaries, ownerTreePosition, AccessBoundary] of accessBoundaries) {
+    // Like Next.js's, every access boundary clears when the visible pathname
+    // changes, even under an intercepted route whose reset key stays the
+    // source's. Next.js also remounts it when the segment below it changes,
+    // including a route group, so a rewrite that keeps the pathname clears it
+    // only then. The reset key is the route's state path down to that
+    // segment, keyed like a template's.
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/layout-router.tsx
+    const accessResetKey = resolveAppPageTemplateStateKey(
+      routeSegments,
+      treePosition,
+      options.matchedParams,
+    );
+    for (const [boundaries, AccessBoundary] of accessBoundaries) {
       const boundary = boundaries.get(treePosition);
       if (!boundary) continue;
       const BoundaryComponent = boundary.component;
-      // A file that owns the page's signal clears when the route changes.
-      // Like Next.js's, every other boundary, including the built-in, takes no
-      // reset key and clears when the visible pathname changes, so a layout's
-      // signal clears when only that layout's params change.
-      // https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/http-access-fallback/error-boundary.tsx
-      const resetKey =
-        boundary.module !== null && treePosition === ownerTreePosition ? routeResetKey : undefined;
       segmentChildren = (
-        <AccessBoundary resetKey={resetKey} fallback={<BoundaryComponent />}>
+        <AccessBoundary resetKey={accessResetKey} fallback={<BoundaryComponent />}>
           {segmentChildren}
         </AccessBoundary>
       );
