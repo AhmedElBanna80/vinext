@@ -2417,8 +2417,16 @@ describe("App Router Production server (startProdServer)", () => {
     expect(response.status).toBe(200);
 
     const html = await response.text();
-    expect(html.match(/<title>/g) ?? []).toHaveLength(1);
-    expect(html).toContain("<title>Streamed not-found metadata</title>");
+    // Count title elements like Next's cheerio assertion does: the inline RSC
+    // payload scripts carry the same markup as text.
+    const markup = html
+      .split("<script")
+      .map((part, index) =>
+        index === 0 ? part : part.slice(part.indexOf("</script>") + "</script>".length),
+      )
+      .join("");
+    expect(markup.match(/<title>/g) ?? []).toHaveLength(1);
+    expect(markup).toContain("<title>Streamed not-found metadata</title>");
 
     const rscResponse = await fetch(`${baseUrl}/metadata-streaming-not-found.rsc`, {
       headers: { Accept: "text/x-component", RSC: "1", "user-agent": "HeadlessChrome" },
