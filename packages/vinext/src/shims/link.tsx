@@ -24,7 +24,9 @@ import {
   getNavigationRuntime,
   hasAppNavigationRuntime,
   loadNavigationRuntimeRouteManifest,
+  NAVIGATION_RUNTIME_KEY,
   registerNavigationRuntimeFunctions,
+  type NavigationRuntime,
 } from "../client/navigation-runtime.js";
 import { isDangerousScheme, reportBlockedDangerousNavigation } from "./url-safety.js";
 import {
@@ -239,7 +241,6 @@ function resolveHref(href: LinkProps["href"], validate = false): string {
 function resolvePagesLinkValue(
   value: LinkProps["href"],
   pagesRouter: React.ContextType<typeof RouterContext>,
-  routePathnameForWarning: string,
 ): string {
   const formatted = resolveHref(value, pagesRouter !== null);
   if (pagesRouter === null) return formatted;
@@ -251,7 +252,7 @@ function resolvePagesLinkValue(
   ) {
     return resolvePagesRouterHref(formatted, pagesRouter, __basePath);
   }
-  return normalizeRouterHref(formatted, routePathnameForWarning);
+  return normalizeRouterHref(formatted, getCurrentRoutePathnameForWarning());
 }
 
 function resolvePagesQueryOnlyHref(href: string): string {
@@ -871,9 +872,28 @@ function setVisibleLinkPrefetch(instance: LinkPrefetchInstance, isVisible: boole
   }
 }
 
+let visibleLinkPingRuntime: NavigationRuntime | null = null;
+
 function registerVisibleLinkPing(): void {
   if (typeof window === "undefined") return;
-  registerNavigationRuntimeFunctions({ pingVisibleLinks: pingVisibleLinkPrefetches });
+  // Registering validates the whole navigation runtime and copies its function
+  // table, so skip it while the runtime that already holds this ping is still
+  // the one installed on window, instead of repeating it for every Link mount.
+  // A malformed table still goes through registration, which replaces the
+  // runtime with a valid one.
+  const functions: unknown = visibleLinkPingRuntime?.functions;
+  if (
+    visibleLinkPingRuntime !== null &&
+    Reflect.get(window, NAVIGATION_RUNTIME_KEY) === visibleLinkPingRuntime &&
+    typeof functions === "object" &&
+    functions !== null &&
+    Reflect.get(functions, "pingVisibleLinks") === pingVisibleLinkPrefetches
+  ) {
+    return;
+  }
+  visibleLinkPingRuntime = registerNavigationRuntimeFunctions({
+    pingVisibleLinks: pingVisibleLinkPrefetches,
+  });
 }
 
 /**
@@ -939,10 +959,13 @@ function getDefaultLocale(): string | undefined {
 
 function getCurrentLocale(): string | undefined {
   if (typeof window !== "undefined") {
+    const domainLocales = getDomainLocales();
     return getCurrentBrowserLocale({
       basePath: __basePath,
-      domainLocales: getDomainLocales(),
-      hostname: getCurrentHostname(),
+      domainLocales,
+      // Only matched against configured domain locales; skip the location read
+      // when there are none.
+      hostname: domainLocales?.length ? getCurrentHostname() : undefined,
     });
   }
   return getI18nContext()?.locale;
@@ -1050,17 +1073,14 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     legacyBehavior = false,
     passHref = false,
     transitionTypes: _transitionTypes,
-    ...rest
+    locale,
+    ...anchorProps
   },
   forwardedRef,
 ) {
   const pagesRouter = useContext(RouterContext);
-  const routePathnameForWarning = getCurrentRoutePathnameForWarning();
-  const hrefStr = resolvePagesLinkValue(href, pagesRouter, routePathnameForWarning);
-  const asHref =
-    as === undefined ? undefined : resolvePagesLinkValue(as, pagesRouter, routePathnameForWarning);
-  // Extract locale from rest props
-  const { locale, ...restWithoutLocale } = rest;
+  const hrefStr = resolvePagesLinkValue(href, pagesRouter);
+  const asHref = as === undefined ? undefined : resolvePagesLinkValue(as, pagesRouter);
 
   // Next.js parity: in legacyBehavior, a string or number child is wrapped in
   // a plain <a> so the cloneElement path below has an element to clone. The
@@ -1182,11 +1202,15 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     const node = internalRef.current;
     if (!node) return;
 
-    const hrefToPrefetch = getLinkPrefetchHref({
-      href: normalizedHref,
-      basePath: __basePath,
-      currentOrigin: window.location.origin,
-    });
+    // getLinkPrefetchHref() returns relative hrefs unchanged, so only read the
+    // window origin for absolute ones.
+    const hrefToPrefetch = isAbsoluteOrProtocolRelativeUrl(normalizedHref)
+      ? getLinkPrefetchHref({
+          href: normalizedHref,
+          basePath: __basePath,
+          currentOrigin: window.location.origin,
+        })
+      : normalizedHref;
     if (hrefToPrefetch == null) return;
 
     const observer = getSharedObserver();
@@ -1473,8 +1497,6 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
       window.location.assign(absoluteFullHref);
     }
   };
-
-  const anchorProps = restWithoutLocale;
 
   const linkStatusValue = React.useMemo(() => ({ pending }), [pending]);
 
