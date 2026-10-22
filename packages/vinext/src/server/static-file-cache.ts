@@ -37,6 +37,7 @@ export const CONTENT_TYPES: Record<string, string> = {
   ".mp4": "video/mp4",
   ".ogg": "audio/ogg",
   ".ogv": "video/ogg",
+  ".otf": "font/otf",
   ".pdf": "application/pdf",
   ".png": "image/png",
   ".rsc": "text/x-component",
