@@ -1827,6 +1827,18 @@ function getClientConfigRouteContext(href: string): {
   };
 }
 
+/**
+ * matchRedirect has already applied basePath to a config destination, so a
+ * local one that resolves outside it (`/../outside`, or a `basePath: false`
+ * rule) is another app's URL. resolveLocalRedirectUrl would treat it as an app
+ * path and re-add basePath, so it is followed as a document navigation instead,
+ * landing where the server's redirect does.
+ */
+function configRedirectLeavesBasePath(location: string): boolean {
+  if (!__basePath || !location.startsWith("/") || location.startsWith("//")) return false;
+  return !hasBasePath(new URL(location, "http://vinext.local").pathname, __basePath);
+}
+
 async function resolveClientConfigRedirect(href: string): Promise<string | null> {
   const redirects = window.__VINEXT_CLIENT_REDIRECTS__;
   if (!redirects || redirects.length === 0) return null;
@@ -1834,10 +1846,11 @@ async function resolveClientConfigRedirect(href: string): Promise<string | null>
   const routeContext = getClientConfigRouteContext(href);
   if (!routeContext) return null;
 
-  const [{ matchClientRedirect }, { preserveRedirectDestinationQuery }] = await Promise.all([
-    import("../client/client-redirect-matcher.js"),
-    import("../config/config-matchers.js"),
-  ]);
+  const [{ matchClientRedirect }, { encodeRedirectLocation, preserveRedirectDestinationQuery }] =
+    await Promise.all([
+      import("../client/client-redirect-matcher.js"),
+      import("../config/config-matchers.js"),
+    ]);
   const redirect = matchClientRedirect(
     routeContext.pathname,
     redirects,
@@ -1846,17 +1859,15 @@ async function resolveClientConfigRedirect(href: string): Promise<string | null>
   );
   if (!redirect) return null;
 
-  const destination =
-    __basePath &&
-    routeContext.basePathState.hadBasePath &&
-    !isExternalUrl(redirect.destination) &&
-    !hasBasePath(redirect.destination, __basePath)
-      ? __basePath + redirect.destination
-      : redirect.destination;
-  return preserveRedirectDestinationQuery(
-    destination,
-    routeContext.search,
-    redirect.destinationQuery,
+  // matchClientRedirect has already prefixed a local destination with basePath.
+  // Encoded like the server's Location, so the URL parser cannot strip captured
+  // control characters and land somewhere else.
+  return encodeRedirectLocation(
+    preserveRedirectDestinationQuery(
+      redirect.destination,
+      routeContext.search,
+      redirect.destinationQuery,
+    ),
   );
 }
 
@@ -2860,7 +2871,9 @@ async function navigateClient(
           ? await resolveClientConfigRedirect(browserUrl)
           : null;
       if (configRedirect) {
-        const redirectedUrl = resolveLocalRedirectUrl(configRedirect);
+        const redirectedUrl = configRedirectLeavesBasePath(configRedirect)
+          ? null
+          : resolveLocalRedirectUrl(configRedirect);
         if (!redirectedUrl) {
           scheduleHardNavigationAndThrow(configRedirect, "Navigation redirected externally");
         }

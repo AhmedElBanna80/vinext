@@ -20,6 +20,7 @@ import type {
 } from "../config/next-config.js";
 import type { BasePathMatchState, RequestContext } from "../config/config-matchers.js";
 import {
+  encodeRedirectLocation,
   matchRedirect,
   matchRewrite,
   preserveRedirectDestinationQuery,
@@ -27,7 +28,6 @@ import {
   applyMiddlewareRequestHeaders,
   isExternalUrl,
   proxyExternalRequest,
-  sanitizeDestination,
 } from "../config/config-matchers.js";
 import { buildMiddlewarePrefetchSkipResponse } from "./pages-data-route.js";
 import { cloneRequestWithUrl, normalizeTrailingSlash } from "./request-pipeline.js";
@@ -46,7 +46,7 @@ import {
   stripI18nLocaleForApiRoute,
 } from "./pages-i18n.js";
 import { mergeRewriteQuery } from "../utils/query.js";
-import { addBasePathToPathname, hasBasePath } from "../utils/base-path.js";
+import { addBasePathToPathname } from "../utils/base-path.js";
 import { patternToNextFormat } from "../routing/route-validation.js";
 import { normalizePathnameForRouteMatchStrict } from "../routing/utils.js";
 import {
@@ -465,22 +465,15 @@ export async function runPagesRequest(
       conditionalRedirectCacheability,
     );
     if (redirect) {
-      // Only prepend basePath when the request was actually under basePath.
-      // Opt-out rules running on out-of-basepath requests must not receive a basePath prefix.
-      const dest = sanitizeDestination(
-        basePath &&
-          hadBasePath &&
-          !isExternalUrl(redirect.destination) &&
-          !hasBasePath(redirect.destination, basePath)
-          ? basePath + redirect.destination
-          : redirect.destination,
-      );
+      // matchRedirect has already prefixed a local destination with basePath.
       // Use the raw query (when the adapter supplies it) so the redirect Location
       // isn't re-encoded by URL parsing; fall back to the parsed search otherwise.
-      const location = preserveRedirectDestinationQuery(
-        dest,
-        deps.rawSearch ?? search,
-        redirect.destinationQuery,
+      const location = encodeRedirectLocation(
+        preserveRedirectDestinationQuery(
+          redirect.destination,
+          deps.rawSearch ?? search,
+          redirect.destinationQuery,
+        ),
       );
       return {
         type: "response",

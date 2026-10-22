@@ -128,12 +128,56 @@ const nextConfig: NextConfig = {
         permanent: false,
         has: [{ type: "query", key: "to", value: "(?<to>.*)" }],
       },
+      // Used by E2E: config-redirect.spec.ts — a captured control character is
+      // percent-encoded the same way in every request mode.
+      {
+        source: "/control-capture-redirect",
+        destination: "/target/:x",
+        permanent: false,
+        has: [{ type: "query", key: "x", value: "(?<x>[\\s\\S]*)" }],
+      },
+      // Used by E2E: config-redirect.spec.ts — non-ASCII destination characters
+      // are percent-encoded and the template is parsed like a URL in the
+      // Location header.
+      {
+        source: "/non-ascii-redirect/:slug",
+        destination: "/blog/치과-:slug#섹션",
+        permanent: true,
+      },
+      {
+        source: "/non-ascii-query-redirect",
+        destination: "/about?from=서울",
+        permanent: false,
+      },
+      {
+        source: "/normalized-redirect/:slug",
+        destination: "/x/./y/../../blog/:slug?",
+        permanent: false,
+      },
+      {
+        source: "/non-ascii-external-redirect",
+        destination: "https://한국.example/치과",
+        permanent: false,
+      },
       // Ported from Next.js v16.2.6:
       // test/e2e/app-dir/rsc-query-routing/next.config.js
       {
         source: "/nextjs-compat/rsc-query-routing/redirect/source",
         destination: "/nextjs-compat/rsc-query-routing/redirect/dest",
         permanent: true,
+      },
+      // Used by E2E: app-router-encoded-basepath-i18n/config-redirect.spec.ts —
+      // the basePath and locale prefix the destination template before it is
+      // parsed, so dot segments resolve against them.
+      {
+        source: "/basepath-dot-redirect",
+        destination: "/../outside",
+        permanent: false,
+      },
+      {
+        source: "/basepath-root-redirect",
+        destination: "/",
+        permanent: false,
       },
     ];
   },

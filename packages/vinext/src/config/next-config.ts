@@ -206,6 +206,12 @@ export type NextRedirect = {
    * `.nextjs-ref/packages/next/src/lib/load-custom-routes.ts:26`.
    */
   basePath?: false;
+  /**
+   * Internal: set by `applyLocaleToRoutes` on the `/${defaultLocale}` variant.
+   * Next.js `processRoutes` prefixes that variant's destination with the
+   * basePath without turning a bare `/` into the bare basePath.
+   */
+  defaultLocaleVariant?: true;
 };
 
 export type NextRewrite = {
