@@ -1157,6 +1157,79 @@ describe("Pages Router integration", () => {
     expect(body.pageProps?.__N_REDIRECT).toBe("https://example.com/landing");
   });
 
+  // Next.js pages-handler.ts gives every getServerSideProps exit
+  // `revalidate: 0` before it answers the redirect or notFound, so a shared
+  // cache never stores the per-request result. Dev sends the same header.
+  it("sends the getServerSideProps Cache-Control default on redirect and notFound exits", async () => {
+    const dataHeaders = { Accept: "application/json", "x-nextjs-data": "1" };
+    const document = await fetch(`${baseUrl}/gssp-redirect`, { redirect: "manual" });
+    expect(document.status).toBe(307);
+    expect(document.headers.get("cache-control")).toBe(
+      "private, no-cache, no-store, max-age=0, must-revalidate",
+    );
+
+    const data = await fetch(`${baseUrl}/_next/data/test-build-id/gssp-redirect.json`, {
+      headers: dataHeaders,
+    });
+    expect(data.status).toBe(200);
+    expect(data.headers.get("cache-control")).toBe(
+      "private, no-cache, no-store, max-age=0, must-revalidate",
+    );
+
+    const notFoundData = await fetch(
+      `${baseUrl}/_next/data/test-build-id/gssp-not-found.json?hiding=true`,
+      { headers: dataHeaders },
+    );
+    expect(notFoundData.status).toBe(404);
+    expect(notFoundData.headers.get("cache-control")).toBe(
+      "private, no-cache, no-store, max-age=0, must-revalidate",
+    );
+
+    // The document 404 is a rendered page, which Next.js dev never caches.
+    const notFoundDocument = await fetch(`${baseUrl}/gssp-not-found?hiding=true`);
+    expect(notFoundDocument.status).toBe(404);
+    expect(notFoundDocument.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+  });
+
+  it("keeps a getServerSideProps Cache-Control on redirects", async () => {
+    const document = await fetch(`${baseUrl}/gssp-redirect-cache-control`, { redirect: "manual" });
+    expect(document.status).toBe(308);
+    expect(document.headers.get("cache-control")).toBe("public, s-maxage=60");
+
+    const data = await fetch(
+      `${baseUrl}/_next/data/test-build-id/gssp-redirect-cache-control.json`,
+      {
+        headers: { Accept: "application/json", "x-nextjs-data": "1" },
+      },
+    );
+    expect(data.status).toBe(200);
+    expect(data.headers.get("cache-control")).toBe("public, s-maxage=60");
+  });
+
+  it.each(["empty", "zero"])(
+    "treats a falsy getServerSideProps Cache-Control (%s) as unset on redirects",
+    async (value) => {
+      const document = await fetch(`${baseUrl}/gssp-redirect-cache-control?value=${value}`, {
+        redirect: "manual",
+      });
+      expect(document.status).toBe(308);
+      expect(document.headers.get("cache-control")).toBe(
+        "private, no-cache, no-store, max-age=0, must-revalidate",
+      );
+
+      const data = await fetch(
+        `${baseUrl}/_next/data/test-build-id/gssp-redirect-cache-control.json?value=${value}`,
+        {
+          headers: { Accept: "application/json", "x-nextjs-data": "1" },
+        },
+      );
+      expect(data.status).toBe(200);
+      expect(data.headers.get("cache-control")).toBe(
+        "private, no-cache, no-store, max-age=0, must-revalidate",
+      );
+    },
+  );
+
   // Ported from Next.js: test/e2e/getserversideprops/test/index.test.ts
   // https://github.com/vercel/next.js/blob/canary/test/e2e/getserversideprops/test/index.test.ts
   it("skips the custom 500 page for getServerSideProps errors in dev", async () => {
@@ -3730,6 +3803,12 @@ export default function Page(props) {
           expect.stringMatching(/^__prerender_bypass=; Expires=/),
           expect.stringMatching(/^__next_preview_data=; Expires=/),
         ]);
+        if (page === "gssp-not-found") {
+          // A shared cache must not replay the cookie cleanup.
+          expect(response.headers.get("cache-control")).toBe(
+            "private, no-cache, no-store, max-age=0, must-revalidate",
+          );
+        }
       }
     }
   });
@@ -8728,6 +8807,72 @@ describe("Production server middleware (Pages Router)", () => {
       expect(res.headers.get("content-type")).toContain("application/json");
       expect(await res.json()).toEqual({});
     });
+
+    // Next.js pages-handler.ts gives every getServerSideProps exit
+    // `revalidate: 0` before it answers the redirect or notFound, so a shared
+    // cache never stores the per-request result.
+    it("sends the getServerSideProps Cache-Control default on redirect and notFound exits", async () => {
+      const document = await fetch(`${prodUrl}/gssp-redirect`, { redirect: "manual" });
+      expect(document.status).toBe(307);
+      expect(document.headers.get("cache-control")).toBe(
+        "private, no-cache, no-store, max-age=0, must-revalidate",
+      );
+
+      const data = await fetch(`${prodUrl}/_next/data/${BUILD_ID}/gssp-redirect.json`);
+      expect(data.status).toBe(200);
+      expect(data.headers.get("cache-control")).toBe(
+        "private, no-cache, no-store, max-age=0, must-revalidate",
+      );
+
+      const notFoundData = await fetch(
+        `${prodUrl}/_next/data/${BUILD_ID}/gssp-not-found.json?hiding=true`,
+      );
+      expect(notFoundData.status).toBe(404);
+      expect(notFoundData.headers.get("cache-control")).toBe(
+        "private, no-cache, no-store, max-age=0, must-revalidate",
+      );
+
+      const notFoundDocument = await fetch(`${prodUrl}/gssp-not-found?hiding=true`);
+      expect(notFoundDocument.status).toBe(404);
+      expect(notFoundDocument.headers.get("cache-control")).toBe(
+        "private, no-cache, no-store, max-age=0, must-revalidate",
+      );
+    });
+
+    it("keeps a getServerSideProps Cache-Control on redirects", async () => {
+      const document = await fetch(`${prodUrl}/gssp-redirect-cache-control`, {
+        redirect: "manual",
+      });
+      expect(document.status).toBe(308);
+      expect(document.headers.get("cache-control")).toBe("public, s-maxage=60");
+
+      const data = await fetch(
+        `${prodUrl}/_next/data/${BUILD_ID}/gssp-redirect-cache-control.json`,
+      );
+      expect(data.status).toBe(200);
+      expect(data.headers.get("cache-control")).toBe("public, s-maxage=60");
+    });
+
+    it.each(["empty", "zero"])(
+      "treats a falsy getServerSideProps Cache-Control (%s) as unset on redirects",
+      async (value) => {
+        const document = await fetch(`${prodUrl}/gssp-redirect-cache-control?value=${value}`, {
+          redirect: "manual",
+        });
+        expect(document.status).toBe(308);
+        expect(document.headers.get("cache-control")).toBe(
+          "private, no-cache, no-store, max-age=0, must-revalidate",
+        );
+
+        const data = await fetch(
+          `${prodUrl}/_next/data/${BUILD_ID}/gssp-redirect-cache-control.json?value=${value}`,
+        );
+        expect(data.status).toBe(200);
+        expect(data.headers.get("cache-control")).toBe(
+          "private, no-cache, no-store, max-age=0, must-revalidate",
+        );
+      },
+    );
   });
 });
 
@@ -10762,6 +10907,24 @@ describe("custom App optional pageProps envelope parity", () => {
       expect(hitResponse.headers.get("x-nextjs-cache")).toBe("HIT");
       expect(await hitResponse.text()).toContain('<div id="page-content">gsp-sent-response</div>');
     });
+  });
+
+  // Next.js dev sets its development page Cache-Control after the 404 render,
+  // so custom App code cannot make a per-request notFound document cacheable.
+  it("keeps the development Cache-Control on a getServerSideProps notFound in dev", async () => {
+    const response = await fetch(`${devUrl}/gssp-not-found`);
+    expect(response.status).toBe(404);
+    expect(response.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    await response.body?.cancel();
+
+    // The getServerSideProps default is set before the 404 render, so a
+    // custom App that ends that render early still sends it.
+    const ended = await fetch(`${devUrl}/gssp-not-found?end=true`);
+    expect(ended.status).toBe(404);
+    expect(await ended.text()).toBe("ended by App.getInitialProps");
+    expect(ended.headers.get("cache-control")).toBe(
+      "private, no-cache, no-store, max-age=0, must-revalidate",
+    );
   });
 });
 
