@@ -44,6 +44,7 @@ import {
   createNavigationRuntimeRscMetadataScript,
   createRscEmbedTransform,
   createTickBufferedTransform,
+  rewriteInlineCssStylesheetLinks,
   waitAtLeastOneReactRenderTask,
   type InitialNavigationCacheMetadata,
 } from "./app-ssr-stream.js";
@@ -64,6 +65,12 @@ import {
   createClientReferencePreloader,
   resolveRouteClientReferences,
 } from "./app-client-reference-preloader.js";
+import {
+  createStreamedClientReferences,
+  renderStreamedStylesheets,
+  runWithStreamedClientReferences,
+  wrapClientReferenceRequireForStreaming,
+} from "./app-streamed-client-references.js";
 import { RSC_FORM_STATE_GLOBAL } from "../client/browser-globals.js";
 import { isPprFallbackShellAbortError } from "vinext/shims/ppr-fallback-shell";
 import DefaultGlobalError from "vinext/shims/default-global-error";
@@ -216,6 +223,16 @@ function renderSsrErrorDocumentShell(
 
   return createUtf8Stream(
     `<!DOCTYPE html>${html.slice(0, -documentClose.length)}${bootstrapScript}${documentClose}`,
+  );
+}
+
+// Streamed references load through a wrapped loader, which must see every
+// load from the first.
+if (routeClientReferences?.async.length) {
+  const { async, references } = routeClientReferences;
+  wrapClientReferenceRequireForStreaming(
+    new Set(async.map((index) => references[index]!)),
+    (id) => (clientReferences as Record<string, (() => Promise<unknown>) | undefined>)[id],
   );
 }
 
@@ -481,12 +498,16 @@ export async function handleSsr(
     };
 
     // A render waits for its route's client references, so a cold render
-    // shows the same document as a warm one. A PPR fallback shell aborts on
-    // the next tick, so it loads every reference first.
+    // shows the same document as a warm one, except for those whose modules
+    // evaluate asynchronously, which it streams like Next.js. A PPR fallback
+    // shell aborts on the next tick, so it loads every reference first.
+    const routeReferences = options?.pprFallbackShellSignal
+      ? undefined
+      : resolveRouteClientReferences(routeClientReferences, options?.preloadRoutePattern);
+    const streamedReferences = createStreamedClientReferences(routeReferences);
     await clientReferencePreloader.preload(
-      options?.pprFallbackShellSignal
-        ? undefined
-        : resolveRouteClientReferences(routeClientReferences, options?.preloadRoutePattern),
+      routeReferences?.references,
+      streamedReferences?.streamed,
     );
 
     setNavigationContext(ssrNavigationContext);
@@ -739,9 +760,11 @@ export async function handleSsr(
         } else {
           let streamingHtmlStream: Awaited<ReturnType<typeof renderToReadableStream>> | undefined;
           try {
-            streamingHtmlStream = await renderToReadableStream(ssrRoot, {
-              ...renderOptions,
-            });
+            streamingHtmlStream = await runWithStreamedClientReferences(streamedReferences, () =>
+              renderToReadableStream(ssrRoot, {
+                ...renderOptions,
+              }),
+            );
             renderComplete = streamingHtmlStream.allReady;
 
             if (options?.waitForAllReady === true) {
@@ -833,7 +856,18 @@ export async function handleSsr(
               : ssrNavigationContext,
             bootstrapModuleUrl,
             options?.formState ?? null,
-            insertedHTML + errorMetaHTML + getTraceMetaHTML() + initialDevServerErrorHTML,
+            insertedHTML +
+              errorMetaHTML +
+              getTraceMetaHTML() +
+              initialDevServerErrorHTML +
+              // The transform inlines Fizz's stylesheet links before it adds
+              // this HTML, so inline the streamed ones here.
+              rewriteInlineCssStylesheetLinks(
+                renderStreamedStylesheets(streamedReferences),
+                inlineCssManifest,
+                "",
+                options?.scriptNonce,
+              ).html,
             fontHTML,
             options?.dynamicStaleTimeSeconds,
             isSearchParamsFromBrowser,
