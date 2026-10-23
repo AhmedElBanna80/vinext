@@ -80,11 +80,14 @@ const APP_PAGE_SLOT_ERROR_NOT_FOUND_BOUNDARY = Symbol.for(
   "vinext.appPage.slotErrorNotFoundBoundary",
 );
 
-export function tagAppPageSlotError<T>(
-  error: T,
-  layoutIndex: number,
-  notFoundBoundary?: string,
-): T {
+/**
+ * Marker we tag onto an error the route's page component threw, so that the
+ * document's fallback can tell it from one a layout or a template threw,
+ * which no slot tag marks either.
+ */
+const APP_PAGE_PAGE_ERROR = Symbol.for("vinext.appPage.pageError");
+
+function tagAppPageHttpAccessFallbackError<T>(error: T, tags: PropertyDescriptorMap): T {
   // Only an HTTP access fallback reads the tag. A thrown error can be shared
   // across slots, renders and requests (a module-scoped rejected promise), so
   // each throw gets its own tagged copy instead of marking the shared error.
@@ -97,16 +100,46 @@ export function tagAppPageSlotError<T>(
   Object.defineProperties(tagged, {
     ...Object.getOwnPropertyDescriptors(source),
     stack: { value: Reflect.get(source, "stack"), configurable: true, writable: true },
+    ...tags,
+  });
+  return tagged as T;
+}
+
+export function tagAppPageSlotError<T>(
+  error: T,
+  layoutIndex: number,
+  notFoundBoundary?: string,
+): T {
+  return tagAppPageHttpAccessFallbackError(error, {
     [APP_PAGE_SLOT_ERROR_LAYOUT_INDEX]: { value: layoutIndex },
     [APP_PAGE_SLOT_ERROR_NOT_FOUND_BOUNDARY]: { value: notFoundBoundary },
   });
-  return tagged as T;
+}
+
+export function tagAppPagePageError<T>(error: T): T {
+  return tagAppPageHttpAccessFallbackError(error, { [APP_PAGE_PAGE_ERROR]: { value: true } });
+}
+
+function isAppPagePageError(error: unknown): boolean {
+  return !!error && typeof error === "object" && Reflect.get(error, APP_PAGE_PAGE_ERROR) === true;
 }
 
 function getAppPageSlotErrorLayoutIndex(error: unknown): number | null {
   if (!error || typeof error !== "object") return null;
   const layoutIndex: unknown = Reflect.get(error, APP_PAGE_SLOT_ERROR_LAYOUT_INDEX);
   return typeof layoutIndex === "number" ? layoutIndex : null;
+}
+
+/**
+ * The id of the not-found boundary that catches the route page's notFound():
+ * the page-level boundary, or the segment one it passes the signal up to.
+ */
+export const APP_PAGE_NOT_FOUND_BOUNDARY_ID = "page";
+
+function getAppPageSlotErrorNotFoundBoundary(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+  const boundary: unknown = Reflect.get(error, APP_PAGE_SLOT_ERROR_NOT_FOUND_BOUNDARY);
+  return typeof boundary === "string" ? boundary : null;
 }
 
 export type AppPageSpecialError =
@@ -297,7 +330,10 @@ export function resolveAppPageSpecialError(error: unknown): AppPageSpecialError 
  * that digest. When the page threw one too, the page's decides. An error a
  * client component threw during SSR is the page's, since generateMetadata()
  * runs only in the RSC render. A notFound() / forbidden() / unauthorized()
- * a parallel slot's page threw is caught above the layout rendering it.
+ * a parallel slot's page threw is caught above the layout rendering it,
+ * unless the slot's own not-found catches its notFound() and every other copy
+ * is the page's or another slot's. A copy neither threw, such as a template's,
+ * keeps the fallback above that layout.
  */
 export function resolveAppPageShellSpecialError(
   error: unknown,
@@ -314,9 +350,20 @@ export function resolveAppPageShellSpecialError(
   if (fromMetadata) return { ...specialError, fromMetadata: true };
   if (specialError.kind !== "http-access-fallback") return specialError;
   // The boundary above a slot's layout is never below the page's, so the
-  // outermost slot's replaces the page's when both threw.
+  // outermost slot's replaces the page's when both threw. A slot's own
+  // not-found boundary catches its notFound() inside the slot, leaving that
+  // layout and the page's boundary in place.
+  const skipsSlotCaughtNotFound =
+    specialError.statusCode === 404 &&
+    renderedSpecialErrors.every(
+      (rendered) =>
+        isAppPagePageError(rendered) || getAppPageSlotErrorLayoutIndex(rendered) !== null,
+    );
   let slotLayoutIndex: number | null = null;
   for (const rendered of renderedSpecialErrors) {
+    if (skipsSlotCaughtNotFound && getAppPageSlotErrorNotFoundBoundary(rendered) !== null) {
+      continue;
+    }
     const layoutIndex = getAppPageSlotErrorLayoutIndex(rendered);
     if (layoutIndex !== null && (slotLayoutIndex === null || layoutIndex < slotLayoutIndex)) {
       slotLayoutIndex = layoutIndex;
@@ -330,7 +377,13 @@ export function resolveAppPageShellSpecialError(
  * rejected an SSR shell, or null when any copy the RSC render threw isn't
  * caught inside its slot. On the client, each slot's own not-found boundary
  * catches its signal while the rest of the route renders, as in Next.js,
- * which sends an empty error shell and renders them in the browser.
+ * which sends an empty error shell and renders them in the browser. A copy
+ * no slot threw is caught by the page's boundary beside them when the page
+ * threw it, including from a component the page renders, which nothing tags.
+ * One a layout or a template threw renders outside the caught boundaries, so
+ * the document's render from the same payload throws it again and takes the
+ * fallback, which keeps it above the slot's layout (see
+ * `resolveAppPageShellSpecialError`). Without a slot's, that fallback renders.
  */
 export function resolveAppPageCaughtNotFoundBoundaries(
   error: unknown,
@@ -342,16 +395,20 @@ export function resolveAppPageCaughtNotFoundBoundaries(
   }
   if (isThrownNavigationError(error) || renderedSpecialErrors.length === 0) return null;
   const boundaries = new Set<string>();
+  let caughtInSlot = false;
   for (const rendered of renderedSpecialErrors) {
     if (resolveAppPageSpecialError(rendered)?.fromMetadata === true) return null;
-    const boundary: unknown =
-      rendered && typeof rendered === "object"
-        ? Reflect.get(rendered, APP_PAGE_SLOT_ERROR_NOT_FOUND_BOUNDARY)
-        : undefined;
-    if (typeof boundary !== "string") return null;
-    boundaries.add(boundary);
+    const boundary = getAppPageSlotErrorNotFoundBoundary(rendered);
+    if (boundary !== null) {
+      caughtInSlot = true;
+      boundaries.add(boundary);
+    } else if (getAppPageSlotErrorLayoutIndex(rendered) === null) {
+      boundaries.add(APP_PAGE_NOT_FOUND_BOUNDARY_ID);
+    } else {
+      return null;
+    }
   }
-  return Array.from(boundaries);
+  return caughtInSlot ? Array.from(boundaries) : null;
 }
 
 /**

@@ -35,7 +35,10 @@ import {
   resolveAppPageLoadingModuleAtOrAbove,
 } from "../packages/vinext/src/server/app-page-route-wiring.js";
 import { createAppLayoutParamAccessTracker } from "../packages/vinext/src/server/app-layout-param-observation.js";
-import { resolveAppPageCaughtNotFoundBoundaries } from "../packages/vinext/src/server/app-page-execution.js";
+import {
+  APP_PAGE_NOT_FOUND_BOUNDARY_ID,
+  resolveAppPageCaughtNotFoundBoundaries,
+} from "../packages/vinext/src/server/app-page-execution.js";
 import {
   APP_RSC_RENDER_MODE_PREFETCH_EMPTY,
   APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
@@ -2393,6 +2396,98 @@ describe("app page route wiring helpers", () => {
     expect(pageElements.at(-1)).toEqual({ slotLayoutIndex: 0, slotNotFoundBoundary: undefined });
   });
 
+  it("leaves an unmatched slot's default.tsx outside the slot's not-found boundaries", async () => {
+    // Next.js renders an unmatched slot as a `__DEFAULT__` segment carrying
+    // only the default page, so the slot directory's not-found.tsx never
+    // catches the default's notFound(): it is caught above the layout
+    // rendering the slot, on the client and in the document.
+    vi.doMock("../packages/vinext/src/server/app-render-dependency.js", async (importOriginal) => ({
+      ...(await importOriginal<Record<string, unknown>>()),
+      renderAfterAppDependencies: (children: ReactNode) => children,
+    }));
+    const wiringSpecifier =
+      "../packages/vinext/src/server/app-page-route-wiring.js?slot-default-not-found";
+    const {
+      buildAppPageElements: buildElements,
+    }: typeof import("../packages/vinext/src/server/app-page-route-wiring.js") = await import(
+      /* @vite-ignore */ wiringSpecifier
+    );
+    vi.doUnmock("../packages/vinext/src/server/app-render-dependency.js");
+    function SlotDefault(): ReactNode {
+      notFound();
+    }
+    function SlotNotFound() {
+      return createElement("p", null, "slot not found");
+    }
+    const pageElements: {
+      component: unknown;
+      slotLayoutIndex?: number;
+      slotNotFoundBoundary?: string;
+    }[] = [];
+    const buildSlotElements = (page: AppPageModule | null) =>
+      buildElements({
+        createPageElement(component, props, slotLayoutIndex, slotNotFoundBoundary) {
+          pageElements.push({ component, slotLayoutIndex, slotNotFoundBoundary });
+          return createElement(component, props);
+        },
+        element: createElement(PageProbe),
+        makeThenableParams(value) {
+          return Promise.resolve(value);
+        },
+        matchedParams: {},
+        route: {
+          error: null,
+          errors: [null],
+          layoutTreePositions: [0],
+          layouts: [{ default: RootLayout }],
+          loading: null,
+          notFound: null,
+          notFounds: [null],
+          routeSegments: [],
+          slots: {
+            modal: {
+              default: { default: SlotDefault },
+              error: null,
+              layout: null,
+              layoutIndex: 0,
+              loading: null,
+              name: "modal",
+              notFound: { default: SlotNotFound },
+              notFoundTreePosition: 0,
+              notFounds: [{ default: SlotNotFound }],
+              notFoundTreePositions: [0],
+              page,
+              routeSegments: page ? [] : null,
+            },
+          },
+          templateTreePositions: [],
+          templates: [],
+        },
+        routePath: "/",
+        rootNotFoundModule: null,
+      });
+    const modalSlotId = AppElementsWire.encodeSlotId("modal", "/");
+
+    const defaultSlot = buildSlotElements(null)[modalSlotId];
+    expect(pageElements.at(-1)).toEqual({
+      component: SlotDefault,
+      slotLayoutIndex: 0,
+      slotNotFoundBoundary: undefined,
+    });
+    expect(findElementByTypeName(defaultSlot, "NotFoundBoundary")).toBeNull();
+
+    // The slot's page is still caught by the slot's own boundary.
+    const pageSlot = buildSlotElements({ default: SlotPage })[modalSlotId];
+    expect(pageElements.at(-1)).toEqual({
+      component: SlotPage,
+      slotLayoutIndex: 0,
+      slotNotFoundBoundary: `${modalSlotId}:0`,
+    });
+    expect(findElementByTypeName(pageSlot, "NotFoundBoundary")?.props.caughtId).toBe(
+      `${modalSlotId}:0`,
+    );
+  });
+
   it("uses intercepted override segments for named slot reset boundaries", async () => {
     function SlotError() {
       return createElement("div", null, "slot error");
@@ -4434,6 +4529,7 @@ describe("app page route wiring helpers", () => {
     expect(getElementTypeName((notFoundBoundary.props.fallback as ReactElement).type)).toBe(
       "DefaultNotFound",
     );
+    expect(notFoundBoundary.props.caughtId).toBe(APP_PAGE_NOT_FOUND_BOUNDARY_ID);
     expect(
       findSlotById(
         notFoundBoundary.props.children,
@@ -4486,6 +4582,81 @@ describe("app page route wiring helpers", () => {
     );
     expect(findSlotById(rootNotFoundBoundary.props.children, "layout:/dashboard")).not.toBeNull();
     expect(findElementByTypeName(nestedLayoutSlot.props.children, "NotFoundBoundary")).toBeNull();
+    // It catches the page's notFound(), so the document can render it caught
+    // beside a slot's own boundary.
+    expect(rootNotFoundBoundary.props.caughtId).toBe(APP_PAGE_NOT_FOUND_BOUNDARY_ID);
+  });
+
+  it("ids the page-level not-found boundary that catches the page's notFound()", () => {
+    function PageNotFound() {
+      return createElement("p", null, "page not found");
+    }
+    const collectNotFoundBoundaries = (
+      siblingIntercept: boolean,
+      segmentNotFound: boolean,
+    ): ReactElement<Record<string, unknown>>[] => {
+      const elements = buildAppPageElements({
+        element: siblingIntercept ? null : createElement(PageProbe),
+        renderElementWithMetadataOutlet: siblingIntercept ? () => createElement(PageProbe) : null,
+        makeThenableParams(params) {
+          return Promise.resolve(params);
+        },
+        matchedParams: {},
+        route: {
+          error: null,
+          errors: [null],
+          layoutTreePositions: [0],
+          layouts: [{ default: RootLayout }],
+          loading: null,
+          notFound: { default: PageNotFound },
+          notFounds: [segmentNotFound ? { default: PageNotFound } : null],
+          notFoundTreePosition: segmentNotFound ? 0 : null,
+          routeSegments: ["reports"],
+          slots: {},
+          templateTreePositions: [],
+          templates: [],
+        },
+        routePath: "/reports",
+        rootNotFoundModule: null,
+      });
+      const boundaries: ReactElement<Record<string, unknown>>[] = [];
+      findElement(elements["route:/reports"], (element) => {
+        if (getElementTypeName(element.type) === "NotFoundBoundary") {
+          boundaries.push(element as ReactElement<Record<string, unknown>>);
+        }
+        return false;
+      });
+      return boundaries;
+    };
+    const boundaries = collectNotFoundBoundaries(false, false);
+    const pageBoundary = boundaries.find(
+      (boundary) =>
+        getElementTypeName((boundary.props.fallback as ReactElement).type) === "PageNotFound",
+    );
+    expect(pageBoundary?.props.caughtId).toBe(APP_PAGE_NOT_FOUND_BOUNDARY_ID);
+    // No other boundary carries the id.
+    expect(
+      boundaries.filter((boundary) => boundary.props.caughtId === APP_PAGE_NOT_FOUND_BOUNDARY_ID),
+    ).toHaveLength(1);
+    // When the segment owns the not-found, its boundary carries the id instead.
+    expect(
+      collectNotFoundBoundaries(false, true).filter(
+        (boundary) => boundary.props.caughtId === APP_PAGE_NOT_FOUND_BOUNDARY_ID,
+      ),
+    ).toHaveLength(1);
+
+    // A sibling intercept page brings its own boundaries and renders only for
+    // an RSC navigation, which never replays a caught document, so neither the
+    // source route's page-level nor its segment boundary carries the id.
+    for (const segmentNotFound of [false, true]) {
+      const interceptBoundaries = collectNotFoundBoundaries(true, segmentNotFound);
+      expect(interceptBoundaries.length).toBeGreaterThan(0);
+      expect(
+        interceptBoundaries.filter(
+          (boundary) => boundary.props.caughtId === APP_PAGE_NOT_FOUND_BOUNDARY_ID,
+        ),
+      ).toEqual([]);
+    }
   });
 
   it("clears the built-in not-found boundary on the visible pathname, not the route", () => {

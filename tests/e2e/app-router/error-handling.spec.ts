@@ -511,6 +511,90 @@ test.describe("Not Found", () => {
     await expect(page.locator("#slot-own-team")).toHaveText("Team ok");
   });
 
+  test("a parallel slot's default.tsx notFound() skips the slot's own not-found", async ({
+    page,
+  }) => {
+    // Next.js renders an unmatched slot as a `__DEFAULT__` segment without the
+    // slot directory's files, so @panel/not-found.tsx doesn't catch it and the
+    // not-found above the panel layout does.
+    const response = await page.goto(`${BASE}/nextjs-compat/not-found-slot-own/panel`);
+    expect(response?.status()).toBe(404);
+    await waitForAppRouterHydration(page);
+    await expect(page.locator("#slot-own-layout #slot-own-root-nf")).toBeVisible();
+    await expect(page.locator("#slot-own-panel-layout")).toHaveCount(0);
+    await expect(page.locator("#slot-own-panel-nf")).toHaveCount(0);
+    await expect(page.locator("#slot-own-panel-segment-nf")).toHaveCount(0);
+    await expect(page).not.toHaveTitle("Not Found (panel slot)");
+
+    await page.goto(`${BASE}/nextjs-compat/not-found-slot-own`);
+    await waitForAppRouterHydration(page);
+    await page.getByRole("link", { name: "Panel default" }).click();
+    await expect(page).toHaveURL(/\/panel$/);
+    await expect(page.locator("#slot-own-layout #slot-own-root-nf")).toBeVisible();
+    await expect(page.locator("#slot-own-panel-layout")).toHaveCount(0);
+    await expect(page.locator("#slot-own-panel-nf")).toHaveCount(0);
+    await expect(page.locator("#slot-own-panel-segment-nf")).toHaveCount(0);
+  });
+
+  test("a page's and a slot's notFound() keep the layout rendering the slot", async ({ page }) => {
+    // The team segment's not-found catches the page's inside the team layout,
+    // and the slot's own not-found catches the slot's. "late" throws the
+    // page's from below a Suspense boundary.
+    const errors: string[] = [];
+    page.on("console", (message) => {
+      // The browser logs the document's own 404.
+      if (message.type() === "error" && !message.text().startsWith("Failed to load resource")) {
+        errors.push(message.text());
+      }
+    });
+    page.on("pageerror", (error) => errors.push(error.message));
+    for (const id of ["both", "late"]) {
+      const response = await page.goto(`${BASE}/nextjs-compat/not-found-slot-own/team/${id}`);
+      expect(response?.status(), id).toBe(404);
+      await waitForAppRouterHydration(page);
+      await expect(page.locator("#slot-own-team-layout #slot-own-segment-nf")).toBeVisible();
+      await expect(page.locator("#slot-own-team-slot #slot-own-team-nf")).toBeVisible();
+      await expect(page.locator("#slot-own-root-nf")).toHaveCount(0);
+    }
+    // Both boundaries hydrate caught, so React doesn't recover by client rendering.
+    expect(errors).toEqual([]);
+
+    await page.goto(`${BASE}/nextjs-compat/not-found-slot-own/team/ok`);
+    await waitForAppRouterHydration(page);
+    for (const id of ["both", "late"]) {
+      await page.getByRole("link", { name: `Team ${id}` }).click();
+      await expect(page).toHaveURL(new RegExp(`/team/${id}$`));
+      await expect(page.locator("#slot-own-team-layout #slot-own-segment-nf")).toBeVisible();
+      await expect(page.locator("#slot-own-team-slot #slot-own-team-nf")).toBeVisible();
+      await expect(page.locator("#slot-own-root-nf")).toHaveCount(0);
+    }
+  });
+
+  test("a layout's or a template's notFound() beside a slot's is caught above that layout", async ({
+    page,
+  }) => {
+    const cases = [
+      { link: "Team gone", path: "team/gone", layout: "#slot-own-team-layout" },
+      { link: "Template", path: "tmpl", layout: "#slot-own-tmpl-layout" },
+    ];
+    for (const { path, layout } of cases) {
+      const response = await page.goto(`${BASE}/nextjs-compat/not-found-slot-own/${path}`);
+      expect(response?.status(), path).toBe(404);
+      await waitForAppRouterHydration(page);
+      await expect(page.locator("#slot-own-layout #slot-own-root-nf")).toBeVisible();
+      await expect(page.locator(layout)).toHaveCount(0);
+    }
+
+    for (const { link, path, layout } of cases) {
+      await page.goto(`${BASE}/nextjs-compat/not-found-slot-own/team/ok`);
+      await waitForAppRouterHydration(page);
+      await page.getByRole("link", { name: link, exact: true }).click();
+      await expect(page).toHaveURL(new RegExp(`/${path}$`));
+      await expect(page.locator("#slot-own-layout #slot-own-root-nf")).toBeVisible();
+      await expect(page.locator(layout)).toHaveCount(0);
+    }
+  });
+
   test("a slot intercept below a slot segment keeps that segment's layout and not-found", async ({
     page,
   }) => {

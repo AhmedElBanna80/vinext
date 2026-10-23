@@ -52,7 +52,7 @@ import {
   type AppPageRenderDependency,
   type AppRenderDependency,
 } from "./app-render-dependency.js";
-import { tagAppPageSlotError } from "./app-page-execution.js";
+import { APP_PAGE_NOT_FOUND_BOUNDARY_ID, tagAppPageSlotError } from "./app-page-execution.js";
 import {
   resolveAppPageBranchParams,
   resolveAppPageSegmentParamScopeKeys,
@@ -1592,10 +1592,15 @@ export function buildAppPageElements<
     // Each not-found.tsx in the slot's branch belongs to its own segment, so,
     // as in Next.js, it catches notFound() from inside that segment's layout,
     // and a layout's own notFound() reaches the boundary of the segment above.
+    // An unmatched slot renders its default.tsx as Next.js's `__DEFAULT__`
+    // segment, which carries none of the slot directory's files, so the
+    // default's notFound() is caught above the layout rendering the slot.
     const branchNotFounds = new Map<number, AppPageComponent>();
-    const slotNotFoundModules = hasSlotTreeOverride
-      ? slotOverride?.notFoundModules
-      : slot.notFounds;
+    const slotNotFoundModules = !overrideOrPageComponent
+      ? undefined
+      : hasSlotTreeOverride
+        ? slotOverride?.notFoundModules
+        : slot.notFounds;
     const slotNotFoundTreePositions = hasSlotTreeOverride
       ? slotOverride?.notFoundTreePositions
       : slot.notFoundTreePositions;
@@ -1991,11 +1996,34 @@ export function buildAppPageElements<
   const notFoundComponent =
     getDefaultExport(notFoundPageModule) ??
     (layoutEntries.length === 0 ? DEFAULT_NOT_FOUND_COMPONENT : null);
+  // The boundary that catches the page's own notFound(), the page-level one or
+  // else the deepest segment's, carries an id so that a document whose slot
+  // boundaries catch their slots' signals renders it caught beside them.
+  // A sibling intercept page brings its own boundaries and renders only for
+  // an RSC navigation, which never replays a caught document, so the source
+  // route's boundaries carry no id then.
+  const identifiesPageNotFoundCatcher = !renderElementWithMetadataOutlet;
+  const isPageNotFoundCaughtAtPage =
+    identifiesPageNotFoundCatcher &&
+    notFoundComponent !== null &&
+    notFoundOwnerTreePosition === null;
+  let pageNotFoundCatcherTreePosition: number | null = null;
+  if (identifiesPageNotFoundCatcher && !isPageNotFoundCaughtAtPage) {
+    for (const treePosition of notFoundBoundaries.keys()) {
+      if (
+        pageNotFoundCatcherTreePosition === null ||
+        treePosition > pageNotFoundCatcherTreePosition
+      ) {
+        pageNotFoundCatcherTreePosition = treePosition;
+      }
+    }
+  }
   if (notFoundComponent) {
     const NotFoundComponent = notFoundComponent;
     routeChildren = (
       <NotFoundBoundary
         resetKey={routeResetKey}
+        caughtId={isPageNotFoundCaughtAtPage ? APP_PAGE_NOT_FOUND_BOUNDARY_ID : undefined}
         fallback={
           notFoundOwnerTreePosition === null ? (
             <NotFoundComponent />
@@ -2108,11 +2136,20 @@ export function buildAppPageElements<
       const boundary = boundaries.get(treePosition);
       if (!boundary) continue;
       const BoundaryComponent = boundary.component;
-      segmentChildren = (
-        <AccessBoundary resetKey={accessResetKey} fallback={<BoundaryComponent />}>
-          {segmentChildren}
-        </AccessBoundary>
-      );
+      segmentChildren =
+        AccessBoundary === NotFoundBoundary && treePosition === pageNotFoundCatcherTreePosition ? (
+          <NotFoundBoundary
+            resetKey={accessResetKey}
+            fallback={<BoundaryComponent />}
+            caughtId={APP_PAGE_NOT_FOUND_BOUNDARY_ID}
+          >
+            {segmentChildren}
+          </NotFoundBoundary>
+        ) : (
+          <AccessBoundary resetKey={accessResetKey} fallback={<BoundaryComponent />}>
+            {segmentChildren}
+          </AccessBoundary>
+        );
     }
 
     const segmentErrorComponent = getErrorBoundaryExport(
