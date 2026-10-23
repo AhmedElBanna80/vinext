@@ -22,7 +22,7 @@ import React, {
 import type { UrlObject } from "node:url";
 import {
   getNavigationRuntime,
-  hasAppNavigationRuntime,
+  isNavigationRuntimeFunctions,
   loadNavigationRuntimeRouteManifest,
   NAVIGATION_RUNTIME_KEY,
   registerNavigationRuntimeFunctions,
@@ -306,8 +306,42 @@ export function resolveLinkPrefetchMode(
 // policy helpers moved to internal/app-route-prefetch-policy.ts.
 export { canAutoPrefetchFullAppRoute, resolveAutoAppRoutePrefetch };
 
+let validatedNavigationRuntime: NavigationRuntime | null = null;
+let validatedNavigationRuntimeBootstrap: unknown = null;
+let validatedNavigationRuntimeFunctions: unknown = null;
+
+/**
+ * `hasAppNavigationRuntime()` for Link, which asks on every render and every
+ * prefetch. Full validation walks the whole navigation runtime, including every
+ * inline RSC chunk still held by the bootstrap, so skip it while window still
+ * holds the runtime that last passed it with the same bootstrap and function
+ * table objects. Registering either replaces that object, and a replaced
+ * runtime, bootstrap or table falls through to full validation. A table edited
+ * in place keeps its identity, so the function table is still checked on every
+ * call (it is cheap); chunks streamed into the held bootstrap are not
+ * revalidated.
+ */
+function hasLinkAppNavigationRuntime(): boolean {
+  if (typeof window === "undefined") return false;
+  const runtime = validatedNavigationRuntime;
+  if (
+    runtime !== null &&
+    Reflect.get(window, NAVIGATION_RUNTIME_KEY) === runtime &&
+    runtime.bootstrap === validatedNavigationRuntimeBootstrap &&
+    runtime.functions === validatedNavigationRuntimeFunctions
+  ) {
+    const functions: unknown = runtime.functions;
+    return isNavigationRuntimeFunctions(functions) && typeof functions.navigate === "function";
+  }
+  const validated = getNavigationRuntime();
+  validatedNavigationRuntime = validated;
+  validatedNavigationRuntimeBootstrap = validated?.bootstrap ?? null;
+  validatedNavigationRuntimeFunctions = validated?.functions ?? null;
+  return typeof validated?.functions.navigate === "function";
+}
+
 function getLinkPrefetchRouterMode(): LinkPrefetchRouterMode {
-  return hasAppNavigationRuntime() ? "app" : "pages";
+  return hasLinkAppNavigationRuntime() ? "app" : "pages";
 }
 
 // ---------------------------------------------------------------------------
@@ -391,7 +425,7 @@ function prefetchUrl(
 
   const runPrefetch = () => {
     void (async () => {
-      if (hasAppNavigationRuntime()) {
+      if (hasLinkAppNavigationRuntime()) {
         if (isBotUserAgent(window.navigator?.userAgent ?? "")) return;
 
         const [
@@ -758,7 +792,7 @@ function prefetchUrl(
     });
   };
 
-  if (priority === "high" || hasAppNavigationRuntime()) {
+  if (priority === "high" || hasLinkAppNavigationRuntime()) {
     runPrefetch();
     return;
   }
@@ -769,7 +803,7 @@ function prefetchUrl(
 
 async function promotePrefetchEntriesForNavigation(href: string): Promise<void> {
   if (typeof window === "undefined") return;
-  if (!hasAppNavigationRuntime()) return;
+  if (!hasLinkAppNavigationRuntime()) return;
   const [
     { getPrefetchCache },
     { parseRscRequestPath, stripRscCacheBustingSearchParam, stripRscSuffix },
@@ -1109,7 +1143,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
   const pagesAsHref = asHref ?? implicitDynamicRouteHref?.as;
   const unresolvedHref = pagesAsHref ?? hrefStr;
   const resolvedHref =
-    unresolvedHref.startsWith("#") && !getNavigationRuntime()?.functions.navigate
+    unresolvedHref.startsWith("#") && !hasLinkAppNavigationRuntime()
       ? resolvePagesQueryOnlyHref(unresolvedHref)
       : unresolvedHref;
   const concreteRouteHref = HAS_PAGES_ROUTER
@@ -1373,7 +1407,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
 
     e.preventDefault();
 
-    const hasAppNavigationRuntime = Boolean(getNavigationRuntime()?.functions.navigate);
+    const hasAppNavigationRuntime = hasLinkAppNavigationRuntime();
     const pagesNavigateHref =
       HAS_PAGES_ROUTER && resolvedHref.startsWith("?")
         ? resolvePagesLinkNavigationHref(resolvedHref, locale)
