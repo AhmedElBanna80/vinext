@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   createRenderStreamCancellation,
   type RenderStreamCancellation,
@@ -48,6 +49,8 @@ const NEWLINE_PREFIXED_ROW_TAGS = new Set([
   "P",
   "#",
 ]);
+
+type ChunkSink = { enqueue(chunk: Uint8Array): void };
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -159,6 +162,10 @@ function isTagInTable(table: Uint8Array, byte: number): boolean {
  * no stylesheet hint are forwarded as-is without copying; only rows whose
  * tag is `HL` are decoded and inspected. Length-prefixed bodies remain separate
  * so binary bytes do not force adjacent text through the embed's base64 path.
+ *
+ * Every RSC render passes through here, so the returned stream reads the
+ * source directly instead of piping it through a `TransformStream`, which
+ * would add two more streams, a pipe and their promise hops per chunk.
  */
 export function normalizeReactFlightPreloadHints(
   stream: ReadableStream<Uint8Array>,
@@ -174,138 +181,221 @@ export function normalizeReactFlightPreloadHints(
   // row.
   let inPlainRow = false;
 
-  return stream.pipeThrough(
-    new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        if (passThrough) {
-          controller.enqueue(chunk);
-          return;
-        }
+  const transform = (chunk: Uint8Array, controller: ChunkSink): void => {
+    if (passThrough) {
+      controller.enqueue(chunk);
+      return;
+    }
 
-        // Where this chunk's first unfinished row starts. Inside a plain row,
-        // only a split UTF-8 character's leading bytes are ever carried.
-        let start = 0;
-        if (inPlainRow) {
-          const end = indexOfByte(chunk, NEWLINE_BYTE, 0);
-          if (end === -1) {
-            const bytes = carry === null ? chunk : concatBytes(carry, chunk);
-            const complete = utf8CompleteEnd(bytes, 0);
-            carry = complete === bytes.byteLength ? null : bytes.slice(complete);
-            if (complete > 0) {
-              controller.enqueue(
-                complete === bytes.byteLength ? bytes : bytes.subarray(0, complete),
-              );
-            }
-            return;
-          }
-          inPlainRow = false;
-          start = (carry === null ? 0 : carry.byteLength) + end + 1;
-        }
-
+    // Where this chunk's first unfinished row starts. Inside a plain row,
+    // only a split UTF-8 character's leading bytes are ever carried.
+    let start = 0;
+    if (inPlainRow) {
+      const end = indexOfByte(chunk, NEWLINE_BYTE, 0);
+      if (end === -1) {
         const bytes = carry === null ? chunk : concatBytes(carry, chunk);
-        carry = null;
-        const byteLength = bytes.byteLength;
-        // Offset of the first byte not yet known to belong to a complete row.
-        let offset = start;
-        let emittedThrough = 0;
-        // Copy-on-write output: only allocate when a hint row is rewritten.
-        let output = bytes;
-        let ownsOutput = bytes !== chunk;
+        const complete = utf8CompleteEnd(bytes, 0);
+        carry = complete === bytes.byteLength ? null : bytes.slice(complete);
+        if (complete > 0) {
+          controller.enqueue(complete === bytes.byteLength ? bytes : bytes.subarray(0, complete));
+        }
+        return;
+      }
+      inPlainRow = false;
+      start = (carry === null ? 0 : carry.byteLength) + end + 1;
+    }
 
-        while (offset < byteLength) {
-          if (rawBytesRemaining > 0) {
-            const length = Math.min(rawBytesRemaining, byteLength - offset);
-            if (offset > emittedThrough)
-              controller.enqueue(output.subarray(emittedThrough, offset));
-            controller.enqueue(bytes.subarray(offset, offset + length));
-            rawBytesRemaining -= length;
-            offset += length;
-            emittedThrough = offset;
-            continue;
-          }
+    const bytes = carry === null ? chunk : concatBytes(carry, chunk);
+    carry = null;
+    const byteLength = bytes.byteLength;
+    // Offset of the first byte not yet known to belong to a complete row.
+    let offset = start;
+    let emittedThrough = 0;
+    // Copy-on-write output: only allocate when a hint row is rewritten.
+    let output = bytes;
+    let ownsOutput = bytes !== chunk;
 
-          const colon = indexOfByte(bytes, COLON_BYTE, offset);
-          if (colon === -1 || colon + 1 === byteLength) break;
+    while (offset < byteLength) {
+      if (rawBytesRemaining > 0) {
+        const length = Math.min(rawBytesRemaining, byteLength - offset);
+        if (offset > emittedThrough) controller.enqueue(output.subarray(emittedThrough, offset));
+        controller.enqueue(bytes.subarray(offset, offset + length));
+        rawBytesRemaining -= length;
+        offset += length;
+        emittedThrough = offset;
+        continue;
+      }
 
-          const tagByte = bytes[colon + 1];
-          if (isTagInTable(LENGTH_PREFIXED_ROW_TAG_TABLE, tagByte)) {
-            const comma = indexOfByte(bytes, COMMA_BYTE, colon + 2);
-            if (comma === -1) break;
+      const colon = indexOfByte(bytes, COLON_BYTE, offset);
+      if (colon === -1 || colon + 1 === byteLength) break;
 
-            const length = parseHexBytes(bytes, colon + 2, comma);
-            if (length != null) {
-              rawBytesRemaining = length;
-              offset = comma + 1;
-              continue;
-            }
+      const tagByte = bytes[colon + 1];
+      if (isTagInTable(LENGTH_PREFIXED_ROW_TAG_TABLE, tagByte)) {
+        const comma = indexOfByte(bytes, COMMA_BYTE, colon + 2);
+        if (comma === -1) break;
 
-            // A known length-prefixed tag with an invalid length is malformed
-            // or belongs to a newer protocol. Preserve the remaining stream
-            // byte-for-byte instead of guessing at row boundaries.
-            passThrough = true;
-            offset = byteLength;
-            break;
-          }
-
-          if (
-            !isTagInTable(NEWLINE_PREFIXED_ROW_TAG_TABLE, tagByte) &&
-            !isUntaggedJsonRowStart(tagByte)
-          ) {
-            // Unknown tags may be length-prefixed in a newer React release.
-            // Stop inspecting this stream so their bodies can never be
-            // mistaken for newline-framed Flight rows.
-            passThrough = true;
-            offset = byteLength;
-            break;
-          }
-
-          const newline = indexOfByte(bytes, NEWLINE_BYTE, offset);
-          if (newline === -1) {
-            // Only an `HL` row is ever rewritten, so only a row that may still
-            // be one is carried. Any other row's bytes are forwarded now, up
-            // to its last complete UTF-8 character.
-            const mayBeHint =
-              tagByte === HINT_TAG_BYTE &&
-              (colon + 2 === byteLength || bytes[colon + 2] === LINK_HINT_CODE_BYTE);
-            if (!mayBeHint) {
-              inPlainRow = true;
-              offset = utf8CompleteEnd(bytes, offset);
-            }
-            break;
-          }
-
-          if (tagByte === HINT_TAG_BYTE && bytes[colon + 2] === LINK_HINT_CODE_BYTE) {
-            const line = bytes.subarray(offset, newline + 1);
-            const normalized = normalizeReactFlightHintLine(line);
-            if (normalized !== line) {
-              if (!ownsOutput) {
-                output = bytes.slice();
-                ownsOutput = true;
-              }
-              output.set(normalized, offset);
-            }
-          }
-          offset = newline + 1;
+        const length = parseHexBytes(bytes, colon + 2, comma);
+        if (length != null) {
+          rawBytesRemaining = length;
+          offset = comma + 1;
+          continue;
         }
 
-        if (offset < byteLength) carry = bytes.slice(offset);
-        if (offset > emittedThrough) {
-          controller.enqueue(
-            offset === byteLength && emittedThrough === 0
-              ? output
-              : output.subarray(emittedThrough, offset),
-          );
+        // A known length-prefixed tag with an invalid length is malformed
+        // or belongs to a newer protocol. Preserve the remaining stream
+        // byte-for-byte instead of guessing at row boundaries.
+        passThrough = true;
+        offset = byteLength;
+        break;
+      }
+
+      if (
+        !isTagInTable(NEWLINE_PREFIXED_ROW_TAG_TABLE, tagByte) &&
+        !isUntaggedJsonRowStart(tagByte)
+      ) {
+        // Unknown tags may be length-prefixed in a newer React release.
+        // Stop inspecting this stream so their bodies can never be
+        // mistaken for newline-framed Flight rows.
+        passThrough = true;
+        offset = byteLength;
+        break;
+      }
+
+      const newline = indexOfByte(bytes, NEWLINE_BYTE, offset);
+      if (newline === -1) {
+        // Only an `HL` row is ever rewritten, so only a row that may still
+        // be one is carried. Any other row's bytes are forwarded now, up
+        // to its last complete UTF-8 character.
+        const mayBeHint =
+          tagByte === HINT_TAG_BYTE &&
+          (colon + 2 === byteLength || bytes[colon + 2] === LINK_HINT_CODE_BYTE);
+        if (!mayBeHint) {
+          inPlainRow = true;
+          offset = utf8CompleteEnd(bytes, offset);
+        }
+        break;
+      }
+
+      if (tagByte === HINT_TAG_BYTE && bytes[colon + 2] === LINK_HINT_CODE_BYTE) {
+        const line = bytes.subarray(offset, newline + 1);
+        const normalized = normalizeReactFlightHintLine(line);
+        if (normalized !== line) {
+          if (!ownsOutput) {
+            output = bytes.slice();
+            ownsOutput = true;
+          }
+          output.set(normalized, offset);
+        }
+      }
+      offset = newline + 1;
+    }
+
+    if (offset < byteLength) carry = bytes.slice(offset);
+    if (offset > emittedThrough) {
+      controller.enqueue(
+        offset === byteLength && emittedThrough === 0
+          ? output
+          : output.subarray(emittedThrough, offset),
+      );
+    }
+  };
+  const flush = (controller: ChunkSink): void => {
+    if (carry !== null && carry.byteLength > 0) {
+      controller.enqueue(rawBytesRemaining > 0 ? carry : normalizeReactFlightHintLine(carry));
+    }
+  };
+
+  const reader = stream.getReader();
+  // As with a pipe, the source is read and cancelled in the context that
+  // created this stream rather than in the consumer's.
+  const runInCreationContext = AsyncLocalStorage.snapshot();
+  let target!: ReadableStreamDefaultController<Uint8Array>;
+  let enqueued = 0;
+  let reading = false;
+  // Done, errored or cancelled.
+  let settled = false;
+  // As the pipe did, unlock the source once it is done, errored or cancelled.
+  const release = (): void => {
+    try {
+      reader.releaseLock();
+    } catch {
+      // Already released.
+    }
+  };
+  const sink: ChunkSink = {
+    enqueue(chunk) {
+      enqueued++;
+      target.enqueue(chunk);
+    },
+  };
+  const finish = (): void => {
+    settled = true;
+    try {
+      flush(sink);
+      target.close();
+    } catch (error) {
+      target.error(error);
+    }
+    release();
+  };
+  const fail = (error: unknown): void => {
+    settled = true;
+    void runInCreationContext(() => reader.cancel(error))
+      .catch(() => {})
+      .finally(release);
+  };
+  // The source can close or error after its last chunk while the consumer
+  // isn't reading. Pass that on without waiting for another read, as the pipe
+  // did. A read in progress sees it itself.
+  reader.closed.then(
+    () => {
+      if (!reading && !settled) finish();
+    },
+    (error: unknown) => {
+      if (reading || settled) return;
+      fail(error);
+      target.error(error);
+    },
+  );
+  return new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
+        target = controller;
+      },
+      async pull() {
+        enqueued = 0;
+        try {
+          // A chunk may end inside a row that is carried to the next one, so
+          // keep reading until something is forwarded.
+          while (enqueued === 0 && !settled) {
+            reading = true;
+            let result: ReadableStreamReadResult<Uint8Array>;
+            try {
+              result = await runInCreationContext(() => reader.read());
+            } finally {
+              reading = false;
+            }
+            if (settled) return;
+            if (result.done) {
+              finish();
+              return;
+            }
+            transform(result.value, sink);
+          }
+        } catch (error) {
+          if (settled) return;
+          fail(error);
+          throw error;
         }
       },
-      flush(controller) {
-        if (carry !== null && carry.byteLength > 0) {
-          controller.enqueue(rawBytesRemaining > 0 ? carry : normalizeReactFlightHintLine(carry));
-        }
+      // Runs before the cancellation reaches the source stream.
+      cancel(reason) {
+        settled = true;
+        onCancel?.(reason);
+        return runInCreationContext(() => reader.cancel(reason)).finally(release);
       },
-      // Runs before the cancellation reaches the source stream. TypeScript's
-      // DOM types predate this hook, which Node (22+) and workerd support.
-      cancel: onCancel,
-    } as Transformer<Uint8Array, Uint8Array>),
+    },
+    { highWaterMark: 0 },
   );
 }
 
