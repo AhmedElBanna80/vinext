@@ -136,10 +136,10 @@ type MockReactAnchorCaptureOptions = {
 
 // This is a tactical escape hatch for Link only. It intercepts React and JSX
 // runtime output because the current E2E setup cannot honestly reach the
-// production-only Link prefetch path. It mocks useEffect synchronously and
-// captures element creation before reconciliation, so it cannot test commit
-// scheduling, cleanup, re-renders, or conditional effect execution. Do not
-// reuse it as a component harness.
+// production-only Link prefetch path. It mocks useEffect and useLayoutEffect
+// synchronously and captures element creation before reconciliation, so it
+// cannot test commit scheduling, cleanup, re-renders, or conditional effect
+// execution. Do not reuse it as a component harness.
 function mockReactAnchorCaptureForLinkOnly_DO_NOT_REUSE(
   options: MockReactAnchorCaptureOptions,
 ): void {
@@ -163,7 +163,8 @@ function mockReactAnchorCaptureForLinkOnly_DO_NOT_REUSE(
         ...actual,
         createElement,
         useEffect,
-        default: { ...mockDefault, useEffect },
+        useLayoutEffect: useEffect,
+        default: { ...mockDefault, useEffect, useLayoutEffect: useEffect },
       };
     }
 

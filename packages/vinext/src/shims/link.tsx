@@ -13,6 +13,7 @@ import React, {
   useContext,
   createContext,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type AnchorHTMLAttributes,
@@ -73,7 +74,12 @@ import {
 import { getCurrentRoutePathnameForWarning } from "./internal/route-pattern-for-warning.js";
 import { normalizeRouterHref, resolvePagesRouterHref } from "./internal/normalize-router-href.js";
 import { formatUrlObject, formatUrlObjectWithValidation } from "./internal/format-url-object.js";
-import { scheduleAppPrefetchFetch } from "./internal/app-prefetch-fetch-queue.js";
+import {
+  cancelQueuedAppPrefetchFetch,
+  getAppPrefetchFetchClaimSequence,
+  isAppPrefetchFetchClaimed,
+  scheduleAppPrefetchFetch,
+} from "./internal/app-prefetch-fetch-queue.js";
 
 type NavigateEvent = {
   url: URL;
@@ -363,6 +369,9 @@ function getLinkPrefetchRouterMode(): LinkPrefetchRouterMode {
  *
  * `afterInvalidation` marks a re-prefetch that follows a whole-cache
  * invalidation; see `invalidationPrefetch`.
+ *
+ * `owner` is the visible Link behind a viewport prefetch; see
+ * `OwnedLinkPrefetch`.
  */
 function prefetchUrl(
   href: string,
@@ -371,6 +380,7 @@ function prefetchUrl(
   pagesRouteHref?: string,
   locale?: string | false,
   afterInvalidation = false,
+  owner?: LinkPrefetchInstance,
 ): void {
   if (typeof window === "undefined") return;
   const navigationEpoch = linkPrefetchNavigationEpoch;
@@ -565,10 +575,13 @@ function prefetchUrl(
           !autoPrefetch.cacheForNavigation &&
           hasFreshLearningOnlyPrefetchCacheEntry(rscUrl, interceptionContext)
         ) {
+          joinOwnedLinkPrefetch(getPrefetchCache().get(cacheKey)?.fetchPromise, owner);
           return;
         }
+        const owned = createOwnedLinkPrefetch(owner);
         const fetchFullRscPayload = () =>
-          scheduleAppPrefetchFetch(
+          scheduleOwnedLinkPrefetch(
+            owned,
             (signal) =>
               fetch(rscUrl, {
                 headers,
@@ -591,26 +604,33 @@ function prefetchUrl(
           if (mountedSlotsHeader) {
             shellHeaders.set(VINEXT_MOUNTED_SLOTS_HEADER, mountedSlotsHeader);
           }
+          const ownerLeaveCount = owner?.leaveCount;
           const shellRscUrl = await createRscRequestUrl(fullHref, shellHeaders);
+          // The Link left meanwhile, so this prefetch was dropped.
+          if (owner && owner.leaveCount !== ownerLeaveCount) return;
           const shellCacheKey = AppElementsWire.encodeCacheKey(shellRscUrl, interceptionContext);
           const shellCache = getPrefetchCache();
           let shellEntry = shellCache.get(shellCacheKey);
           if (shellEntry === undefined) {
             getPrefetchedUrls().add(shellCacheKey);
+            const shellOwned = createOwnedLinkPrefetch(owner);
+            const shellFetchPromise = scheduleOwnedLinkPrefetch(
+              shellOwned,
+              (signal) =>
+                fetch(shellRscUrl, {
+                  headers: shellHeaders,
+                  credentials: "include",
+                  priority,
+                  signal,
+                  // @ts-expect-error — purpose is a valid fetch option in some browsers
+                  purpose: "prefetch",
+                }),
+              priority,
+            );
+            trackOwnedLinkPrefetch(shellOwned, shellFetchPromise);
             prefetchRscResponse(
               shellRscUrl,
-              scheduleAppPrefetchFetch(
-                (signal) =>
-                  fetch(shellRscUrl, {
-                    headers: shellHeaders,
-                    credentials: "include",
-                    priority,
-                    signal,
-                    // @ts-expect-error — purpose is a valid fetch option in some browsers
-                    purpose: "prefetch",
-                  }),
-                priority,
-              ),
+              shellFetchPromise,
               interceptionContext,
               mountedSlotsHeader,
               undefined,
@@ -621,6 +641,8 @@ function prefetchUrl(
               },
             );
             shellEntry = shellCache.get(shellCacheKey);
+          } else {
+            joinOwnedLinkPrefetch(shellEntry.fetchPromise, owner);
           }
           await shellEntry?.pending?.catch(() => {});
         };
@@ -635,7 +657,12 @@ function prefetchUrl(
           if (mountedSlotsHeader) {
             probeHeaders.set(VINEXT_MOUNTED_SLOTS_HEADER, mountedSlotsHeader);
           }
+          const ownerLeaveCount = owner?.leaveCount;
           const probeRscUrl = await createRscRequestUrl(fullHref, probeHeaders);
+          // The Link left meanwhile. The probe is best effort, so drop it.
+          if (owner && owner.leaveCount !== ownerLeaveCount) {
+            throw new DOMException("Prefetch is no longer wanted", "AbortError");
+          }
           return fetch(probeRscUrl, {
             method: "HEAD",
             headers: probeHeaders,
@@ -645,14 +672,20 @@ function prefetchUrl(
             purpose: "prefetch",
           });
         };
+        // A visible Link that reuses a pending request becomes one of its owners.
+        const onReuse = (entry: { fetchPromise?: Promise<Response> }) =>
+          joinOwnedLinkPrefetch(entry.fetchPromise, owner);
         const hasExactNavigationCacheEntry =
           autoPrefetch.cacheForNavigation &&
-          hasPrefetchCacheEntryForNavigation(rscUrl, interceptionContext, mountedSlotsHeader);
+          hasPrefetchCacheEntryForNavigation(rscUrl, interceptionContext, mountedSlotsHeader, {
+            onReuse,
+          });
         const hasNavigationCacheEntry =
           hasExactNavigationCacheEntry ||
           (autoPrefetch.cacheForNavigation &&
             hasPrefetchCacheEntryForNavigation(rscUrl, interceptionContext, mountedSlotsHeader, {
               additionalRscUrls,
+              onReuse,
             }));
         // A single freshness-aware gate covers both an exact prior prefetch and
         // an equivalent `_rsc` variant; the helper also deletes any stale exact
@@ -700,7 +733,8 @@ function prefetchUrl(
                 return fetchRouteTreeGatedPrefetch({
                   fetchFullRscPayload,
                   fetchRouteTree: (routeTreeRscUrl, routeTreeHeaders) =>
-                    scheduleAppPrefetchFetch(
+                    scheduleOwnedLinkPrefetch(
+                      owned,
                       (signal) =>
                         fetch(routeTreeRscUrl, {
                           headers: routeTreeHeaders,
@@ -719,6 +753,7 @@ function prefetchUrl(
                 });
               })()
             : fetchFullRscPayload();
+        trackOwnedLinkPrefetch(owned, fetchPromise);
         if (
           !__prefetchInlining &&
           mode === "full" &&
@@ -850,6 +885,10 @@ type LinkPrefetchInstance = {
   isVisible: boolean;
   locale?: string | false;
   mode: LinkPrefetchMode;
+  /** Prefetches this Link created or reused while visible. */
+  ownedPrefetches: Set<OwnedLinkPrefetch>;
+  /** How many times this Link has left the viewport or unmounted. */
+  leaveCount: number;
   pagesRouteHref?: string;
   queuedViewportPrefetch: boolean;
   routerMode: LinkPrefetchRouterMode;
@@ -860,6 +899,129 @@ const observedLinkPrefetches = new WeakMap<Element, LinkPrefetchInstance>();
 const visibleLinkPrefetches = new Set<LinkPrefetchInstance>();
 const visibleAppPrefetchQueue: LinkPrefetchInstance[] = [];
 let visibleAppPrefetchDrainScheduled = false;
+
+/**
+ * Next.js cancels a Link's prefetch task when the Link leaves the viewport or
+ * unmounts (`cancelPrefetchTask` in `client/components/links.ts`): requests it
+ * has not started are never sent, while requests already in flight finish.
+ * Otherwise a prefetch queued by the previous page could still reach
+ * middleware after the user navigated away (for example resetting a locale
+ * cookie the destination page just set).
+ *
+ * Vinext queues requests rather than tasks, and Links whose hrefs resolve to
+ * the same request share it. So each viewport prefetch records the visible
+ * Links that created or reused it. When the last of them leaves, the prefetch
+ * is dropped: its queued requests are cancelled and its later stages are never
+ * sent, unless a navigation that claimed it before then is still current. A
+ * Link that comes back prefetches again with the current page's inputs.
+ */
+type OwnedLinkPrefetch = {
+  owners: Set<LinkPrefetchInstance>;
+  /** Every queued request made for this prefetch, one per stage. */
+  requests: Array<Promise<Response>>;
+  /** The cached promise a navigation claims. */
+  claimable?: Promise<Response>;
+  /** The claim sequence when the last owner left; later claims are ignored. */
+  droppedAt?: number;
+};
+
+const ownedLinkPrefetches = new WeakMap<Promise<Response>, OwnedLinkPrefetch>();
+
+function createOwnedLinkPrefetch(
+  owner: LinkPrefetchInstance | undefined,
+): OwnedLinkPrefetch | undefined {
+  if (owner === undefined) return undefined;
+  return { owners: new Set([owner]), requests: [] };
+}
+
+function hasVisibleOwner(owned: OwnedLinkPrefetch): boolean {
+  for (const owner of owned.owners) {
+    if (owner.isVisible) return true;
+  }
+  return false;
+}
+
+function isOwnedLinkPrefetchWanted(owned: OwnedLinkPrefetch): boolean {
+  if (owned.droppedAt !== undefined) {
+    return isAppPrefetchFetchClaimed(owned.claimable, owned.droppedAt);
+  }
+  return isAppPrefetchFetchClaimed(owned.claimable) || hasVisibleOwner(owned);
+}
+
+function scheduleOwnedLinkPrefetch(
+  owned: OwnedLinkPrefetch | undefined,
+  fetcher: (signal: AbortSignal) => Promise<Response>,
+  priority: "low" | "high",
+): Promise<Response> {
+  // A later stage of a dropped prefetch fails right away, which also removes
+  // its cache entry.
+  if (owned && !isOwnedLinkPrefetchWanted(owned)) {
+    return Promise.reject(new DOMException("Prefetch is no longer wanted", "AbortError"));
+  }
+  const request = scheduleAppPrefetchFetch(
+    fetcher,
+    priority,
+    owned && (() => isOwnedLinkPrefetchWanted(owned)),
+  );
+  owned?.requests.push(request);
+  return request;
+}
+
+/**
+ * Registers the promise cached for `owned`, which reusing Links join. Owners
+ * are registered here, not in `createOwnedLinkPrefetch`, since a cache hit
+ * returns before sending anything.
+ */
+function trackOwnedLinkPrefetch(
+  owned: OwnedLinkPrefetch | undefined,
+  fetchPromise: Promise<Response>,
+): void {
+  if (owned === undefined) return;
+  for (const owner of owned.owners) owner.ownedPrefetches.add(owned);
+  owned.claimable = fetchPromise;
+  ownedLinkPrefetches.set(fetchPromise, owned);
+  const settle = (failed: boolean) => {
+    // Only work that can still be cancelled is joined.
+    ownedLinkPrefetches.delete(fetchPromise);
+    for (const owner of owned.owners) {
+      owner.ownedPrefetches.delete(owned);
+      // A Link that came back while the dropped prefetch was still settling
+      // joined it instead of starting a fresh one.
+      if (failed && owned.droppedAt !== undefined && owner.isVisible) {
+        scheduleVisibleAppPrefetch(owner);
+      }
+    }
+    owned.owners.clear();
+  };
+  fetchPromise.then(
+    () => settle(false),
+    () => settle(true),
+  );
+}
+
+function joinOwnedLinkPrefetch(
+  fetchPromise: Promise<Response> | undefined,
+  owner: LinkPrefetchInstance | undefined,
+): void {
+  const owned = fetchPromise && ownedLinkPrefetches.get(fetchPromise);
+  if (!owned || owner === undefined) return;
+  owned.owners.add(owner);
+  owner.ownedPrefetches.add(owned);
+}
+
+/** Called when a Link leaves the viewport or unmounts. */
+function releaseOwnedLinkPrefetches(instance: LinkPrefetchInstance): void {
+  instance.leaveCount += 1;
+  for (const owned of instance.ownedPrefetches) {
+    owned.owners.delete(instance);
+    if (owned.droppedAt !== undefined || hasVisibleOwner(owned)) continue;
+    // Dropped even while claimed, so only claims made before now keep it alive.
+    owned.droppedAt = getAppPrefetchFetchClaimSequence();
+    if (isAppPrefetchFetchClaimed(owned.claimable)) continue;
+    for (const request of owned.requests) cancelQueuedAppPrefetchFetch(request);
+  }
+  instance.ownedPrefetches.clear();
+}
 
 function drainVisibleAppPrefetchQueue(): void {
   visibleAppPrefetchDrainScheduled = false;
@@ -877,6 +1039,7 @@ function drainVisibleAppPrefetchQueue(): void {
       instance.pagesRouteHref,
       undefined,
       afterInvalidation,
+      instance,
     );
   }
 }
@@ -904,6 +1067,7 @@ function setVisibleLinkPrefetch(instance: LinkPrefetchInstance, isVisible: boole
     instance.viewportPrefetched = true;
   } else {
     visibleLinkPrefetches.delete(instance);
+    releaseOwnedLinkPrefetches(instance);
   }
 }
 
@@ -1252,7 +1416,10 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     [forwardedRef],
   );
 
-  useEffect(() => {
+  // A layout effect, so unmounting releases the Link's queued prefetches in the
+  // commit that detaches it (Next.js unmounts from its ref callback), not in a
+  // later passive effect that a free prefetch slot could beat.
+  useLayoutEffect(() => {
     if (!shouldViewportPrefetch || typeof window === "undefined") return;
     const node = internalRef.current;
     if (!node) return;
@@ -1277,6 +1444,8 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
       isVisible: false,
       locale,
       mode: prefetchMode,
+      ownedPrefetches: new Set(),
+      leaveCount: 0,
       pagesRouteHref:
         normalizedRouteHref === normalizedHref
           ? undefined
@@ -1298,6 +1467,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
       observedLinkPrefetches.delete(node);
       visibleLinkPrefetches.delete(instance);
       instance.isVisible = false;
+      releaseOwnedLinkPrefetches(instance);
     };
   }, [
     shouldViewportPrefetch,
