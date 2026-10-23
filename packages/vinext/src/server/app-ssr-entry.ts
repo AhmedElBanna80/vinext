@@ -11,8 +11,13 @@ import {
 } from "react-dom";
 import { Fragment, createElement as createReactElement, use } from "react";
 import { createFromReadableStream } from "@vitejs/plugin-rsc/ssr";
-import type { RenderToReadableStreamOptions } from "react-dom/server";
-import { renderToReadableStream, renderToStaticMarkup } from "react-dom/server.edge";
+// Resolved per environment: React's Node build on Node and the edge build under
+// workerd/edge-light, matching how Next.js loads `react-dom/server`.
+import {
+  renderToReadableStream,
+  renderToStaticMarkup,
+  type RenderToReadableStreamOptions,
+} from "react-dom/server";
 import clientReferences, { routeClientReferences } from "virtual:vite-rsc/client-references";
 import type { NavigationContext } from "vinext/shims/navigation-server";
 import {
@@ -123,17 +128,7 @@ export type FontData = {
   preloads?: FontPreload[];
 };
 
-type StaticPrerender = typeof import("react-dom/static.edge").prerender;
-
-function isReactDevelopmentRuntime(): boolean {
-  if (process.env.NODE_ENV === "production") {
-    return false;
-  }
-  if (process.env.NODE_ENV === "development") {
-    return true;
-  }
-  return Function.prototype.toString.call(createReactElement).includes("getOwner");
-}
+type StaticPrerender = typeof import("react-dom/static").prerender;
 
 function isStaticPrerenderModule(value: unknown): value is { prerender: StaticPrerender } {
   return (
@@ -145,53 +140,13 @@ function isStaticPrerenderModule(value: unknown): value is { prerender: StaticPr
 }
 
 async function loadStaticPrerender(): Promise<StaticPrerender> {
-  // Prefer the stable ESM entry in all environments. Future React dev builds
-  // may export prerender() here, so this is the first path we attempt.
-  const staticRenderer: unknown = await import("react-dom/static.edge");
+  // Every react-dom/static build exports prerender() from React 19.3, the
+  // minimum vinext supports.
+  const staticRenderer: unknown = await import("react-dom/static");
   if (isStaticPrerenderModule(staticRenderer)) {
     return staticRenderer.prerender;
   }
-
-  // Fallback: React development builds historically did not export prerender()
-  // from the ESM entry, so reach into the CJS artifact. The path is fragile
-  // because it depends on React's internal file layout, but it is only used
-  // when the stable ESM entry does not provide prerender().
-  if (isReactDevelopmentRuntime()) {
-    try {
-      const [{ createRequire }, path] = await Promise.all([
-        import("node:module"),
-        // Native node:path is fine here: the resolved path is fed straight into
-        // a dynamic import() and never compared against pathslash-normalized
-        // ids, so forward-slash canonicalization buys nothing.
-        // oxlint-disable-next-line no-restricted-imports
-        import("node:path"),
-      ]);
-      const require = createRequire(import.meta.url);
-      const reactDomPackageJson = require.resolve("react-dom/package.json");
-      const reactDomDir = path.dirname(reactDomPackageJson);
-      const devRendererPath = path.join(reactDomDir, "cjs/react-dom-server.edge.development.js");
-      const devRenderer: unknown = await import(/* @vite-ignore */ devRendererPath);
-      if (isStaticPrerenderModule(devRenderer)) {
-        return devRenderer.prerender;
-      }
-      // Node.js ESM import of a CJS module wraps the exports in `default`.
-      const devRendererDefault =
-        typeof devRenderer === "object" &&
-        devRenderer !== null &&
-        "default" in devRenderer &&
-        devRenderer.default;
-      if (isStaticPrerenderModule(devRendererDefault)) {
-        return devRendererDefault.prerender;
-      }
-      throw new Error("react-dom development renderer did not expose prerender().");
-    } catch (error) {
-      throw new Error("[vinext] Failed to load React static development renderer.", {
-        cause: error,
-      });
-    }
-  }
-
-  throw new Error("[vinext] react-dom/static.edge did not expose prerender().");
+  throw new Error("[vinext] react-dom/static did not expose prerender().");
 }
 
 function createUtf8Stream(html: string): ReadableStream<Uint8Array> {

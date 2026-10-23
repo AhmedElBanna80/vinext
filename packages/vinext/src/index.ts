@@ -4330,6 +4330,15 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                     ? SSR_EXTERNAL_REACT_ENTRIES
                     : [],
                 ),
+                // plugin-rsc pre-includes react-dom/server.edge and static.edge,
+                // but the SSR entry imports the condition-resolved entries so
+                // Node loads React's Node renderer. Where React is optimized
+                // (Nitro dev), pre-include those so they are not discovered on
+                // the first request. Cloudflare resolves them to the .edge
+                // entries (vinext:cloudflare-react-dom-edge).
+                ...(userSsrExternal === true || externalizeSsrReactInDev || hasCloudflarePlugin
+                  ? {}
+                  : { include: ["react-dom/server", "react-dom/static"] }),
                 entries: optimizeEntries,
                 ...depOptimizeNodeEnvOptions,
               },
@@ -5483,6 +5492,28 @@ export const loadServerActionClient = ${
           // consumed, so nulling the map is safe and prevents stale-map
           // confusion in tooling.
           return { code: nextCode, map: null };
+        },
+      },
+    },
+    {
+      // Workers render with React's edge Fizz build. React's exports map picks
+      // it for `react-dom/server` and `react-dom/static` under the `workerd`
+      // condition; resolve the .edge entries directly so the Worker does not
+      // depend on the Cloudflare plugin's condition list. The RSC environment
+      // keeps React's react-server entries, which reject these APIs.
+      name: "vinext:cloudflare-react-dom-edge",
+      enforce: "pre",
+      resolveId: {
+        filter: { id: /^react-dom\/(?:server|static)$/ },
+        handler(id, importer, options) {
+          if (
+            !hasCloudflarePlugin ||
+            this.environment?.config.consumer !== "server" ||
+            this.environment.name === "rsc"
+          ) {
+            return;
+          }
+          return this.resolve(`${id}.edge`, importer, { ...options, skipSelf: true });
         },
       },
     },

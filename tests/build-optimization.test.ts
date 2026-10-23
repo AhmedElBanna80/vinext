@@ -709,7 +709,9 @@ describe("optimizeDeps.exclude for vinext", () => {
   const ssrExternalReactEntries = [
     "react",
     "react-dom",
+    "react-dom/server",
     "react-dom/server.edge",
+    "react-dom/static",
     "react-dom/static.edge",
     "react/jsx-runtime",
     "react/jsx-dev-runtime",
@@ -1052,6 +1054,62 @@ describe("optimizeDeps.exclude for vinext", () => {
       await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
   }, 15000);
+
+  it("resolves React's edge Fizz entries in Cloudflare server environments", async () => {
+    const vinext = (await import("../packages/vinext/src/index.js")).default;
+    const plugins = vinext();
+    const mainPlugin = plugins.find(
+      (p: any) => p.name === "vinext:config" && typeof p.config === "function",
+    );
+    const edgePlugin = plugins.find((p: any) => p.name === "vinext:cloudflare-react-dom-edge");
+    expect(mainPlugin).toBeDefined();
+    expect(edgePlugin).toBeDefined();
+
+    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-cf-react-dom-edge-"));
+    await fsp.mkdir(path.join(tmpDir, "app"), { recursive: true });
+    await fsp.writeFile(
+      path.join(tmpDir, "app", "page.tsx"),
+      `export default function Home() { return <h1>Home</h1>; }`,
+    );
+    await fsp.writeFile(path.join(tmpDir, "next.config.mjs"), `export default {};`);
+
+    try {
+      const resolveIn = async (consumer: "client" | "server", id: string, name = "ssr") => {
+        const resolve = vi.fn(async (target: string) => ({ id: target }));
+        const result = await (edgePlugin as any).resolveId.handler.call(
+          { environment: { name, config: { consumer } }, resolve },
+          id,
+          "/app/entry.ts",
+          {},
+        );
+        return { result, resolve };
+      };
+
+      // Without the Cloudflare plugin, React's exports map picks the build.
+      expect((await resolveIn("server", "react-dom/server")).result).toBeUndefined();
+
+      await (mainPlugin as any).config(
+        { root: tmpDir, build: {}, plugins: [{ name: "vite-plugin-cloudflare" }] },
+        { command: "build" },
+      );
+
+      for (const id of ["react-dom/server", "react-dom/static"]) {
+        const { result, resolve } = await resolveIn("server", id);
+        expect(result).toEqual({ id: `${id}.edge` });
+        expect(resolve).toHaveBeenCalledWith(`${id}.edge`, "/app/entry.ts", { skipSelf: true });
+      }
+      // The Pages Router Worker environment is named after the Worker.
+      expect((await resolveIn("server", "react-dom/server", "my_worker")).result).toEqual({
+        id: "react-dom/server.edge",
+      });
+      // Server Components keep React's react-server entries, and browser code
+      // keeps React's browser build.
+      expect((await resolveIn("server", "react-dom/server", "rsc")).result).toBeUndefined();
+      expect((await resolveIn("client", "react-dom/server")).result).toBeUndefined();
+    } finally {
+      await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
 
   it("uses server package conditions in RSC and SSR environments", async () => {
     const vinext = (await import("../packages/vinext/src/index.js")).default;
