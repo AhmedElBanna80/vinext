@@ -343,6 +343,7 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
     layoutParamAccess?: AppLayoutParamAccessTracker,
     options?: {
       isForceStatic?: boolean;
+      isUncacheableRender?: boolean;
       observeMetadataSearchParamsAccess?: boolean;
       observePageSearchParamsAccess?: boolean;
       serveStreamingMetadata?: boolean;
@@ -930,6 +931,15 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     isStaticEligible &&
     options.pprFallbackShell === undefined &&
     !isNeverStoredPath;
+  // A render that can never be stored and, in production, is never sent with
+  // static cache headers. Only it may skip layouts that would otherwise decide
+  // whether the response is cacheable. With Cache Components, Next.js renders
+  // layouts for every production prefetch (isRoutePPREnabled), so only dev
+  // skips them.
+  const isUncacheableRender =
+    !(isCacheEligibleRender && isStaticEligible) &&
+    options.pprFallbackShell === undefined &&
+    (options.pprRuntime === undefined || !options.isProduction);
   if (shouldReadCache && isStaticEligible) {
     traceOperation = resolveAppPageTraceOperation({
       hasRequestSearchParams,
@@ -1340,6 +1350,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
           isForceStatic: sourceDynamicConfig === "force-static",
           observeMetadataSearchParamsAccess: sourceDynamicConfig !== "force-static",
           observePageSearchParamsAccess: sourceDynamicConfig !== "force-static",
+          isUncacheableRender,
           serveStreamingMetadata: placeGeneratedMetadataInBody,
           placeStreamedMetadataInHead: options.renderWholeDocument === true,
           onHeadPrepared,
@@ -1430,6 +1441,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
             isForceStatic,
             observeMetadataSearchParamsAccess: !isForceStatic,
             observePageSearchParamsAccess: !isForceStatic,
+            isUncacheableRender,
             serveStreamingMetadata: placeGeneratedMetadataInBody,
             placeStreamedMetadataInHead: options.renderWholeDocument === true,
             onHeadPrepared,
