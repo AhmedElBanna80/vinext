@@ -1281,6 +1281,95 @@ describe("next/navigation shim", () => {
     }
   });
 
+  it("hands every browser module instance the same hydrated search params object", async () => {
+    // Every instance must hydrate with the same object: the browser adopts it
+    // once the URL's query matches, so a per-instance wrapper would hand some
+    // callers a new object after hydration.
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const previousWindow = globalThis.window;
+    const accessorsKey = Symbol.for("vinext.navigation.globalAccessors");
+    const hydrationKey = Symbol.for("vinext.navigation.clientHydrationContext");
+    const globalRecord = globalThis as Record<PropertyKey, unknown>;
+    const previousAccessors = globalRecord[accessorsKey];
+    const previousHydration = globalRecord[hydrationKey];
+
+    let firstMod: typeof import("../packages/vinext/src/shims/navigation.js") | undefined;
+
+    try {
+      delete globalRecord[accessorsKey];
+      delete globalRecord[hydrationKey];
+      (globalThis as any).window = {
+        addEventListener() {},
+        dispatchEvent() {
+          return true;
+        },
+        history: {
+          pushState() {},
+          replaceState() {},
+        },
+        location: {
+          href: "http://localhost/shared-search?q=hello",
+          origin: "http://localhost",
+          pathname: "/shared-search",
+          search: "?q=hello",
+        },
+        removeEventListener() {},
+      };
+
+      const firstPath = "../packages/vinext/src/shims/navigation.js?hydration-search-params=first";
+      const secondPath =
+        "../packages/vinext/src/shims/navigation.js?hydration-search-params=second";
+      firstMod = (await import(
+        firstPath
+      )) as typeof import("../packages/vinext/src/shims/navigation.js");
+      const secondMod = (await import(
+        secondPath
+      )) as typeof import("../packages/vinext/src/shims/navigation.js");
+
+      firstMod.setNavigationContext({
+        pathname: "/shared-search",
+        searchParams: new URLSearchParams("q=hello"),
+        params: {},
+      });
+
+      const seen: unknown[] = [];
+      function Probe({ mod }: { mod: typeof secondMod }) {
+        seen.push(mod.useSearchParams());
+        return null;
+      }
+      renderToStaticMarkup(
+        React.createElement(
+          React.Fragment,
+          null,
+          React.createElement(Probe, { mod: firstMod }),
+          React.createElement(Probe, { mod: secondMod }),
+        ),
+      );
+
+      expect(seen).toHaveLength(2);
+      expect((seen[0] as URLSearchParams).get("q")).toBe("hello");
+      expect(seen[0]).toBe(seen[1]);
+    } finally {
+      firstMod?.setNavigationContext(null);
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      if (previousAccessors === undefined) {
+        delete globalRecord[accessorsKey];
+      } else {
+        globalRecord[accessorsKey] = previousAccessors;
+      }
+      if (previousHydration === undefined) {
+        delete globalRecord[hydrationKey];
+      } else {
+        globalRecord[hydrationKey] = previousHydration;
+      }
+    }
+  });
+
   it("keeps explicit app navigation context ahead of globally installed Pages compat state", async () => {
     const React = await import("react");
     const { renderToStaticMarkup } = await import("react-dom/server");
