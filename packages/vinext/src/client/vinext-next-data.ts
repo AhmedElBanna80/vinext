@@ -22,9 +22,24 @@ export type VinextLinkPrefetchRoute = {
    * (Next.js prefetches its static shell instead).
    */
   rendersDynamically?: true;
+  /**
+   * Intercepting pages that can render a URL of this route under a matching
+   * interception context. Next.js builds each as its own route, so its
+   * `rendersDynamically` replaces the route's own then. Set only alongside
+   * `rendersDynamically` classification.
+   */
+  intercepts?: VinextLinkPrefetchIntercept[];
   requiresDynamicNavigationRequest?: boolean;
   /** The route has dynamic params above its root layout. */
   hasRootParams?: true;
+};
+
+export type VinextLinkPrefetchIntercept = {
+  /** The URL pattern of the route the interception context must be on, or below. */
+  sourcePatternParts: string[];
+  /** The URL pattern the intercepting page intercepts. */
+  targetPatternParts: string[];
+  rendersDynamically?: true;
 };
 
 /**
