@@ -13,7 +13,13 @@ import type {
   UserConfig,
   ViteDevServer,
 } from "vite";
-import { createIdResolver, createLogger, isRunnableDevEnvironment, transformWithOxc } from "vite";
+import {
+  createIdResolver,
+  createLogger,
+  esmExternalRequirePlugin,
+  isRunnableDevEnvironment,
+  transformWithOxc,
+} from "vite";
 import {
   hasImportAttributes,
   isTypeOnlyImport,
@@ -476,6 +482,19 @@ const APP_CLIENT_OPTIONAL_OPTIMIZE_DEPS_INCLUDE = Object.freeze([
   "use-sync-external-store/shim/with-selector.js",
   "use-sync-external-store/with-selector",
   "use-sync-external-store/with-selector.js",
+]);
+
+// The third-party imports of vinext's client shims. App Router apps keep the
+// shims out of the optimizer (see shimOptimizeDepsExclude), so the dependency
+// scan never crawls them. An installed vinext serves them raw from node_modules, and Vite does not
+// pre-bundle the bare imports of files inside node_modules: ipaddr.js is
+// CommonJS-only and would reach the browser without its default export. A
+// linked vinext lives outside node_modules, so Vite would discover these on
+// the first request that renders next/image or next/web-vitals and reload.
+const CLIENT_OPTIONAL_OPTIMIZE_DEPS_INCLUDE = Object.freeze([
+  "vinext > @unpic/react",
+  "vinext > ipaddr.js",
+  "vinext > web-vitals",
 ]);
 
 const ANSI_ESCAPE_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
@@ -1994,6 +2013,15 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
 
   // Shim alias map — populated in config(), used by resolveId() for .js variants
   let nextShimMap: Record<string, string> = {};
+  // VINEXT_OPTIMIZE_DEPS_EXCLUDE plus every bare specifier vinext resolves to
+  // its own modules — populated in config() alongside nextShimMap.
+  let shimOptimizeDepsExclude: readonly string[] = VINEXT_OPTIMIZE_DEPS_EXCLUDE;
+  // Server optimizers pre-bundle for platform "node" (or "neutral" on
+  // Cloudflare), where Vite keeps require() calls to excluded ids instead of
+  // turning them into imports as it does for the browser. A CommonJS library's
+  // require("next/headers") would then load real Next or fail in the Worker.
+  const createShimRequirePlugin = () =>
+    esmExternalRequirePlugin({ external: [...shimOptimizeDepsExclude] });
 
   /**
    * Generate the virtual SSR server entry module.
@@ -3254,8 +3282,8 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         // Build the shim alias map. Exact `.js` variants are included for the
         // public Next entrypoints that are file-backed in `next/package.json`.
         // Some libraries (for example `nuqs`) import `next/navigation.js`
-        // directly; aliasing the `.js` form ensures optimizeDeps pre-bundles
-        // vinext's shim instead of real Next.
+        // directly; aliasing the `.js` form ensures it reaches vinext's shim
+        // instead of real Next.
         nextShimMap = Object.fromEntries(
           Object.entries({
             ...Object.fromEntries(
@@ -3355,6 +3383,18 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 ]
               : [[k, v]],
           ),
+        );
+
+        // An installed vinext lives in node_modules, so the dep optimizer would
+        // pre-bundle these specifiers (an app's `next/link`, or a library's
+        // `next/navigation.js`) into a copy of the shim and its module state:
+        // router state, prefetch caches and instrumentation hooks. Excluding
+        // them keeps one instance, the one vinext's runtime imports. Excluded
+        // imports inside pre-bundled libraries stay bare and reach the shim.
+        shimOptimizeDepsExclude = mergeOptimizeDepsExclude(
+          VINEXT_OPTIMIZE_DEPS_EXCLUDE,
+          Object.keys(nextShimMap),
+          [..._reactServerShims.keys()],
         );
 
         // Detect if Cloudflare's vite plugin is present — if so, skip
@@ -4063,15 +4103,24 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         // environments, where Vite's keepProcessEnv default prevents replacement.
         viteConfig.optimizeDeps = {
           // @tailwindcss/oxide contains native .node bindings that Rolldown cannot process
-          exclude: mergeOptimizeDepsExclude(incomingExclude, VINEXT_OPTIMIZE_DEPS_EXCLUDE, [
-            "@tailwindcss/oxide",
-          ]),
+          exclude: mergeOptimizeDepsExclude(
+            incomingExclude,
+            // The Pages Router client entry imports next/router, so the
+            // optimizer pre-bundles its runtime and the app's next/* shims
+            // together, sharing one copy of their module state in fewer
+            // requests. The App Router runtime loads raw, so its shims must too.
+            hasAppDir ? shimOptimizeDepsExclude : VINEXT_OPTIMIZE_DEPS_EXCLUDE,
+            ["@tailwindcss/oxide"],
+          ),
           ...(incomingInclude.length > 0 ? { include: incomingInclude } : {}),
           ...depOptimizeNodeEnvOptions,
           rolldownOptions: {
             ...depOptimizeNodeEnvOptions.rolldownOptions,
             // vite-plugin-commonjs's pre-bundle plugin runs in this optimizer.
-            plugins: [depOptimizeAliasPlugin, commonJsEsmFacadeOptimizeDepsPlugin],
+            // The alias plugin would inline excluded shims into App Router deps.
+            plugins: hasAppDir
+              ? [commonJsEsmFacadeOptimizeDepsPlugin]
+              : [depOptimizeAliasPlugin, commonJsEsmFacadeOptimizeDepsPlugin],
           },
         };
         pagesOptimizeEntries = !hasAppDir
@@ -4195,11 +4244,6 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   additionalClientOptimizeIncludes.push(include);
                 } catch {}
               }
-              // The private Link reference also imports next/link on hydration.
-              // Discover it before the browser starts to avoid reloading React.
-              if (!excluded.includes("next") && !excluded.includes("next/link")) {
-                additionalClientOptimizeIncludes.push("next/link");
-              }
             } catch {}
           }
           const appClientInput: Record<string, string> = { index: VIRTUAL_APP_BROWSER_ENTRY };
@@ -4255,7 +4299,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                     },
                   }),
               optimizeDeps: {
-                exclude: mergeOptimizeDepsExclude(incomingExclude, VINEXT_OPTIMIZE_DEPS_EXCLUDE),
+                exclude: mergeOptimizeDepsExclude(incomingExclude, shimOptimizeDepsExclude),
                 entries: optimizeEntries,
                 // plugin-rsc pre-includes server.edge and static.edge for the
                 // Flight runtime it selects: its vendored copy, or an app-installed
@@ -4329,7 +4373,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 // while the renderer and client modules use the native one.
                 exclude: mergeOptimizeDepsExclude(
                   incomingExclude,
-                  VINEXT_OPTIMIZE_DEPS_EXCLUDE,
+                  shimOptimizeDepsExclude,
                   ["ipaddr.js"],
                   userSsrExternal === true || externalizeSsrReactInDev
                     ? SSR_EXTERNAL_REACT_ENTRIES
@@ -4373,7 +4417,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 // causing MISSING_EXPORT build failures).
                 exclude: mergeOptimizeDepsExclude(
                   incomingExclude,
-                  VINEXT_OPTIMIZE_DEPS_EXCLUDE,
+                  shimOptimizeDepsExclude,
                   nextServerExternal,
                 ),
                 // Crawl app/ source files up front so client-only deps imported
@@ -4491,12 +4535,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 // Excluding it from the SSR dep optimizer avoids the "new
                 // dependencies optimized" full reload the first time a Pages
                 // Router page renders an <Image>.
-                exclude: mergeOptimizeDepsExclude(
-                  incomingExclude,
-                  VINEXT_OPTIMIZE_DEPS_EXCLUDE,
-                  ["ipaddr.js"],
-                  Object.keys(nextShimMap),
-                ),
+                exclude: mergeOptimizeDepsExclude(incomingExclude, shimOptimizeDepsExclude, [
+                  "ipaddr.js",
+                ]),
                 ...depOptimizeNodeEnvOptions,
               },
               build: {
@@ -4542,7 +4583,17 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           config.build.copyPublicDir = false;
         }
 
-        if (name !== "client" && config.consumer !== "client") {
+        const isClientConsumer = name === "client" || config.consumer === "client";
+        if (isClientConsumer && hasAppDir) {
+          // Covers client environments vinext does not create.
+          config.optimizeDeps ??= {};
+          config.optimizeDeps.exclude = mergeOptimizeDepsExclude(
+            config.optimizeDeps.exclude ?? [],
+            shimOptimizeDepsExclude,
+          );
+        }
+
+        if (!isClientConsumer) {
           // optimizeDeps runs its own Rolldown pipeline, outside Vite's plugin
           // container. Register only the thin adapter for the same module-
           // identity capability; parsing, dependency classification, marker
@@ -4557,7 +4608,14 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 ? [configuredPlugins]
                 : []),
             importMetaUrlCapability.optimizeDepsPlugin,
+            createShimRequirePlugin(),
           ];
+          // Covers server environments vinext does not create, such as other
+          // plugins' Worker environments.
+          config.optimizeDeps.exclude = mergeOptimizeDepsExclude(
+            config.optimizeDeps.exclude ?? [],
+            shimOptimizeDepsExclude,
+          );
         }
 
         if (
@@ -4583,7 +4641,6 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           );
           config.optimizeDeps.exclude = mergeOptimizeDepsExclude(
             config.optimizeDeps.exclude ?? [],
-            VINEXT_OPTIMIZE_DEPS_EXCLUDE,
             PAGES_CLOUDFLARE_WORKER_OPTIMIZE_DEPS_EXCLUDE,
           );
         }
@@ -4621,18 +4678,50 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             if (!config.server.middlewareMode) applyDevServerDefaults(config.server, {});
           }
         }
-        if (isServeCommand && (hasAppDir || (hasCloudflarePlugin && hasPagesDir))) {
+        if (isServeCommand) {
           // Wait for all config/configEnvironment hooks before adding optional
           // defaults, so other plugins' explicit includes and opt-outs win.
           // Optimizers are created afterward, so these are still startup includes.
           const optionalWarnings = new Set<string>();
+          const isExcludedShim = (depId: string) =>
+            shimOptimizeDepsExclude.some((excluded) => {
+              if (depId === excluded || depId.startsWith(`${excluded}/`)) return true;
+              // Vite expands a glob include such as next/* after this hook, from
+              // the installed package's files. path.matchesGlob needs Node
+              // 22.5, so older versions drop any glob over a shim package.
+              if (!/[*?[\]{}()!]/.test(depId)) return false;
+              const pkgName = depId
+                .split("/")
+                .slice(0, depId.startsWith("@") ? 2 : 1)
+                .join("/");
+              if (excluded !== pkgName && !excluded.startsWith(`${pkgName}/`)) return false;
+              return typeof path.matchesGlob !== "function" || path.matchesGlob(excluded, depId);
+            });
           for (const [name, environment] of Object.entries(config.environments)) {
             const optimizer = environment.optimizeDeps;
-            const optionalIncludes = hasAppDir
-              ? name === "client" && !optimizer.noDiscovery
-                ? APP_CLIENT_OPTIONAL_OPTIMIZE_DEPS_INCLUDE
+            const isClient = (environment.consumer ?? name) === "client";
+            // Vite disables a noDiscovery optimizer without includes.
+            const optimizerActive = !optimizer.noDiscovery || !!optimizer.include?.length;
+            // Vite pre-bundles an included specifier even when it is also
+            // excluded, so an app's or plugin's include of a shim specifier
+            // would bring back the duplicate shim module state.
+            if (optimizer.include && (!isClient || hasAppDir)) {
+              optimizer.include = optimizer.include.filter(
+                (id) => !isExcludedShim(id.slice(id.lastIndexOf(">") + 1).trim()),
+              );
+            }
+            // The excluded shims' own dependencies are required whenever the
+            // client optimizer runs, since a filtered next/image include no
+            // longer brings ipaddr.js with it. noDiscovery only opts out of the
+            // App Router defaults.
+            const optionalIncludes = isClient
+              ? hasAppDir && optimizerActive
+                ? [
+                    ...(optimizer.noDiscovery ? [] : APP_CLIENT_OPTIONAL_OPTIMIZE_DEPS_INCLUDE),
+                    ...CLIENT_OPTIONAL_OPTIMIZE_DEPS_INCLUDE,
+                  ]
                 : []
-              : name !== "client"
+              : !hasAppDir && hasCloudflarePlugin && hasPagesDir
                 ? PAGES_CLOUDFLARE_WORKER_OPTIONAL_OPTIMIZE_DEPS_INCLUDE
                 : [];
             for (const id of optionalIncludes) {
@@ -4925,7 +5014,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
 
           // The RSC next/image entry references Image as vinext/shims/image.
           // Elsewhere that is next/image, so the browser and SSR load one image
-          // module, the dep optimizer's when it has pre-bundled next/image.
+          // module.
           if (cleanId === "vinext/shims/image" && this.environment?.name !== "rsc") {
             return this.resolve("next/image", importer, { skipSelf: true });
           }
