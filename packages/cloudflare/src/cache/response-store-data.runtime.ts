@@ -345,7 +345,10 @@ function cachePolicy(revalidate: number | false | undefined, expire: number | un
 export class WorkersResponseStoreCacheHandler implements CacheHandler {
   private readonly tagExpirations = cacheForRequest(() => new Map<string, Promise<number>>());
   /** The revision behind each entry returned stale by the Store, for the write refreshing it. */
-  private readonly staleRevisions = new WeakMap<CacheHandlerValue, number>();
+  private readonly staleRevisions = new WeakMap<
+    CacheHandlerValue,
+    { revision: number; tagExpiration?: { tags: string[]; expiration: number } }
+  >();
 
   constructor(private readonly store: WorkersResponseStore = responseStore!) {
     if (!store) {
@@ -403,12 +406,14 @@ export class WorkersResponseStoreCacheHandler implements CacheHandler {
         return null;
       }
 
+      let tagExpiration: { tags: string[]; expiration: number } | undefined;
       if (softTags.length) {
         const expiration = eagerExpiration
           ? await eagerExpiration
           : { value: await getTagExpiration() };
         if ("error" in expiration) throw expiration.error;
         if (expiration.value >= entry.lastModified) return null;
+        tagExpiration = { tags: softTags, expiration: expiration.value };
       }
 
       const age = Date.now() - entry.lastModified;
@@ -461,7 +466,9 @@ export class WorkersResponseStoreCacheHandler implements CacheHandler {
         Number.isSafeInteger(revision) &&
         revision > 0
       ) {
-        this.staleRevisions.set(value, revision);
+        // The Store can't see soft tags (e.g. revalidatePath()) expire, so the refresh carries
+        // them with the expiration this read saw.
+        this.staleRevisions.set(value, { revision, ...(tagExpiration ? { tagExpiration } : {}) });
       }
       return value;
     } catch (error) {
@@ -568,7 +575,7 @@ export class WorkersResponseStoreCacheHandler implements CacheHandler {
     // `staleEntry`. Once one has replaced that revision, the Store drops the rest instead of
     // replacing it again and spending an edge purge on each.
     const staleEntry = context?.staleEntry;
-    const replacesRevision =
+    const replaces =
       staleEntry && typeof staleEntry === "object"
         ? this.staleRevisions.get(staleEntry as CacheHandlerValue)
         : undefined;
@@ -583,7 +590,12 @@ export class WorkersResponseStoreCacheHandler implements CacheHandler {
         : {}),
       coalesce: true,
       purgeExisting: true,
-      ...(replacesRevision === undefined ? {} : { replacesRevision }),
+      ...(replaces
+        ? {
+            replacesRevision: replaces.revision,
+            ...(replaces.tagExpiration ? { replacesTagExpiration: replaces.tagExpiration } : {}),
+          }
+        : {}),
     });
   }
 
