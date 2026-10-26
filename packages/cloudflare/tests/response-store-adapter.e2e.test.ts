@@ -446,6 +446,7 @@ describe("Cloudflare Workers Response Store adapter", () => {
     const rscInit = { headers: { Accept: "text/x-component", RSC: "1" } };
     const firstRsc = await request(`${pathname}?q=${firstQuery}&_rsc`, rscInit);
     const firstRscBody = await firstRsc.text();
+    await waitForResponseEntries(pathname, 2);
     const secondRsc = await request(`${pathname}?q=${secondQuery}&_rsc`, rscInit);
     assert.equal(firstRsc.headers.get("x-vinext-cache"), "MISS");
     assert.equal(secondRsc.headers.get("x-vinext-cache"), "HIT");
@@ -953,10 +954,73 @@ describe("Cloudflare Workers Response Store adapter", () => {
     const init = { headers: { Accept: "text/x-component", RSC: "1" } };
     const firstRsc = await request("/cached/rsc.rsc?_rsc=", init);
     const firstBody = await firstRsc.text();
+    await waitForResponseEntries("/cached/rsc", 1);
     const secondRsc = await request("/cached/rsc.rsc?_rsc=", init);
     assert.equal(firstRsc.headers.get("x-vinext-cache"), "MISS");
     assert.equal(secondRsc.headers.get("x-vinext-cache"), "HIT");
     assert.equal(await secondRsc.text(), firstBody);
+    // A `.rsc` path reaches its page's HTML path only through the app's
+    // trailingSlash policy, so it stores its payload alone.
+    const document = await request("/cached/rsc");
+    assert.equal(document.headers.get("x-vinext-cache"), "MISS");
+    await document.arrayBuffer();
+  });
+
+  test("stores the page's document when an RSC request misses its entry", async () => {
+    const rsc = await request("/cached/preload-rsc-first?_rsc", {
+      headers: { Accept: "text/x-component", RSC: "1" },
+    });
+    assert.equal(rsc.headers.get("x-vinext-cache"), "MISS");
+    const payload = await rsc.text();
+    await waitForResponseEntries("/cached/preload-rsc-first", 2);
+
+    const document = await request("/cached/preload-rsc-first");
+    assert.equal(document.status, 200);
+    assert.equal(document.headers.get("x-vinext-cache"), "HIT");
+    assert.match(document.headers.get("content-type") ?? "", /^text\/html/);
+    const documentHtml = await document.text();
+    assert.match(documentHtml, /<title>Cached page: preload-rsc-first<\/title>/);
+    // The RSC render rendered the document: both parts carry its render id.
+    const renderId = documentHtml.match(/data-render-id="([^"]+)"/)?.[1];
+    assert.ok(renderId);
+    assert.ok(payload.includes(`"data-render-id":"${renderId}"`));
+
+    // An HTML request stores the same headers for its document.
+    const html = await request("/cached/preload-html-first");
+    assert.equal(html.headers.get("x-vinext-cache"), "MISS");
+    await html.arrayBuffer();
+    await waitForResponseEntries("/cached/preload-html-first", 1);
+    const storedHeaders = async (pathname: string) => {
+      const headers = (await responseEntries(pathname))
+        .map((entry) => new Headers(entry.responseHeaders as [string, string][]))
+        .find((headers) => headers.get("content-type")?.startsWith("text/html"));
+      assert.ok(headers, `missing the stored document of ${pathname}`);
+      return Object.fromEntries(headers);
+    };
+    // Including the renderer's Link.
+    const htmlHeaders = await storedHeaders("/cached/preload-html-first");
+    assert.match(htmlHeaders.link ?? "", /preload-probe\.woff2/);
+    assert.deepEqual(await storedHeaders("/cached/preload-rsc-first"), htmlHeaders);
+  });
+
+  test("stores the document when a rewritten or HEAD RSC request misses its entry", async () => {
+    const rscHeaders = { Accept: "text/x-component", RSC: "1" };
+    const rewritten = await request("/rewritten/rewritten-rsc?_rsc", { headers: rscHeaders });
+    assert.equal(rewritten.headers.get("x-vinext-cache"), "MISS");
+    await rewritten.arrayBuffer();
+    await waitForResponseEntries("/rewritten/rewritten-rsc", 2);
+    const rewrittenDocument = await request("/rewritten/rewritten-rsc");
+    assert.equal(rewrittenDocument.headers.get("x-vinext-cache"), "HIT");
+    assert.match(await rewrittenDocument.text(), /<title>Cached page: rewritten-rsc<\/title>/);
+
+    // A shared HEAD stores the GET entry, so it stores the document too.
+    const head = await request("/cached/head-rsc?_rsc", { headers: rscHeaders, method: "HEAD" });
+    assert.equal(head.headers.get("x-vinext-cache"), "MISS");
+    await head.arrayBuffer();
+    await waitForResponseEntries("/cached/head-rsc", 2);
+    const headDocument = await request("/cached/head-rsc");
+    assert.equal(headDocument.headers.get("x-vinext-cache"), "HIT");
+    assert.match(await headDocument.text(), /<title>Cached page: head-rsc<\/title>/);
   });
 
   test("seeds canonical RSC from one HTML warmup request", async () => {
