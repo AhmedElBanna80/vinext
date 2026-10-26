@@ -311,8 +311,6 @@ export type ProjectInfo = {
   hasMDX: boolean;
   /** CodeHike is a dependency */
   hasCodeHike: boolean;
-  /** Native Node modules that need stubbing for Workers */
-  nativeModulesToStub: string[];
 };
 
 /** Check whether a wrangler config file exists in the given directory. */
@@ -403,7 +401,6 @@ export function detectProject(root: string): ProjectInfo {
     ...(pkg?.devDependencies as Record<string, unknown> | undefined),
   };
   const hasCodeHike = "codehike" in allDeps;
-  const nativeModulesToStub = detectNativeModules(allDeps);
 
   return {
     root,
@@ -420,7 +417,6 @@ export function detectProject(root: string): ProjectInfo {
     hasTypeModule,
     hasMDX,
     hasCodeHike,
-    nativeModulesToStub,
   };
 }
 
@@ -535,18 +531,6 @@ function detectCacheComponents(root: string): boolean {
     }
   }
   return false;
-}
-
-const NATIVE_MODULES_TO_STUB = [
-  "@resvg/resvg-js",
-  "satori",
-  "lightningcss",
-  "@napi-rs/canvas",
-  "sharp",
-];
-
-function detectNativeModules(allDeps: Record<string, unknown>): string[] {
-  return NATIVE_MODULES_TO_STUB.filter((mod) => mod in allDeps);
 }
 
 type MissingDep = {
