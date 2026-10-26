@@ -91,6 +91,7 @@ import {
 import { shouldServeStreamingMetadata } from "./streaming-metadata.js";
 import { createAppPageRscErrorTracker, type AppPageSsrHandler } from "./app-page-stream.js";
 import {
+  NEXT_ROUTER_PREFETCH_HEADER,
   VINEXT_INTERCEPTION_ID_HEADER,
   VINEXT_MOUNTED_LAYOUTS_HEADER,
   VINEXT_PRERENDER_SPECULATIVE_HEADER,
@@ -928,7 +929,14 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
         isForceStatic,
         revalidateSeconds: currentRevalidateSeconds,
       }),
-      renderFreshPageForCache: async () => {
+      // As in Next.js, a path generated at build time answers its RSC requests
+      // from the cache, and its regeneration renders the document.
+      isDynamicRscRequest:
+        options.pprRuntime !== undefined &&
+        options.isRscRequest &&
+        options.request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) !== "1" &&
+        options.renderedConcreteUrlPaths?.has(options.cleanPathname) !== true,
+      renderFreshPageForCache: async ({ renderDocument }) => {
         const revalidationTarget = await resolveCacheRenderTarget();
 
         const revalidationDynamicConfig =
@@ -1031,15 +1039,15 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
                 return baseRevalidatedOnSsrError(error, undefined, undefined);
               },
               reactMaxHeadersLength: options.reactMaxHeadersLength,
-              // An RSC request regenerates only its RSC entry, so its shell's
-              // special error needs no document.
-              resolveCaughtNotFoundBoundaries: options.isRscRequest
-                ? undefined
-                : (error) =>
+              // A regeneration of an RSC variant's entry alone needs no
+              // document for its shell's special error.
+              resolveCaughtNotFoundBoundaries: renderDocument
+                ? (error) =>
                     resolveAppPageCaughtNotFoundBoundaries(
                       error,
                       rscErrorTracker.getCapturedSpecialErrors(error),
-                    ),
+                    )
+                : undefined,
               async renderShellSpecialError(error, caughtDocument) {
                 const specialError = resolveAppPageShellSpecialError(
                   error,
@@ -1049,22 +1057,11 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
                 // when the triggering request blocks on metadata, as an
                 // html-limited bot does, and is then stored like the page's.
                 if (!specialError) return null;
-                // An RSC request regenerates only its RSC entry, so needs no
-                // document. generateMetadata()'s would leave its status beside
-                // a document that the request's user agent didn't decide, so
-                // the previous entry is kept.
-                if (options.isRscRequest) {
-                  if (specialError.fromMetadata === true) return null;
-                  return {
-                    headers: resolveAppPageSpecialErrorStoredHeaders(
-                      specialError,
-                      options.basePath,
-                    ),
-                    html: "",
-                    status: specialError.statusCode,
-                  };
-                }
-                if (caughtDocument) {
+                // An RSC request's generateMetadata() special error would leave
+                // its status beside a document that the request's user agent
+                // didn't decide, so the previous entry is kept.
+                if (options.isRscRequest && specialError.fromMetadata === true) return null;
+                if (renderDocument && caughtDocument) {
                   return {
                     headers: resolveAppPageSpecialErrorStoredHeaders(
                       specialError,
@@ -1072,6 +1069,20 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
                     ),
                     html: caughtDocument.html,
                     linkHeader: caughtDocument.linkHeader,
+                    status: specialError.statusCode,
+                  };
+                }
+                // A regeneration of an RSC variant's entry alone needs no
+                // document. The special error's own document renders as the
+                // triggering request does, so an RSC request stores its RSC
+                // entry alone and leaves the document to an HTML request.
+                if (!renderDocument || options.isRscRequest) {
+                  return {
+                    headers: resolveAppPageSpecialErrorStoredHeaders(
+                      specialError,
+                      options.basePath,
+                    ),
+                    html: "",
                     status: specialError.statusCode,
                   };
                 }
