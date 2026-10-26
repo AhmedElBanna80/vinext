@@ -344,6 +344,8 @@ function cachePolicy(revalidate: number | false | undefined, expire: number | un
 
 export class WorkersResponseStoreCacheHandler implements CacheHandler {
   private readonly tagExpirations = cacheForRequest(() => new Map<string, Promise<number>>());
+  /** The revision behind each entry returned stale by the Store, for the write refreshing it. */
+  private readonly staleRevisions = new WeakMap<CacheHandlerValue, number>();
 
   constructor(private readonly store: WorkersResponseStore = responseStore!) {
     if (!store) {
@@ -444,12 +446,24 @@ export class WorkersResponseStoreCacheHandler implements CacheHandler {
       ) {
         cacheState = "stale";
       }
-      return {
+      const value: CacheHandlerValue = {
         lastModified: entry.lastModified,
         value: entry.value,
         ...(cacheState ? { cacheState } : {}),
         ...(entry.cacheControl ? { cacheControl: entry.cacheControl } : {}),
       };
+      // Only an entry the Store itself reports stale is refreshed as that revision. A copy
+      // stale only to its caller may be an edge copy, whose replacement must still purge it.
+      const revision = Number(response.headers.get("X-Workers-Response-Store-Revision"));
+      if (
+        cacheState &&
+        storeStatus === "BLOB-STALE" &&
+        Number.isSafeInteger(revision) &&
+        revision > 0
+      ) {
+        this.staleRevisions.set(value, revision);
+      }
+      return value;
     } catch (error) {
       console.error(
         JSON.stringify({
@@ -550,6 +564,14 @@ export class WorkersResponseStoreCacheHandler implements CacheHandler {
     }
     if (regeneration && !revalidator) return;
 
+    // Concurrent requests that read the entry stale each refresh it, passing it as
+    // `staleEntry`. Once one has replaced that revision, the Store drops the rest instead of
+    // replacing it again and spending an edge purge on each.
+    const staleEntry = context?.staleEntry;
+    const replacesRevision =
+      staleEntry && typeof staleEntry === "object"
+        ? this.staleRevisions.get(staleEntry as CacheHandlerValue)
+        : undefined;
     await this.store.put(await cacheRequest(key), response, {
       ...(revalidator ? { revalidator } : {}),
       // A read that finds a page-replay entry expired must not wait for the replay: a page
@@ -561,6 +583,7 @@ export class WorkersResponseStoreCacheHandler implements CacheHandler {
         : {}),
       coalesce: true,
       purgeExisting: true,
+      ...(replacesRevision === undefined ? {} : { replacesRevision }),
     });
   }
 

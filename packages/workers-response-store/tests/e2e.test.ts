@@ -37,6 +37,7 @@ type PutOptions = {
   lastModified?: string;
   noRevalidator?: boolean;
   purgeExisting?: boolean;
+  replacesRevision?: string | null;
   revalidator?: Record<string, SerializableValue>;
   status?: number;
   shards?: number;
@@ -69,6 +70,7 @@ beforeEach(async () => {
               let exposeInvalidate = false;
               let edgeCalls = [];
               let failR2Write = false;
+              let delayFirstPurgeMs = 0;
               export class ResponseStoreBinding extends BaseBinding {
                 constructor(ctx, env) {
                   super(ctx, {
@@ -87,6 +89,11 @@ beforeEach(async () => {
                   if (purgeMode) {
                     const edgeOperation = (operation) => (options) => {
                       edgeCalls.push({ operation, options });
+                      if (delayFirstPurgeMs && edgeCalls.length === 1) {
+                        return new Promise((resolve) =>
+                          setTimeout(() => resolve({ success: true }), delayFirstPurgeMs),
+                        );
+                      }
                       if (purgeMode === "throw") throw new Error("Purge unavailable");
                       if (purgeMode === "reject") return Promise.reject(new Error("Purge unavailable"));
                       return Promise.resolve({
@@ -107,6 +114,9 @@ beforeEach(async () => {
                     purgeMode = new URL(request.url).searchParams.get("mode");
                     exposeInvalidate = new URL(request.url).searchParams.has("invalidate");
                     failR2Write = new URL(request.url).searchParams.has("fail-r2");
+                    delayFirstPurgeMs = Number(
+                      new URL(request.url).searchParams.get("delay-first-ms") ?? 0,
+                    );
                     edgeCalls = [];
                     return new Response("ok");
                   }
@@ -169,6 +179,7 @@ async function put(path: string, body: BodyInit | null, options: PutOptions = {}
   if (options.noRevalidator) headers.set("X-No-Revalidator", "1");
   if (options.purgeExisting) headers.set("X-Purge-Existing", "1");
   if (options.coalesce) headers.set("X-Coalesce", "1");
+  if (options.replacesRevision) headers.set("X-Replaces-Revision", options.replacesRevision);
   if (options.expiryBehavior) headers.set("X-Expiry-Behavior", options.expiryBehavior);
   if (options.bodyFailure) headers.set("X-Body-Failure", "1");
   if (options.bodyDelayMs) headers.set("X-Body-Delay-Ms", String(options.bodyDelayMs));
@@ -425,6 +436,174 @@ test("purgeExisting skips replacing an entry without a revalidator once its edge
     1,
   );
   assert.equal(await (await read("/expired-edge-copy")).text(), "third");
+});
+
+test("replacesRevision drops a refresh of a revision another write already replaced", async () => {
+  const options = {
+    cacheControl: "public, max-age=1, stale-while-revalidate=60",
+    noRevalidator: true,
+    purgeExisting: true,
+  };
+  const refresh = { ...options, cacheControl: "public, max-age=60, stale-while-revalidate=60" };
+  await worker.fetch("https://user.test/admin/edge-purge?mode=rate-limit");
+  await put("/refresh-race", "first", options);
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  // Two readers find it stale and both refresh it.
+  const stale = await read("/refresh-race");
+  assert.equal(stale.headers.get("X-Workers-Response-Store"), "BLOB-STALE");
+  await stale.arrayBuffer();
+  const replacesRevision = stale.headers.get("X-Workers-Response-Store-Revision");
+  assert.ok(replacesRevision);
+
+  const first = await put("/refresh-race", "second", { ...refresh, replacesRevision });
+  assert.deepEqual(first.json, { backingStoreUpdated: true, edgePurgeAccepted: true });
+  // The later refresh would replace the fresh copy and purge it: drop it instead.
+  const second = await put("/refresh-race", "third", { ...refresh, replacesRevision });
+  assert.deepEqual(second.json, { backingStoreUpdated: false, edgePurgeAccepted: false });
+  assert.deepEqual(await (await worker.fetch("https://user.test/admin/edge-calls")).json(), []);
+  assert.equal(await (await read("/refresh-race")).text(), "second");
+  // A value that isn't a revision, or a revision not reached yet, leaves a plain write.
+  for (const value of ["0", "-1", "abc", "1000000"]) {
+    const write = await put("/refresh-race", value, { ...refresh, replacesRevision: value });
+    assert.equal(write.json.backingStoreUpdated, true, value);
+    assert.equal(await (await read("/refresh-race")).text(), value);
+  }
+
+  // One read before invalidate() is dropped too, and a read of the invalidated revision
+  // refreshes it. One read before purge() fills the tombstone, as any write does.
+  for (const [path, mutate, lateStored] of [
+    ["/refresh-race-invalidated", () => invalidate({ tags: ["refresh-race-invalidated"] }), false],
+    ["/refresh-race-purged", () => purge({ tags: ["refresh-race-purged"] }), true],
+  ] as const) {
+    await put(path, "first", { ...refresh, tags: [path.slice(1)] });
+    const before = await read(path);
+    assert.equal(before.headers.get("X-Workers-Response-Store"), "BLOB-FRESH", path);
+    await before.arrayBuffer();
+    const revision = before.headers.get("X-Workers-Response-Store-Revision");
+    assert.ok(revision, path);
+    await mutate();
+    const late = await put(path, "late", { ...refresh, replacesRevision: revision });
+    assert.equal(late.json.backingStoreUpdated, lateStored, path);
+    const after = await read(path);
+    await after.arrayBuffer();
+    assert.ok(after.headers.get("X-Workers-Response-Store-Revision"), path);
+    const refresh2 = await put(path, "second", {
+      ...refresh,
+      replacesRevision: after.headers.get("X-Workers-Response-Store-Revision"),
+    });
+    assert.equal(refresh2.json.backingStoreUpdated, true, path);
+    assert.equal(await (await read(path)).text(), "second", path);
+  }
+});
+
+test("replacesRevision drops a refresh of a fresh revision still on its way to R2, until it goes stale", async () => {
+  await worker.fetch("https://user.test/admin/edge-purge?mode=rate-limit");
+  const options = {
+    cacheControl: "public, max-age=1, stale-while-revalidate=60",
+    noRevalidator: true,
+    purgeExisting: true,
+  };
+  await put("/refresh-race-unwritten", "first", options);
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  const stale = await read("/refresh-race-unwritten");
+  assert.equal(stale.headers.get("X-Workers-Response-Store"), "BLOB-STALE");
+  await stale.arrayBuffer();
+  const replacesRevision = stale.headers.get("X-Workers-Response-Store-Revision");
+  assert.ok(replacesRevision);
+
+  // Another refresh's fresh publish, committed in the metadata DO before its R2 write.
+  const storage = await mf.unsafeGetDurableObjectStorage("user-worker", "CacheMetadata", {
+    name: metadataName,
+  });
+  await storage.exec(
+    `UPDATE entries SET latest_revision = latest_revision + 1,
+      active_revision = latest_revision + 1, fresh_until = ?
+      WHERE cache_key LIKE '%/refresh-race-unwritten%'`,
+    Date.now() + 60_000,
+  );
+  const refresh = {
+    ...options,
+    cacheControl: "public, max-age=60, stale-while-revalidate=60",
+    replacesRevision,
+  };
+  const dropped = await put("/refresh-race-unwritten", "second", refresh);
+  assert.deepEqual(dropped.json, { backingStoreUpdated: false, edgePurgeAccepted: false });
+  assert.deepEqual(await (await worker.fetch("https://user.test/admin/edge-calls")).json(), []);
+
+  // Once that revision is stale without reaching R2, readers still see the one they refresh.
+  await storage.exec(
+    `UPDATE entries SET fresh_until = ? WHERE cache_key LIKE '%/refresh-race-unwritten%'`,
+    Date.now() - 1,
+  );
+  const healed = await put("/refresh-race-unwritten", "second", refresh);
+  assert.equal(healed.json.backingStoreUpdated, true);
+  assert.equal(await (await read("/refresh-race-unwritten")).text(), "second");
+});
+
+test("replacesRevision doesn't coalesce a refresh into a leader older than its revision", async () => {
+  const path = "/refresh-race-old-leader";
+  const tags = [path.slice(1)];
+  const edgeCalls = async () =>
+    ((await (await worker.fetch("https://user.test/admin/edge-calls")).json()) as unknown[]).length;
+  await put(path, "first", { noRevalidator: true, tags });
+  await worker.fetch("https://user.test/admin/edge-purge?mode=rate-limit&delay-first-ms=1500");
+  // The leader replaces the fresh copy, and stays coalescible while its purge is pending.
+  const leader = put(path, "second", {
+    coalesce: true,
+    noRevalidator: true,
+    purgeExisting: true,
+    tags,
+  });
+  for (let attempt = 0; attempt < 50; attempt++) {
+    if ((await edgeCalls()) === 1) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  // The leader has published and is waiting on its purge.
+  assert.equal(await edgeCalls(), 1);
+  await invalidate({ tags });
+  const stale = await read(path);
+  assert.equal(stale.headers.get("X-Workers-Response-Store"), "BLOB-STALE");
+  await stale.arrayBuffer();
+  const replacesRevision = stale.headers.get("X-Workers-Response-Store-Revision");
+  assert.ok(replacesRevision);
+
+  const refresh = await put(path, "third", {
+    coalesce: true,
+    noRevalidator: true,
+    purgeExisting: true,
+    tags,
+    replacesRevision,
+  });
+  assert.equal(refresh.json.backingStoreUpdated, true);
+  await leader;
+  assert.equal(await (await read(path)).text(), "third");
+});
+
+test("replacesRevision drops an overlapping refresh coalesced into one that replaced it", async () => {
+  // Replacing a fresh entry purges its edge copy, so a follower that adopted the replacement
+  // would request the same purge a second time.
+  await worker.fetch("https://user.test/admin/edge-purge?mode=rate-limit");
+  await put("/refresh-race-coalesced", "first");
+  const fresh = await read("/refresh-race-coalesced");
+  await fresh.arrayBuffer();
+  const replacesRevision = fresh.headers.get("X-Workers-Response-Store-Revision");
+  assert.ok(replacesRevision);
+  const options = { coalesce: true, purgeExisting: true, replacesRevision };
+  const first = put("/refresh-race-coalesced", "second", { ...options, bodyDelayMs: 300 });
+  for (let attempt = 0; attempt < 50; attempt++) {
+    if ((await metadataRowCount("pending_objects")) === 1) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(await metadataRowCount("pending_objects"), 1);
+  const second = put("/refresh-race-coalesced", "third", options);
+
+  assert.equal((await first).json.backingStoreUpdated, true);
+  assert.deepEqual((await second).json, { backingStoreUpdated: false, edgePurgeAccepted: false });
+  assert.equal(
+    ((await (await worker.fetch("https://user.test/admin/edge-calls")).json()) as unknown[]).length,
+    1,
+  );
+  assert.equal(await (await read("/refresh-race-coalesced")).text(), "second");
 });
 
 test("an entry without a revalidator keeps its edge policy with response metadata in the body", async () => {

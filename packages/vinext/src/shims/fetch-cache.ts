@@ -21,7 +21,12 @@
 
 import { Buffer } from "node:buffer";
 
-import { getDataCacheHandler, type CachedFetchValue, type CacheHandler } from "./cache-handler.js";
+import {
+  getDataCacheHandler,
+  type CachedFetchValue,
+  type CacheHandler,
+  type CacheHandlerValue,
+} from "./cache-handler.js";
 import { encodeCacheTags } from "../utils/encode-cache-tag.js";
 import { sha256Hex } from "../utils/hash.js";
 import { traceAppFetch } from "../server/app-fetch-tracing.js";
@@ -843,7 +848,7 @@ async function writeFetchCacheResponse(
   response: Response,
   tags: string[],
   revalidateSeconds: number,
-  options?: { cloneForReturn?: boolean },
+  options?: { cloneForReturn?: boolean; staleEntry?: CacheHandlerValue },
 ): Promise<void> {
   const cacheValue = await buildFetchCacheValue(response, tags, revalidateSeconds, options);
   if (!cacheValue) return;
@@ -852,6 +857,8 @@ async function writeFetchCacheResponse(
     fetchCache: true,
     tags,
     revalidate: revalidateSeconds,
+    // The stale entry this write refreshes, so a handler can tell a refresh from a write.
+    ...(options?.staleEntry ? { staleEntry: options.staleEntry } : {}),
   });
 }
 
@@ -1448,6 +1455,10 @@ function createPatchedFetch(): typeof globalThis.fetch {
     const handler = getDataCacheHandler();
     let mustBypassPendingRevalidation = _hasPendingRevalidatedTag([...tags, ...softTags]);
 
+    // A stale entry this fetch refreshes, kept for the miss path below if the
+    // refresh fails.
+    let staleEntry: CacheHandlerValue | undefined;
+
     // Try cache first
     try {
       let cached = mustBypassPendingRevalidation
@@ -1481,9 +1492,12 @@ function createPatchedFetch(): typeof globalThis.fetch {
       // the simpler approach is to just re-fetch (the page-level ISR handles SWR).
       // However, if we have a stale entry, return it and trigger background refetch.
       if (cached?.value && cached.value.kind === "FETCH" && cached.cacheState === "stale") {
+        staleEntry = cached;
         if (shouldRefreshStaleFetchInForeground()) {
           const freshResponse = await dedupeFetch(input, fetchInit);
-          await writeFetchCacheResponse(handler, cacheKey, freshResponse, tags, revalidateSeconds);
+          await writeFetchCacheResponse(handler, cacheKey, freshResponse, tags, revalidateSeconds, {
+            staleEntry: cached,
+          });
           return recordFetchOutcome(freshResponse, "miss", cacheReason);
         }
 
@@ -1496,6 +1510,7 @@ function createPatchedFetch(): typeof globalThis.fetch {
             .then(async (freshResp) => {
               await writeFetchCacheResponse(handler, cacheKey, freshResp, tags, revalidateSeconds, {
                 cloneForReturn: false,
+                staleEntry: cached,
               });
             })
             .catch((err) => {
@@ -1553,6 +1568,7 @@ function createPatchedFetch(): typeof globalThis.fetch {
           fetchCache: true,
           tags,
           revalidate: revalidateSeconds,
+          ...(staleEntry ? { staleEntry } : {}),
         })
         .catch((err) => {
           console.error("[vinext] fetch cache write error:", err);
