@@ -170,7 +170,7 @@ describe("images.loader config validation", () => {
   it('throws for an image without a loader prop when images.loader is "custom"', async () => {
     process.env.__VINEXT_IMAGE_CUSTOM_LOADER = "true";
     vi.resetModules();
-    const shim = await import("../packages/vinext/src/shims/image-external.js");
+    const shim = await import("../packages/vinext/src/shims/image.js");
     const imageProps = { alt: "a", src: "/photo.jpg", width: 100, height: 100 };
     const message = 'Image with src "/photo.jpg" is missing "loader" prop.';
 
@@ -187,24 +187,20 @@ describe("images.loader config validation", () => {
   it("throws when images.loaderFile has no default export", async () => {
     process.env.__VINEXT_IMAGE_LOADER_FILE = "true";
     vi.resetModules();
-    const shim = await import("../packages/vinext/src/shims/image-external.js");
+    const shim = await import("../packages/vinext/src/shims/image.js");
 
     expect(() =>
       shim.getImageProps({ alt: "a", src: "/photo.jpg", width: 100, height: 100 }),
     ).toThrow("images.loaderFile detected but the file is missing default export.");
   });
 
-  // Next.js's next/legacy/image never imports the loaderFile module, and its
-  // "custom" loader only throws when it has to build a URL (client/legacy/image.tsx).
+  // Next.js's next/legacy/image ignores the loaderFile, and its "custom" loader
+  // only throws when it has to build a URL (client/legacy/image.tsx).
   it("keeps next/legacy/image off loaderFile and lets unoptimized images through", async () => {
     process.env.__VINEXT_IMAGE_CUSTOM_LOADER = "true";
     process.env.__VINEXT_IMAGE_LOADER_FILE = "true";
     vi.resetModules();
-    const loaderFileEvaluated = vi.fn();
-    vi.doMock("vinext/shims/image-loader-file", () => {
-      loaderFileEvaluated();
-      return { default: undefined };
-    });
+    vi.doMock("vinext/shims/image-loader-file", () => ({ default: undefined }));
     try {
       const { default: LegacyImage } = await import("../packages/vinext/src/shims/legacy-image.js");
       const imageProps = { alt: "a", src: "/photo.jpg", width: 100, height: 100 };
@@ -217,11 +213,6 @@ describe("images.loader config validation", () => {
       expect(() =>
         ReactDOMServer.renderToString(React.createElement(LegacyImage, imageProps)),
       ).toThrow('Image with src "/photo.jpg" is missing "loader" prop.');
-      expect(loaderFileEvaluated).not.toHaveBeenCalled();
-
-      // The next/image entry is the only importer of the loader file.
-      await import("../packages/vinext/src/shims/image-external.js");
-      expect(loaderFileEvaluated).toHaveBeenCalledOnce();
     } finally {
       vi.doUnmock("vinext/shims/image-loader-file");
     }
@@ -1454,7 +1445,7 @@ describe("dangerouslyAllowLocalIP private-IP guard", () => {
     process.env.__VINEXT_IMAGE_REMOTE_PATTERNS = JSON.stringify([{ hostname: "**" }]);
     process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP = "false";
 
-    // Module-level constants in image.tsx are evaluated at import time from
+    // Module-level constants in image-props.ts are evaluated at import time from
     // process.env, so we must re-evaluate the module after changing env.
     vi.resetModules();
     const { default: PrivateIpImage } = await import("../packages/vinext/src/shims/image.js");
@@ -1494,7 +1485,7 @@ describe("dangerouslyAllowLocalIP private-IP guard", () => {
     process.env.__VINEXT_IMAGE_REMOTE_PATTERNS = JSON.stringify([{ hostname: "**" }]);
     process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP = "true";
 
-    // Module-level constants in image.tsx are evaluated at import time from
+    // Module-level constants in image-props.ts are evaluated at import time from
     // process.env, so we must re-evaluate the module after changing env.
     vi.resetModules();
     const { default: PrivateIpImage } = await import("../packages/vinext/src/shims/image.js");
@@ -1516,7 +1507,7 @@ describe("dangerouslyAllowLocalIP private-IP guard", () => {
     process.env.__VINEXT_IMAGE_REMOTE_PATTERNS = JSON.stringify([{ hostname: "**" }]);
     process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP = "false";
 
-    // Module-level constants in image.tsx are evaluated at import time from
+    // Module-level constants in image-props.ts are evaluated at import time from
     // process.env, so we must re-evaluate the module after changing env.
     vi.resetModules();
     const { default: PrivateIpImage } = await import("../packages/vinext/src/shims/image.js");
@@ -1540,7 +1531,7 @@ describe("dangerouslyAllowLocalIP private-IP guard", () => {
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    // Module-level constants in image.tsx are evaluated at import time from
+    // Module-level constants in image-props.ts are evaluated at import time from
     // process.env, so we must re-evaluate the module after changing env.
     vi.resetModules();
     const { default: PrivateIpImage } = await import("../packages/vinext/src/shims/image.js");

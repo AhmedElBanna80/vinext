@@ -1735,6 +1735,25 @@ export default { plugins: [vinext({ cache: { cdn: customCdn() } })] };
     expect(snapshotProject(tmpDir)).toBe(before);
   });
 
+  it("rejects ignoreWranglerConfig with the legacy setup before mutating the project", async () => {
+    setupProject(tmpDir);
+    writeFile(tmpDir, "wrangler.jsonc", '{ "name": "other-worker", "main": "src/other.ts" }\n');
+    const before = snapshotProject(tmpDir);
+    await expect(
+      runInit(tmpDir, {
+        install: false,
+        cloudflare: {
+          legacyWrangler: true,
+          ignoreWranglerConfig: true,
+          dataCache: "none",
+          cdnCache: "none",
+          imageOptimization: "none",
+        },
+      }),
+    ).rejects.toThrow("cannot be combined with --legacy-wrangler-cloudflare-init");
+    expect(snapshotProject(tmpDir)).toBe(before);
+  });
+
   it("rejects an incompatible typed Response Store config before mutating the project", async () => {
     setupProject(tmpDir);
     writeFile(tmpDir, "cloudflare.config.ts", "export default {};\n");
@@ -2561,6 +2580,82 @@ describe("init — dependency installation", () => {
     const devDepsIdx = execCalls.indexOf(devDepsCall!);
     expect(upgradeIdx).toBeLessThan(runtimeDepsIdx);
     expect(runtimeDepsIdx).toBeLessThan(devDepsIdx);
+  });
+
+  it("upgrades a declared @vitejs/plugin-react major below vinext's peer range before vinext", async () => {
+    setupProject(tmpDir, {
+      router: "pages",
+      extraPkg: { devDependencies: { "@vitejs/plugin-react": "^4.3.4" } },
+    });
+    setupFakePackage(tmpDir, "@vitejs/plugin-react", "4.7.0");
+
+    const { execCalls, output } = await runInit(tmpDir);
+
+    const upgradeCall = execCalls.find((c) => c.cmd.includes('"@vitejs/plugin-react@latest"'));
+    expect(upgradeCall?.cmd).toContain("-D");
+    const vinextCall = execCalls.find((c) => c.cmd.includes('"vinext"'));
+    expect(execCalls.indexOf(upgradeCall!)).toBeLessThan(execCalls.indexOf(vinextCall!));
+    expect(output).toContain("  Upgrading devDependencies:\n    - @vitejs/plugin-react");
+  });
+
+  it("upgrades an installed @vitejs/plugin-react below the floor of a supported major", async () => {
+    setupProject(tmpDir, {
+      router: "pages",
+      extraPkg: { devDependencies: { "@vitejs/plugin-react": "^5.0.1" } },
+    });
+    setupFakePackage(tmpDir, "@vitejs/plugin-react", "5.0.3");
+
+    const { execCalls } = await runInit(tmpDir);
+
+    expect(execCalls.some((c) => c.cmd.includes('"@vitejs/plugin-react@latest"'))).toBe(true);
+  });
+
+  it("upgrades an installed @vitejs/plugin-react prerelease outside vinext's peer range", async () => {
+    setupProject(tmpDir, {
+      router: "pages",
+      extraPkg: { devDependencies: { "@vitejs/plugin-react": "6.0.0-beta.0" } },
+    });
+    setupFakePackage(tmpDir, "@vitejs/plugin-react", "6.0.0-beta.0");
+
+    const { execCalls } = await runInit(tmpDir);
+
+    expect(execCalls.some((c) => c.cmd.includes('"@vitejs/plugin-react@latest"'))).toBe(true);
+  });
+
+  it("keeps a declared @vitejs/plugin-react union whose installed match is supported", async () => {
+    setupProject(tmpDir, {
+      router: "pages",
+      extraPkg: { devDependencies: { "@vitejs/plugin-react": "4 || ^6" } },
+    });
+    setupFakePackage(tmpDir, "@vitejs/plugin-react", "6.1.2");
+
+    const { execCalls } = await runInit(tmpDir);
+
+    expect(execCalls.some((c) => c.cmd.includes("@vitejs/plugin-react"))).toBe(false);
+  });
+
+  it("keeps a declared @vitejs/plugin-react inside vinext's peer range", async () => {
+    setupProject(tmpDir, {
+      router: "pages",
+      extraPkg: { devDependencies: { "@vitejs/plugin-react": "^5.0.1" } },
+    });
+    setupFakePackage(tmpDir, "@vitejs/plugin-react", "5.2.0");
+
+    const { execCalls } = await runInit(tmpDir);
+
+    expect(execCalls.some((c) => c.cmd.includes("@vitejs/plugin-react"))).toBe(false);
+  });
+
+  it("rewrites a declared @vitejs/plugin-react below vinext's peer range without installing", async () => {
+    setupProject(tmpDir, {
+      router: "pages",
+      extraPkg: { devDependencies: { "@vitejs/plugin-react": "^4.3.4" } },
+    });
+
+    await runInit(tmpDir, { install: false });
+
+    const pkg = JSON.parse(fs.readFileSync(path.join(tmpDir, "package.json"), "utf-8"));
+    expect(pkg.devDependencies["@vitejs/plugin-react"]).toBe("latest");
   });
 
   it("does not upgrade React when version is already compatible", async () => {

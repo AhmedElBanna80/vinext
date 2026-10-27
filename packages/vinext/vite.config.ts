@@ -45,10 +45,12 @@ const renameBundledDepsOutput = (chunk: { name: string }) =>
 
 const bundledDependencies = [
   "am-i-vibing",
+  "iconv-lite",
   "ignore",
   "image-size",
   "process-ancestry",
   "pathslash",
+  "safer-buffer",
   "ua-parser-js",
 ];
 
@@ -66,7 +68,7 @@ const externalizeBareThirdPartySpecifiers = (
   isResolved: boolean,
 ) => {
   if (isResolved) return false;
-  // shims/image-external.tsx imports the `images.loaderFile` slot by this bare
+  // shims/image-props.ts imports the `images.loaderFile` slot by this bare
   // specifier so the vinext plugin can alias it to the user's loader file.
   // Keep it bare in `dist` instead of rewriting it to a relative import.
   if (id === "vinext/shims/image-loader-file") return true;

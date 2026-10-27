@@ -112,6 +112,11 @@ export type RequestInit = globalThis.RequestInit & {
     trailingSlash?: boolean;
     skipTrailingSlashRedirect?: boolean;
   };
+  /**
+   * vinext-internal: the host the request was made to, when the URL carries
+   * the server's own origin instead. It picks the i18n domain locale.
+   */
+  requestHost?: string;
   signal?: AbortSignal;
   duplex?: "half";
 };
@@ -203,9 +208,9 @@ export class NextRequest extends Request {
     // with NextResponse, and so `javascript:` / `data:` URIs are blocked too.
     const rawUrl = typeof input !== "string" && "url" in input ? input.url : String(input);
     validateURL(rawUrl);
-    // Strip nextConfig before passing to super() — it's vinext-internal,
-    // not a valid RequestInit property.
-    const { nextConfig: _nextConfig, ...plainInit } = init ?? {};
+    // Strip nextConfig and requestHost before passing to super() — they're
+    // vinext-internal, not valid RequestInit properties.
+    const { nextConfig: _nextConfig, requestHost, ...plainInit } = init ?? {};
     // A Request passed as init (e.g. `new NextRequest(url, request)`) keeps its
     // method, headers and body on Request.prototype, so the spread above copies
     // none of them. Hand it to super() as-is, like Next.js does.
@@ -253,6 +258,7 @@ export class NextRequest extends Request {
     const urlConfig: NextURLConfig | undefined = _nextConfig
       ? {
           basePath: _nextConfig.basePath,
+          headers: requestHost === undefined ? undefined : { host: requestHost },
           nextConfig: {
             i18n,
             trailingSlash: _nextConfig.trailingSlash,
@@ -454,6 +460,11 @@ export class NextResponse<_Body = unknown> extends Response {
 
 export type NextURLConfig = {
   basePath?: string;
+  /**
+   * Request headers. As in Next.js's `getHostname`, a Host header decides the
+   * domain locale before the URL's own hostname.
+   */
+  headers?: Record<string, string | string[] | undefined>;
   nextConfig?: {
     i18n?: {
       locales: string[];
@@ -482,6 +493,10 @@ export type NextURLConfig = {
   };
 };
 
+function isRawDataPathname(pathname: string): boolean {
+  return pathname.startsWith("/_next/data/") && pathname.endsWith(".json");
+}
+
 export class NextURL {
   /** Internal URL stores the pathname WITHOUT basePath or locale prefix. */
   private _url: URL;
@@ -503,9 +518,16 @@ export class NextURL {
   private _domainLocale:
     | NonNullable<NonNullable<NonNullable<NextURLConfig["nextConfig"]>["i18n"]>["domains"]>[number]
     | undefined;
+  private _headers: NextURLConfig["headers"];
+  private _buildId: string | undefined;
+  /** First page segment of a raw data pathname, where its locale sits. */
+  private _dataPathSegment: string | undefined;
+  /** The locale parsed from that segment, if it is one. */
+  private _dataPathLocale: string | undefined;
 
   constructor(input: string | URL, base?: string | URL, config?: NextURLConfig) {
     this._url = new URL(input.toString(), base);
+    this._headers = config?.headers;
     this._configBasePath = config?.basePath ?? "";
     this._basePath = this._configBasePath;
     this._configTrailingSlash = config?.nextConfig?.trailingSlash ?? false;
@@ -513,6 +535,7 @@ export class NextURL {
     this._trailingSlash = this._configTrailingSlash;
     this._analyzeTrailingSlash();
     this._stripBasePath();
+    this._parseBuildId();
     const i18n = config?.nextConfig?.i18n;
     if (i18n) {
       this._locales = [...i18n.locales];
@@ -556,6 +579,25 @@ export class NextURL {
     this._url.pathname = stripBasePath(this._url.pathname, this._configBasePath);
   }
 
+  /**
+   * Take the build ID from a raw `/_next/data/<buildId>/….json` pathname, as
+   * getNextPathnameInfo does. Middleware only sees one when proxy URL
+   * normalization is skipped; the pathname is left as is.
+   */
+  private _parseBuildId(): void {
+    const { pathname } = this._url;
+    if (!isRawDataPathname(pathname)) {
+      this._buildId = undefined;
+      this._dataPathSegment = undefined;
+      return;
+    }
+    const [buildId, pageSegment] = pathname
+      .slice("/_next/data/".length, -".json".length)
+      .split("/");
+    this._buildId = buildId;
+    this._dataPathSegment = pageSegment === "index" ? undefined : pageSegment;
+  }
+
   /** Extract locale from pathname, stripping it from the internal URL. */
   private _detectPathnameLocale(locales: string[]): string | undefined {
     const segments = this._url.pathname.split("/");
@@ -570,8 +612,21 @@ export class NextURL {
   private _analyzeI18n(): void {
     if (!this._locales || !this._configDefaultLocale) return;
     const detectedLocale = this._detectPathnameLocale(this._locales);
+    // A raw data pathname carries the locale after its build ID. Next.js
+    // detects it there, leaves the pathname as is, and doesn't let it pick
+    // the domain.
+    this._dataPathLocale = undefined;
+    if (!detectedLocale && this._buildId && this._dataPathSegment) {
+      const candidate = this._dataPathSegment.toLowerCase();
+      this._dataPathLocale = this._locales.find((l) => l.toLowerCase() === candidate);
+    }
     const detectedLocaleLower = detectedLocale?.toLowerCase();
-    const hostname = this._url.hostname.toLowerCase();
+    const hostHeader = this._headers?.host;
+    const hostname = (
+      typeof hostHeader === "string" && hostHeader
+        ? hostHeader.split(":", 1)[0]
+        : this._url.hostname
+    ).toLowerCase();
     this._domainLocale = this._domains?.find(
       (domain) =>
         domain.domain.split(":", 1)[0].toLowerCase() === hostname ||
@@ -579,7 +634,20 @@ export class NextURL {
         domain.locales?.some((locale) => locale.toLowerCase() === detectedLocaleLower),
     );
     this._defaultLocale = this._domainLocale?.defaultLocale ?? this._configDefaultLocale;
-    this._locale = detectedLocale ?? this._defaultLocale;
+    this._locale = detectedLocale ?? this._dataPathLocale ?? this._defaultLocale;
+  }
+
+  /**
+   * A raw data pathname keeps its locale segment, replaced by the current
+   * locale once it has been changed.
+   */
+  private _formatDataPathLocale(pathname: string): string {
+    if (!this._dataPathLocale || this._locale === this._dataPathLocale) return pathname;
+    if (!this._locale || !isRawDataPathname(pathname)) return pathname;
+    const segments = pathname.slice("/_next/data/".length, -".json".length).split("/");
+    if (segments[1]?.toLowerCase() !== this._dataPathLocale.toLowerCase()) return pathname;
+    segments[1] = this._locale;
+    return "/_next/data/" + segments.join("/") + ".json";
   }
 
   /**
@@ -590,10 +658,16 @@ export class NextURL {
   private _formatPathname(): string {
     // Build prefix: basePath + locale (skip defaultLocale — Next.js omits it)
     let prefix = this._basePath;
-    const inner = this._url.pathname;
+    const inner = this._formatDataPathLocale(this._url.pathname);
     const innerLower = inner.toLowerCase();
     const isApiPath = innerLower === "/api" || innerLower.startsWith("/api/");
-    if (!isApiPath && this._locale && this._locale !== this._defaultLocale) {
+    // A raw data pathname already contains its locale.
+    if (
+      !isApiPath &&
+      !isRawDataPathname(inner) &&
+      this._locale &&
+      this._locale !== this._defaultLocale
+    ) {
       prefix += "/" + this._locale;
     }
     const composed = !prefix ? inner : inner === "/" ? prefix : prefix + inner;
@@ -638,6 +712,7 @@ export class NextURL {
     this._url.href = value;
     this._analyzeTrailingSlash();
     this._stripBasePath();
+    this._parseBuildId();
     this._analyzeI18n();
   }
 
@@ -779,6 +854,7 @@ export class NextURL {
       // current pathname. Next.js retains the original constructor options in
       // clone(), allowing a later href assignment to re-activate the prefix.
       basePath: this._configBasePath,
+      headers: this._headers,
       nextConfig: Object.keys(nextConfig).length > 0 ? nextConfig : undefined,
     };
     // Pass the full href (with locale/basePath re-added) so the constructor
@@ -795,13 +871,13 @@ export class NextURL {
   }
 
   /**
-   * The build ID of the Next.js application.
-   * Set from `generateBuildId` in next.config.js, or a random UUID if not configured.
-   * Can be used in middleware to detect deployment skew between client and server.
-   * Matches the Next.js API: `request.nextUrl.buildId`.
+   * Matches the Next.js API: `request.nextUrl.buildId`. Next.js derives it
+   * from the URL (only `/_next/data/<buildId>/…` paths carry one) and never
+   * from the deployment, so a Client Component reads the same value on the
+   * server and in the browser.
    */
   get buildId(): string | undefined {
-    return process.env.__VINEXT_BUILD_ID ?? undefined;
+    return this._buildId;
   }
 }
 

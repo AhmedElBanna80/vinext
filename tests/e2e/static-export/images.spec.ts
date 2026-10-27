@@ -73,9 +73,9 @@ test.describe("Static Export — next/image", () => {
     });
   });
 
-  // next/legacy/image never imports images.loaderFile; its built-in loader
-  // uses images.path, which Next.js gives a trailing slash under trailingSlash.
-  test("next/legacy/image keeps the built-in loader with a trailing slash", async ({ page }) => {
+  // next/legacy/image ignores images.loaderFile, so it keeps the built-in loader
+  // (with the trailing slash that trailingSlash gives images.path).
+  test("next/legacy/image ignores images.loaderFile", async ({ page }) => {
     expect(await imageAttrs(page, "legacy")).toEqual({
       src: "/_next/image/?url=%2Flogo.png&w=128&q=75",
       srcSet:
