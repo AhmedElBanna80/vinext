@@ -711,23 +711,21 @@ function createLayoutInputs<TModule extends AppPageHeadModule>(
   return layoutInputs;
 }
 
-/**
- * `resolved`, with the title template of `stashed`, everything resolved up to
- * the last item that may set it, for the next title to resolve with.
- */
-function withTitleTemplateOf(resolved: Metadata, stashed: Metadata): Metadata {
-  if (resolved === stashed || typeof resolved.title !== "object" || !resolved.title) {
-    return resolved;
-  }
-  const template = typeof stashed.title === "object" ? (stashed.title?.template ?? null) : null;
-  return { ...resolved, title: { absolute: resolved.title.absolute ?? "", template } };
-}
+type MetadataTitle = Metadata["title"];
 
-/** The walk's accumulated metadata, with its resolved title as the shown string. */
+/** The walk's accumulated metadata, with its resolved titles as the shown strings. */
 function toShownMetadata(accumulated: Metadata): Metadata {
-  const title = accumulated.title;
-  if (title === undefined || typeof title === "string") return accumulated;
-  return { ...accumulated, title: title.absolute || undefined };
+  const shown = (title: MetadataTitle) =>
+    typeof title === "object" && title ? title.absolute || undefined : title;
+  const result = { ...accumulated };
+  if (typeof accumulated.title === "object") result.title = shown(accumulated.title);
+  if (accumulated.openGraph) {
+    result.openGraph = { ...accumulated.openGraph, title: shown(accumulated.openGraph.title) };
+  }
+  if (accumulated.twitter) {
+    result.twitter = { ...accumulated.twitter, title: shown(accumulated.twitter.title) };
+  }
+  return result;
 }
 
 function getParallelRouteModules<TModule extends AppPageHeadModule>(
@@ -1153,10 +1151,15 @@ function prepareAppPageHeadInner<TModule extends AppPageHeadModule>(
       initial: {},
       merge: (resolved, metadata, stashed) => {
         try {
-          return mergeParentMetadataEntries([
-            { metadata: withTitleTemplateOf(resolved, stashed) },
-            { metadata },
-          ]);
+          // `stashed` is everything resolved up to the last item that may set
+          // the title templates. Merged after it as a page entry, `resolved`
+          // keeps its values but hands `metadata` the templates of `stashed`,
+          // even for a value it cleared, such as `openGraph: null`.
+          return mergeParentMetadataEntries(
+            resolved === stashed
+              ? [{ metadata: resolved }, { metadata }]
+              : [{ metadata: stashed }, { isPage: true, metadata: resolved }, { metadata }],
+          );
         } catch (error) {
           throw tagAppPageMetadataError(error);
         }
