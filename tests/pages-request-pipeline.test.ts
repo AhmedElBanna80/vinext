@@ -1106,6 +1106,85 @@ describe("external proxy", () => {
     expect(result.response.status).toBe(200);
     mockFetch.mockRestore();
   });
+
+  // Every adapter (Node, dev, Workers) proxies through this pipeline. Next.js
+  // proxies a next.config external rewrite without the headers it staged, and
+  // sets the upstream's headers over a middleware rewrite's, keeping
+  // middleware's cookies ahead of the upstream's.
+  it.each([
+    {
+      rewrite: "config",
+      middlewareCookie: true,
+      cookies: ["middleware-cookie=1", "upstream-cookie=1"],
+      configHeader: null,
+      middlewareHeader: null,
+    },
+    {
+      rewrite: "middleware",
+      middlewareCookie: true,
+      cookies: ["middleware-cookie=1", "upstream-cookie=1"],
+      configHeader: "1",
+      middlewareHeader: "1",
+    },
+    {
+      rewrite: "middleware",
+      middlewareCookie: false,
+      cookies: ["upstream-cookie=1"],
+      configHeader: "1",
+      middlewareHeader: "1",
+    },
+  ])(
+    "applies staged headers to a $rewrite external rewrite like Next.js (middleware cookie: $middlewareCookie)",
+    async ({ rewrite, middlewareCookie, ...expected }) => {
+      const upstreamHeaders = new Headers({
+        "cache-control": "public, max-age=60",
+        "set-cookie": "upstream-cookie=1",
+      });
+      const result = await runPagesRequest(
+        makeRequest("/proxy-me"),
+        baseDeps({
+          configHeaders: [
+            {
+              source: "/proxy-me",
+              headers: [
+                { key: "Set-Cookie", value: "config-cookie=1" },
+                { key: "x-config-header", value: "1" },
+              ],
+            },
+          ],
+          configRewrites: {
+            beforeFiles:
+              rewrite === "config"
+                ? [{ source: "/proxy-me", destination: "https://upstream.example/" }]
+                : [],
+            afterFiles: [],
+            fallback: [],
+          },
+          proxyExternal: async () => new Response("upstream", { headers: upstreamHeaders }),
+          runMiddleware: makeMiddleware({
+            continue: true,
+            responseHeaders: new Headers([
+              ["cache-control", "private, max-age=7"],
+              ["x-mw-response-header", "1"],
+              ...(middlewareCookie
+                ? [["set-cookie", "middleware-cookie=1"] as [string, string]]
+                : []),
+            ]),
+            ...(rewrite === "middleware" ? { rewriteUrl: "https://upstream.example/" } : {}),
+          }),
+        }),
+      );
+
+      expect(result.type).toBe("response");
+      if (result.type !== "response") return;
+      expect({
+        cacheControl: result.response.headers.get("cache-control"),
+        cookies: result.response.headers.getSetCookie(),
+        configHeader: result.response.headers.get("x-config-header"),
+        middlewareHeader: result.response.headers.get("x-mw-response-header"),
+      }).toEqual({ cacheControl: "public, max-age=60", ...expected });
+    },
+  );
 });
 
 // 9. beforeFiles rewrite with external URL → {type:"response"} from proxy
@@ -1446,7 +1525,9 @@ describe("out-of-basePath rejection", () => {
     expect(result.response.status).toBe(404);
   });
 
-  it("allows requests outside basePath when beforeFiles rewrite fires", async () => {
+  // Next.js rejects this config when it loads it. At runtime, the destination
+  // is outside the basePath, so like Next.js' resolve-routes it resolves nothing.
+  it("rejects requests a basePath: false rewrite keeps outside basePath", async () => {
     const renderPage = makeRenderPage(200);
     const req = makeRequest("/outside");
     const result = await runPagesRequest(
@@ -1464,8 +1545,36 @@ describe("out-of-basePath rejection", () => {
     );
     expect(result.type).toBe("response");
     if (result.type !== "response") return;
-    expect(result.response.status).toBe(200);
+    expect(result.response.status).toBe(404);
+    expect(renderPage).not.toHaveBeenCalled();
   });
+
+  // The middleware rewrite destination's basePath decides, not the request's.
+  it.each([
+    { hadBasePath: false, rewriteHadBasePath: true, expectedStatus: 200 },
+    { hadBasePath: true, rewriteHadBasePath: false, expectedStatus: 404 },
+  ])(
+    "returns $expectedStatus when middleware rewrites a request (hadBasePath: $hadBasePath) to a destination with rewriteHadBasePath: $rewriteHadBasePath",
+    async ({ hadBasePath, rewriteHadBasePath, expectedStatus }) => {
+      const renderPage = makeRenderPage(200);
+      const matchApiRoute = vi.fn(async () => null);
+      const result = await runPagesRequest(
+        makeRequest("/source"),
+        baseDeps({
+          basePath: "/base",
+          hadBasePath,
+          hasMiddleware: true,
+          matchApiRoute,
+          runMiddleware: makeMiddleware({ rewriteUrl: "/inside", rewriteHadBasePath }),
+          renderPage,
+        }),
+      );
+      expect(result.type).toBe("response");
+      if (result.type !== "response") return;
+      expect(result.response.status).toBe(expectedStatus);
+      expect(renderPage).toHaveBeenCalledTimes(expectedStatus === 200 ? 1 : 0);
+    },
+  );
 });
 
 // 11. API route with renderPage absent → {type:"api"} intent
@@ -1513,6 +1622,35 @@ describe("API routes", () => {
     expect(result.apiUrl).toBe("/api/users");
     expect(result.configRewriteFired).toBe(true);
   });
+
+  // The middleware rewrite destination's basePath decides, not the request's.
+  it.each([
+    { hadBasePath: false, rewriteHadBasePath: true, reachesApi: true },
+    { hadBasePath: true, rewriteHadBasePath: false, reachesApi: false },
+  ])(
+    "reaches API routes when middleware rewrites (hadBasePath: $hadBasePath, rewriteHadBasePath: $rewriteHadBasePath): $reachesApi",
+    async ({ hadBasePath, rewriteHadBasePath, reachesApi }) => {
+      const result = await runPagesRequest(
+        makeRequest("/source"),
+        baseDeps({
+          basePath: "/base",
+          hadBasePath,
+          hasMiddleware: true,
+          runMiddleware: makeMiddleware({ rewriteUrl: "/api/users", rewriteHadBasePath }),
+        }),
+      );
+
+      if (reachesApi) {
+        expect(result.type).toBe("api");
+        if (result.type !== "api") return;
+        expect(result.apiUrl).toBe("/api/users");
+      } else {
+        expect(result.type).toBe("response");
+        if (result.type !== "response") return;
+        expect(result.response.status).toBe(404);
+      }
+    },
+  );
 
   // 12. API route with handleApi present → {type:"response"}
   it("returns response when handleApi present", async () => {

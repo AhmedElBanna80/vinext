@@ -39,12 +39,44 @@ const _instrumentationRuntimePath = resolveEntryPath(
   "../server/instrumentation-runtime.js",
   import.meta.url,
 );
+const _isolateSharedPromisePath = resolveEntryPath(
+  "../server/isolate-shared-promise.js",
+  import.meta.url,
+);
 
-async function getPagesDataKind(filePath: string): Promise<"static" | "server" | "none"> {
+type PagesRouteData = { dataKind: "static" | "server" | "none"; runsInitialProps: boolean };
+
+const GET_INITIAL_PROPS_NAME = /\bgetInitialProps\b/;
+
+/**
+ * Whether a module's source names getInitialProps. Next.js serves a page
+ * without data functions as one static file only when neither it nor a
+ * custom _app defines getInitialProps, which it checks on the loaded modules:
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/build/utils.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/build/index.ts
+ * The source is all the request stage has. A getInitialProps an imported
+ * wrapper attaches is only seen once the page renders.
+ */
+async function namesGetInitialProps(filePath: string | null): Promise<boolean> {
+  if (filePath === null) return false;
+  return GET_INITIAL_PROPS_NAME.test(await readFile(filePath, "utf8"));
+}
+
+async function getPagesRouteData(
+  filePath: string,
+  appRunsInitialProps: boolean,
+): Promise<PagesRouteData> {
   const source = await readFile(filePath, "utf8");
-  if (hasExportedName(source, "getStaticProps")) return "static";
-  if (hasExportedName(source, "getServerSideProps")) return "server";
-  return "none";
+  if (hasExportedName(source, "getStaticProps")) {
+    return { dataKind: "static", runsInitialProps: false };
+  }
+  if (hasExportedName(source, "getServerSideProps")) {
+    return { dataKind: "server", runsInitialProps: false };
+  }
+  return {
+    dataKind: "none",
+    runsInitialProps: appRunsInitialProps || GET_INITIAL_PROPS_NAME.test(source),
+  };
 }
 
 type GeneratePagesServerEntryOptions = {
@@ -73,10 +105,16 @@ export async function generatePagesRequestEntry(
   // imported base class. Keep the request-independent stage conservative
   // instead of growing a second JavaScript analyzer for this cache optimization.
   const hasRequestAwareDocument = documentPath !== null;
+  const appRunsInitialProps = await namesGetInitialProps(
+    findFileWithExts(pagesDir, "_app", fileMatcher),
+  );
   const pageRouteEntries = await Promise.all(
     pageRoutes.map(async (route: Route) => {
-      const dataKind = await getPagesDataKind(route.filePath);
-      return `  { pattern: ${JSON.stringify(route.pattern)}, patternParts: ${JSON.stringify(route.patternParts)}, isDynamic: ${route.isDynamic}, params: ${JSON.stringify(route.params)}, dataKind: ${JSON.stringify(dataKind)} }`;
+      const { dataKind, runsInitialProps } = await getPagesRouteData(
+        route.filePath,
+        appRunsInitialProps,
+      );
+      return `  { pattern: ${JSON.stringify(route.pattern)}, patternParts: ${JSON.stringify(route.patternParts)}, isDynamic: ${route.isDynamic}, params: ${JSON.stringify(route.params)}, dataKind: ${JSON.stringify(dataKind)}, runsInitialProps: ${runsInitialProps} }`;
     }),
   );
   const apiRouteEntries = apiRoutes.map(
@@ -120,7 +158,8 @@ export async function generatePagesRequestEntry(
   });
   const instrumentationImportCode = instrumentationPath
     ? `import * as _instrumentation from ${JSON.stringify(instrumentationPath)};
-import { ensureInstrumentationRegistered as __ensureInstrumentationRegistered } from ${JSON.stringify(_instrumentationRuntimePath)};`
+import { ensureInstrumentationRegistered as __ensureInstrumentationRegistered } from ${JSON.stringify(_instrumentationRuntimePath)};
+import { shareIsolatePromise as __shareIsolatePromise } from ${JSON.stringify(_isolateSharedPromisePath)};`
     : "";
   const instrumentationInitCode = instrumentationPath
     ? `let __applicationInitialization;
@@ -128,8 +167,8 @@ async function __initializeApplication() {
   await __ensureInstrumentationRegistered(_instrumentation, ${JSON.stringify(instrumentationPath)});
   ${middlewarePath ? `middlewareModule = await import(${JSON.stringify(middlewarePath)});` : ""}
 }
-export function __ensureInstrumentation() {
-  return __applicationInitialization ??= __initializeApplication();
+export function __ensureInstrumentation(ctx) {
+  return __applicationInitialization ??= __shareIsolatePromise(__initializeApplication(), ctx);
 }`
     : "export function __ensureInstrumentation() {}";
   const middlewareImportCode = middlewarePath
@@ -139,7 +178,7 @@ export function __ensureInstrumentation() {
     : "";
   const middlewareExportCode = middlewarePath
     ? `export async function runMiddleware(request, ctx, options) {
-  ${instrumentationPath ? "await __ensureInstrumentation();" : ""}
+  ${instrumentationPath ? "await __ensureInstrumentation(ctx);" : ""}
   return __runGeneratedMiddleware({
     basePath: vinextConfig.basePath,
     ctx,
@@ -154,8 +193,8 @@ export function __ensureInstrumentation() {
     trailingSlash: vinextConfig.trailingSlash,
   });
 }`
-    : `export async function runMiddleware() {
-  ${instrumentationPath ? "await __ensureInstrumentation();" : ""}
+    : `export async function runMiddleware(request, ctx) {
+  ${instrumentationPath ? "await __ensureInstrumentation(ctx);" : ""}
   return { continue: true };
 }`;
 
@@ -296,10 +335,16 @@ export async function generateServerEntry(
   );
 
   // Build the route table — include filePath for SSR manifest lookup
+  const appRunsInitialProps = await namesGetInitialProps(
+    findFileWithExts(pagesDir, "_app", fileMatcher),
+  );
   const pageRouteEntries = await Promise.all(
     pageRoutes.map(async (r: Route, i: number) => {
-      const dataKind = await getPagesDataKind(r.filePath);
-      return `  { pattern: ${JSON.stringify(r.pattern)}, patternParts: ${JSON.stringify(r.patternParts)}, isDynamic: ${r.isDynamic}, params: ${JSON.stringify(r.params)}, module: ${instrumentationPath ? "null" : `page_${i}`}, filePath: ${JSON.stringify(r.filePath)}, dataKind: ${JSON.stringify(dataKind)} }`;
+      const { dataKind, runsInitialProps } = await getPagesRouteData(
+        r.filePath,
+        appRunsInitialProps,
+      );
+      return `  { pattern: ${JSON.stringify(r.pattern)}, patternParts: ${JSON.stringify(r.patternParts)}, isDynamic: ${r.isDynamic}, params: ${JSON.stringify(r.params)}, module: ${instrumentationPath ? "null" : `page_${i}`}, filePath: ${JSON.stringify(r.filePath)}, dataKind: ${JSON.stringify(dataKind)}, runsInitialProps: ${runsInitialProps} }`;
     }),
   );
 
@@ -399,7 +444,8 @@ export async function generateServerEntry(
   // all code within the Worker (same global scope).
   const instrumentationImportCode = instrumentationPath
     ? `import * as _instrumentation from ${JSON.stringify(instrumentationPath)};
-import { ensureInstrumentationRegistered as __ensureInstrumentationRegistered } from ${JSON.stringify(_instrumentationRuntimePath)};`
+import { ensureInstrumentationRegistered as __ensureInstrumentationRegistered } from ${JSON.stringify(_instrumentationRuntimePath)};
+import { shareIsolatePromise as __shareIsolatePromise } from ${JSON.stringify(_isolateSharedPromisePath)};`
     : "";
 
   const specialModuleInitializers = instrumentationPath
@@ -426,8 +472,8 @@ async function __initializeApplication() {
   _errorPageRoute.module = ErrorPageModule;
   _renderPage = __createRenderPage();
 }
-export function __ensureInstrumentation() {
-  return __applicationInitialization ??= __initializeApplication();
+export function __ensureInstrumentation(ctx) {
+  return __applicationInitialization ??= __shareIsolatePromise(__initializeApplication(), ctx);
 }`
     : "export function __ensureInstrumentation() {}";
   const openTelemetryLoaderCode = options.nodeOpenTelemetryLoader
@@ -458,7 +504,7 @@ if (process.env.VINEXT_PRERENDER !== "1" && !globalThis[__openTelemetryLoaderKey
     ? middlewarePath
       ? `
 export async function runMiddleware(request, ctx, options) {
-  ${instrumentationPath ? "await __ensureInstrumentation();" : ""}
+  ${instrumentationPath ? "await __ensureInstrumentation(ctx);" : ""}
   return __runGeneratedMiddleware({
     basePath: vinextConfig.basePath,
     ctx,
@@ -475,8 +521,8 @@ export async function runMiddleware(request, ctx, options) {
 }
 `
       : `
-export async function runMiddleware(request) {
-  ${instrumentationPath ? "await __ensureInstrumentation();" : ""}
+export async function runMiddleware(request, ctx) {
+  ${instrumentationPath ? "await __ensureInstrumentation(ctx);" : ""}
   return { continue: true };
 }
 `
@@ -487,7 +533,7 @@ export async function runMiddleware(request) {
   return `
 import ${JSON.stringify(_serverGlobalsPath)};
 import React from "react";
-import { renderToReadableStream } from "react-dom/server.edge";
+import { renderToReadableStream } from "react-dom/server";
 import { resetSSRHead, getSSRHeadHTML, setDocumentInitialHead } from "next/head";
 import { flushPreloads } from "next/dynamic";
 import Router, { setSSRContext, wrapWithRouterContext, getPagesNavigationIsReadyFromSerializedState } from "next/router";
@@ -740,7 +786,7 @@ function __createRenderPage() {
 ${instrumentationPath ? "let _renderPage;" : "const _renderPage = __createRenderPage();"}
 
 export async function renderPage(request, url, manifest, ctx, middlewareHeaders, options, initialResponseHeaders) {
-  ${instrumentationPath ? "await __ensureInstrumentation();" : ""}
+  ${instrumentationPath ? "await __ensureInstrumentation(ctx);" : ""}
   __registerConfiguredCacheAdapters();
   if (ctx) return _runWithExecutionContext(ctx, () => _renderPage(request, url, manifest, middlewareHeaders, options, initialResponseHeaders));
   return _renderPage(request, url, manifest, middlewareHeaders, options, initialResponseHeaders);
@@ -749,7 +795,7 @@ export async function renderPage(request, url, manifest, ctx, middlewareHeaders,
 
 
 export async function handleApiRoute(request, url, ctx, trustedRevalidateOrigin, edgeRuntime = "worker", initialResponseHeaders) {
-  ${instrumentationPath ? "await __ensureInstrumentation();" : ""}
+  ${instrumentationPath ? "await __ensureInstrumentation(ctx);" : ""}
   __registerConfiguredCacheAdapters();
   const match = matchRoute(url, apiRoutes);
   return __handlePagesApiRoute({
