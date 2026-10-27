@@ -558,6 +558,11 @@ export type ResolvedNextConfig = {
   /** Server globals injected into instrumentation.ts by wrapped webpack configs. */
   instrumentationServerValueInjections: Record<string, unknown>;
   cacheComponents: boolean;
+  /**
+   * `experimental.cachedNavigations`: lets the client cache the static stage of
+   * navigation responses. Requires `cacheComponents`.
+   */
+  cachedNavigations: boolean;
   appNavFailHandling: boolean;
   /**
    * Enables the experimental App Router gesture transition API:
@@ -1923,6 +1928,7 @@ export async function resolveNextConfig(
       resolveExtensions: null,
       serverResolveExtensions: null,
       cacheComponents: false,
+      cachedNavigations: false,
       appNavFailHandling: false,
       gestureTransition: false,
       prefetchInlining: false,
@@ -2156,8 +2162,10 @@ export async function resolveNextConfig(
   // Validate experimental.appShells co-flags. Next.js requires all of the
   // following to be enabled when appShells is true:
   //   cacheComponents, prefetchInlining, varyParams, optimisticRouting, cachedNavigations
-  // vinext does not yet implement varyParams, optimisticRouting, or cachedNavigations,
-  // so we warn when appShells is enabled and explain which co-flags are missing.
+  // vinext does not yet implement varyParams or optimisticRouting, and supports
+  // cachedNavigations only partially (it advertises staleTimes.static on
+  // unclaimed cache hits but has no static-stage client cache), so we warn when
+  // appShells is enabled and explain which co-flags are missing.
   const appShells = experimental?.appShells === true;
   if (appShells) {
     const missingCoFlags: string[] = [];
@@ -2356,6 +2364,7 @@ export async function resolveNextConfig(
     instrumentationClientRouteManifest: webpackProbe.instrumentationClientRouteManifest,
     instrumentationServerValueInjections: webpackProbe.instrumentationServerValueInjections,
     cacheComponents,
+    cachedNavigations: cacheComponents && experimental?.cachedNavigations === true,
     appNavFailHandling: experimental?.appNavFailHandling === true,
     gestureTransition: experimental?.gestureTransition === true,
     prefetchInlining,
