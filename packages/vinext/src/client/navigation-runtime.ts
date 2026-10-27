@@ -70,7 +70,7 @@ export type NavigationRuntimeNavigate = (
 ) => Promise<void>;
 
 export type NavigationRuntimeFunctions = {
-  clearNavigationCaches?: () => void;
+  clearNavigationCaches?: (options?: { pingVisibleLinks?: boolean }) => void;
   commitHashNavigation?: (
     href: string,
     historyUpdateMode: NavigationRuntimeHistoryUpdateMode,

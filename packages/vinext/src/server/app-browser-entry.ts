@@ -54,9 +54,11 @@ import {
   setPendingPathname,
   setMountedSlotsHeader,
   setNavigationContext,
+  trackAppRouterNavigationInFlight,
   useRouter,
   type CachedRscResponse,
   type ClientNavigationRenderSnapshot,
+  type InvalidatePrefetchCacheOptions,
   type PrefetchCacheEntry,
 } from "vinext/shims/navigation";
 import {
@@ -579,17 +581,17 @@ function clearVisitedResponseCache(): void {
   visitedResponseCache.clear();
 }
 
-function clearPrefetchState(): void {
-  invalidatePrefetchCache();
+function clearPrefetchState(options?: InvalidatePrefetchCacheOptions): void {
+  invalidatePrefetchCache(options);
   optimisticRouteTemplates.clear();
   optimisticRouteTemplateSources.clear();
   optimisticRouteTemplateLearning.clear();
 }
 
-function clearClientNavigationCaches(): void {
+function clearClientNavigationCaches(options?: InvalidatePrefetchCacheOptions): void {
   clientNavigationCacheGeneration += 1;
   clearVisitedResponseCache();
-  clearPrefetchState();
+  clearPrefetchState(options);
   historyController.invalidateRestorableClientState();
 }
 
@@ -2243,6 +2245,7 @@ function bootstrapHydration(
         historyController.isCurrentBfcacheVersion(
           activeTraversalIntent?.historyState ?? window.history.state,
         ));
+    const releaseNavigationInFlight = trackAppRouterNavigationInFlight();
     try {
       const shouldUsePendingRouterState = programmaticTransition;
       if (hasBrowserRouterState()) {
@@ -3111,6 +3114,7 @@ function bootstrapHydration(
       // settlePendingBrowserRouterState is idempotent via the settled flag.
       browserNavigationController.finalizeNavigation(navId, pendingRouterState);
       discardedServerActionRefreshScheduler.markNavigationSettled();
+      releaseNavigationInFlight();
       if (startedHardNavigation) {
         await waitForMpaNavigationRestore();
       }
