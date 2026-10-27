@@ -1,5 +1,5 @@
 import { decode as decodeQueryString } from "node:querystring";
-import { Readable, Writable } from "node:stream";
+import { Readable, Writable, Stream } from "node:stream";
 import { parseCookieHeader } from "../utils/parse-cookie.js";
 import { readStreamAsTextWithLimit } from "../utils/text-stream.js";
 import { DEFAULT_PAGES_API_BODY_SIZE_LIMIT } from "./pages-body-parser-config.js";
@@ -395,6 +395,22 @@ class PagesResponseStream extends Writable {
   }
 
   send(data: unknown): void {
+    // Next.js's sendData() ends 204/304 responses before it inspects the data,
+    // so a stream is never piped into them. Fetch also forbids a 205 body.
+    // resolveOnce() strips the headers.
+    if (NO_BODY_RESPONSE_STATUSES.has(this.resStatusCode)) {
+      this.end();
+      return;
+    }
+
+    if (data instanceof Stream) {
+      if (!this.resHeaders["content-type"]) {
+        this.resHeaders["content-type"] = "application/octet-stream";
+      }
+      data.pipe(this);
+      return;
+    }
+
     if (Buffer.isBuffer(data)) {
       if (!this.resHeaders["content-type"]) {
         this.resHeaders["content-type"] = "application/octet-stream";

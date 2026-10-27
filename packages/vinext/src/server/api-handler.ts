@@ -9,6 +9,7 @@
  */
 import "./server-globals.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { Stream } from "node:stream";
 import type { NextI18nConfig } from "../config/next-config.js";
 import { decode as decodeQueryString } from "node:querystring";
 import { Buffer } from "node:buffer";
@@ -338,6 +339,24 @@ function enhanceApiObjects(
     },
 
     send(this: NextApiResponse, data: unknown) {
+      // Next.js's sendData() ends 204/304 responses before it inspects the
+      // data, so a stream is never piped into them.
+      if (this.statusCode === 204 || this.statusCode === 304) {
+        this.removeHeader("Content-Type");
+        this.removeHeader("Content-Length");
+        this.removeHeader("Transfer-Encoding");
+        this.end();
+        return;
+      }
+
+      if (data instanceof Stream) {
+        if (!this.getHeader("Content-Type")) {
+          this.setHeader("Content-Type", "application/octet-stream");
+        }
+        data.pipe(this);
+        return;
+      }
+
       if (Buffer.isBuffer(data)) {
         if (!this.getHeader("Content-Type")) {
           this.setHeader("Content-Type", "application/octet-stream");
