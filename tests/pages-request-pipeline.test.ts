@@ -9,6 +9,7 @@ import {
 import { MIDDLEWARE_SKIP_HEADER } from "../packages/vinext/src/server/headers.js";
 import { PRERENDER_REVALIDATE_HEADER } from "../packages/vinext/src/utils/protocol-headers.js";
 import { runWithExecutionContext } from "../packages/vinext/src/shims/request-context.js";
+import { NextRequest } from "../packages/vinext/src/shims/server.js";
 import {
   CACHEABILITY_REQUEST_STATE,
   type RouteCacheabilityState,
@@ -1105,6 +1106,85 @@ describe("external proxy", () => {
     expect(result.response.status).toBe(200);
     mockFetch.mockRestore();
   });
+
+  // Every adapter (Node, dev, Workers) proxies through this pipeline. Next.js
+  // proxies a next.config external rewrite without the headers it staged, and
+  // sets the upstream's headers over a middleware rewrite's, keeping
+  // middleware's cookies ahead of the upstream's.
+  it.each([
+    {
+      rewrite: "config",
+      middlewareCookie: true,
+      cookies: ["middleware-cookie=1", "upstream-cookie=1"],
+      configHeader: null,
+      middlewareHeader: null,
+    },
+    {
+      rewrite: "middleware",
+      middlewareCookie: true,
+      cookies: ["middleware-cookie=1", "upstream-cookie=1"],
+      configHeader: "1",
+      middlewareHeader: "1",
+    },
+    {
+      rewrite: "middleware",
+      middlewareCookie: false,
+      cookies: ["upstream-cookie=1"],
+      configHeader: "1",
+      middlewareHeader: "1",
+    },
+  ])(
+    "applies staged headers to a $rewrite external rewrite like Next.js (middleware cookie: $middlewareCookie)",
+    async ({ rewrite, middlewareCookie, ...expected }) => {
+      const upstreamHeaders = new Headers({
+        "cache-control": "public, max-age=60",
+        "set-cookie": "upstream-cookie=1",
+      });
+      const result = await runPagesRequest(
+        makeRequest("/proxy-me"),
+        baseDeps({
+          configHeaders: [
+            {
+              source: "/proxy-me",
+              headers: [
+                { key: "Set-Cookie", value: "config-cookie=1" },
+                { key: "x-config-header", value: "1" },
+              ],
+            },
+          ],
+          configRewrites: {
+            beforeFiles:
+              rewrite === "config"
+                ? [{ source: "/proxy-me", destination: "https://upstream.example/" }]
+                : [],
+            afterFiles: [],
+            fallback: [],
+          },
+          proxyExternal: async () => new Response("upstream", { headers: upstreamHeaders }),
+          runMiddleware: makeMiddleware({
+            continue: true,
+            responseHeaders: new Headers([
+              ["cache-control", "private, max-age=7"],
+              ["x-mw-response-header", "1"],
+              ...(middlewareCookie
+                ? [["set-cookie", "middleware-cookie=1"] as [string, string]]
+                : []),
+            ]),
+            ...(rewrite === "middleware" ? { rewriteUrl: "https://upstream.example/" } : {}),
+          }),
+        }),
+      );
+
+      expect(result.type).toBe("response");
+      if (result.type !== "response") return;
+      expect({
+        cacheControl: result.response.headers.get("cache-control"),
+        cookies: result.response.headers.getSetCookie(),
+        configHeader: result.response.headers.get("x-config-header"),
+        middlewareHeader: result.response.headers.get("x-mw-response-header"),
+      }).toEqual({ cacheControl: "public, max-age=60", ...expected });
+    },
+  );
 });
 
 // 9. beforeFiles rewrite with external URL → {type:"response"} from proxy
@@ -1445,7 +1525,9 @@ describe("out-of-basePath rejection", () => {
     expect(result.response.status).toBe(404);
   });
 
-  it("allows requests outside basePath when beforeFiles rewrite fires", async () => {
+  // Next.js rejects this config when it loads it. At runtime, the destination
+  // is outside the basePath, so like Next.js' resolve-routes it resolves nothing.
+  it("rejects requests a basePath: false rewrite keeps outside basePath", async () => {
     const renderPage = makeRenderPage(200);
     const req = makeRequest("/outside");
     const result = await runPagesRequest(
@@ -1463,8 +1545,36 @@ describe("out-of-basePath rejection", () => {
     );
     expect(result.type).toBe("response");
     if (result.type !== "response") return;
-    expect(result.response.status).toBe(200);
+    expect(result.response.status).toBe(404);
+    expect(renderPage).not.toHaveBeenCalled();
   });
+
+  // The middleware rewrite destination's basePath decides, not the request's.
+  it.each([
+    { hadBasePath: false, rewriteHadBasePath: true, expectedStatus: 200 },
+    { hadBasePath: true, rewriteHadBasePath: false, expectedStatus: 404 },
+  ])(
+    "returns $expectedStatus when middleware rewrites a request (hadBasePath: $hadBasePath) to a destination with rewriteHadBasePath: $rewriteHadBasePath",
+    async ({ hadBasePath, rewriteHadBasePath, expectedStatus }) => {
+      const renderPage = makeRenderPage(200);
+      const matchApiRoute = vi.fn(async () => null);
+      const result = await runPagesRequest(
+        makeRequest("/source"),
+        baseDeps({
+          basePath: "/base",
+          hadBasePath,
+          hasMiddleware: true,
+          matchApiRoute,
+          runMiddleware: makeMiddleware({ rewriteUrl: "/inside", rewriteHadBasePath }),
+          renderPage,
+        }),
+      );
+      expect(result.type).toBe("response");
+      if (result.type !== "response") return;
+      expect(result.response.status).toBe(expectedStatus);
+      expect(renderPage).toHaveBeenCalledTimes(expectedStatus === 200 ? 1 : 0);
+    },
+  );
 });
 
 // 11. API route with renderPage absent → {type:"api"} intent
@@ -1512,6 +1622,35 @@ describe("API routes", () => {
     expect(result.apiUrl).toBe("/api/users");
     expect(result.configRewriteFired).toBe(true);
   });
+
+  // The middleware rewrite destination's basePath decides, not the request's.
+  it.each([
+    { hadBasePath: false, rewriteHadBasePath: true, reachesApi: true },
+    { hadBasePath: true, rewriteHadBasePath: false, reachesApi: false },
+  ])(
+    "reaches API routes when middleware rewrites (hadBasePath: $hadBasePath, rewriteHadBasePath: $rewriteHadBasePath): $reachesApi",
+    async ({ hadBasePath, rewriteHadBasePath, reachesApi }) => {
+      const result = await runPagesRequest(
+        makeRequest("/source"),
+        baseDeps({
+          basePath: "/base",
+          hadBasePath,
+          hasMiddleware: true,
+          runMiddleware: makeMiddleware({ rewriteUrl: "/api/users", rewriteHadBasePath }),
+        }),
+      );
+
+      if (reachesApi) {
+        expect(result.type).toBe("api");
+        if (result.type !== "api") return;
+        expect(result.apiUrl).toBe("/api/users");
+      } else {
+        expect(result.type).toBe("response");
+        if (result.type !== "response") return;
+        expect(result.response.status).toBe(404);
+      }
+    },
+  );
 
   // 12. API route with handleApi present → {type:"response"}
   it("returns response when handleApi present", async () => {
@@ -1744,6 +1883,7 @@ describe("serveFilesystemRoute", () => {
       "direct",
       "/robots.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -1765,6 +1905,74 @@ describe("serveFilesystemRoute", () => {
     expect(filesystemRequest.headers.get("if-none-match")).toBe('"override"');
     expect(filesystemRequest.headers.get("range")).toBeNull();
   });
+
+  // Next.js only serves filesystem items whose resolved pathname carries the
+  // basePath (filesystem.ts getItem), so adapters gate the image endpoint on it.
+  it.each([
+    [
+      "a middleware rewrite into basePath",
+      false,
+      { rewriteUrl: "/_next/image", rewriteHadBasePath: true },
+      [],
+      true,
+    ],
+    [
+      "a middleware rewrite outside basePath",
+      true,
+      { rewriteUrl: "/_next/image", rewriteHadBasePath: false },
+      [],
+      false,
+    ],
+    [
+      "a default beforeFiles rewrite",
+      true,
+      {},
+      [{ source: "/legacy", destination: "/_next/image" }],
+      true,
+    ],
+    [
+      "a basePath: false beforeFiles rewrite",
+      false,
+      {},
+      [{ source: "/legacy", destination: "/_next/image", basePath: false as const }],
+      false,
+    ],
+    [
+      "a default beforeFiles rewrite after a middleware rewrite outside basePath",
+      true,
+      { rewriteUrl: "/outside", rewriteHadBasePath: false },
+      [{ source: "/outside", destination: "/_next/image" }],
+      false,
+    ],
+    [
+      "a default beforeFiles rewrite after a middleware rewrite into basePath",
+      false,
+      { rewriteUrl: "/legacy", rewriteHadBasePath: true },
+      [{ source: "/legacy", destination: "/_next/image" }],
+      true,
+    ],
+  ])(
+    "reports whether %s keeps the basePath",
+    async (_name, hadBasePath, middlewareResult, beforeFiles, expected) => {
+      const serveFilesystemRoute = vi.fn(
+        async (..._args: Parameters<NonNullable<PagesPipelineDeps["serveFilesystemRoute"]>>) =>
+          true,
+      );
+      await runPagesRequest(
+        makeRequest("/legacy"),
+        baseDeps({
+          basePath: "/docs",
+          hadBasePath,
+          runMiddleware: makeMiddleware(middlewareResult),
+          configRewrites: { beforeFiles, afterFiles: [], fallback: [] },
+          serveFilesystemRoute,
+        }),
+      );
+      // Rules that don't match the current basePath state never reach the image endpoint.
+      const imageCall = serveFilesystemRoute.mock.calls.find((call) => call[0] === "/_next/image");
+      expect(imageCall?.[5] ?? false).toBe(expected);
+    },
+  );
 
   it.each([
     ["beforeFiles", null],
@@ -1796,6 +2004,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       destination,
       expect.any(Request),
+      true,
     );
   });
 
@@ -1849,6 +2058,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       "/file.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -1889,6 +2099,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       "/api/rewritten",
       expect.any(Request),
+      true,
     );
     expect(handleApi).toHaveBeenCalledWith(
       expect.any(Request),
@@ -1929,6 +2140,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       "/api/from-middleware",
       expect.any(Request),
+      true,
     );
     expect(handleApi).toHaveBeenCalledWith(
       expect.any(Request),
@@ -1963,6 +2175,7 @@ describe("serveFilesystemRoute", () => {
       "beforeFiles",
       "/asset.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -2074,6 +2287,7 @@ describe("afterFiles rewrites", () => {
       "afterFiles",
       "/file.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -2102,6 +2316,7 @@ describe("afterFiles rewrites", () => {
       "direct",
       "/after-control",
       expect.any(Request),
+      true,
     );
     expect(renderPage).toHaveBeenCalledWith(
       expect.any(Request),
@@ -2433,6 +2648,7 @@ describe("fallback rewrites on 404", () => {
       "fallback",
       "/file.txt",
       expect.any(Request),
+      true,
     );
   });
 
@@ -2710,6 +2926,20 @@ describe("wrapMiddlewareWithBasePath", () => {
     expect(mwReq.headers.get("x-test")).toBe("kept");
     expect(ctx).toBe("ctx");
     expect(opts).toEqual({ isDataRequest: true });
+  });
+
+  it("keeps Workers cf metadata on the middleware request", async () => {
+    const runMiddleware = makeMiddleware({ continue: true });
+    const wrapped = wrapMiddlewareWithBasePath(runMiddleware, "/root", true);
+    const cf = { country: "AU" };
+    const request = makeRequest("/dashboard", { "cf-connecting-ip": "203.0.113.10" });
+    Object.defineProperty(request, "cf", { value: cf, enumerable: true, configurable: true });
+    await wrapped(request, null, { isDataRequest: false });
+    const [mwReq] = runMiddleware.mock.calls[0];
+    expect(Reflect.get(mwReq, "cf")).toBe(cf);
+    const middlewareRequest = new NextRequest(mwReq);
+    expect(middlewareRequest.ip).toBe("203.0.113.10");
+    expect(middlewareRequest.geo?.country).toBe("AU");
   });
 
   it("does not double-add an already-present basePath (addBasePathToPathname is idempotent)", async () => {

@@ -41,11 +41,7 @@ import { registerConfiguredCacheAdapters } from "virtual:vinext-cache-adapters";
 import { applyCdnResponseIdentityHeaders, validateCdnRequest } from "./cache-control.js";
 // @ts-expect-error -- virtual module resolved by vinext at build time
 import { registerConfiguredImageOptimizer } from "virtual:vinext-image-adapters";
-import {
-  getImageOptimizer,
-  isImageOptimizationPath,
-  readImageOptimizationSignal,
-} from "./image-optimization.js";
+import { getImageOptimizer, readImageOptimizationSignal } from "./image-optimization.js";
 import { createStaticAssetRequest, resolveStaticAssetSignal } from "./worker-utils.js";
 import { resolveClientBuildFile } from "./client-build-files.js";
 import {
@@ -114,7 +110,7 @@ export default {
     ctx?: ExecutionContextLike & VinextRequestStageContext,
   ): Promise<Response> {
     const handleFetch = async () => {
-      await __ensureInstrumentation();
+      await __ensureInstrumentation(ctx);
       const url = new URL(request.url);
       return traceFrameworkRequest({
         callback: async () =>
@@ -152,7 +148,7 @@ async function handleRequest(
   let ctx = createWorkerPrerenderDiscoveryContext(requestCtx, request, __rscPrerenderSecret);
   const readinessResponse = createWorkerPrerenderReadinessResponse(ctx, request);
   if (readinessResponse) {
-    if (readinessResponse.status === 204) await __ensureHybridPagesApplication();
+    if (readinessResponse.status === 204) await __ensureHybridPagesApplication(ctx);
     return (await validateCdnRequest(request)) ?? readinessResponse;
   }
   let finalizeCacheabilityResponse:
@@ -178,7 +174,7 @@ async function handleRequest(
       const probeUrl = new URL(request.url);
       if (probeUrl.searchParams.has(VINEXT_CACHEABILITY_PROBE_QUERY_PARAM)) {
         probeUrl.searchParams.delete(VINEXT_CACHEABILITY_PROBE_QUERY_PARAM);
-        request = new Request(probeUrl, request);
+        request = cloneRequestWithUrl(request, probeUrl.href);
       }
     }
   }
@@ -216,19 +212,6 @@ async function handleRequest(
   // The image endpoint runs through middleware and rewrites like any request;
   // the handler then signals that the Worker may serve the image itself.
   const servesImages = Boolean(assets) && getImageOptimizer() !== null;
-  // vinext's next/image emits the endpoint without the basePath, where Next.js
-  // prefixes it. Admit that form as the basePath endpoint and resolve its
-  // unprefixed sources under the basePath, as the Node server does.
-  const imageEndpointBasePath =
-    servesImages && __workerBasePath && isImageOptimizationPath(url.pathname)
-      ? __workerBasePath
-      : "";
-  if (imageEndpointBasePath) {
-    request = cloneRequestWithUrl(
-      request,
-      new URL(imageEndpointBasePath + url.pathname + url.search, url).href,
-    );
-  }
 
   // Redirect repeated slashes / backslashes like Next.js (//evil.com/ →
   // /evil.com/) and block encoded protocol-relative shapes (/%5Cevil.com/,
@@ -325,7 +308,6 @@ async function handleRequest(
           basePath: __workerBasePath,
           assetPathPrefix: __workerAssetPathPrefix,
           clientBuildFiles: __workerClientBuildFiles,
-          sourceBasePath: imageEndpointBasePath,
           // The source runs outside this request's cacheability context.
           fetchPublicFile: async (sourceRequest) => {
             const sourceResult = await runWithExecutionContext(requestCtx, () =>

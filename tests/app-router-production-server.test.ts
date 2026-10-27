@@ -14,7 +14,9 @@ import {
 import {
   APP_FIXTURE_DIR,
   createIsolatedFixture,
+  EXTERNAL_REWRITE_HEADER_CASES,
   expectRepeatedSlashRedirects,
+  requestExternalRewriteHeaders,
   testCacheDir,
 } from "./helpers.js";
 
@@ -83,7 +85,7 @@ function getInlineStyleText(html: string): string {
 
 async function rawHttpRequest(
   url: URL,
-  options: { method?: string; headers?: Record<string, string> } = {},
+  options: { method?: string; path?: string; headers?: Record<string, string> } = {},
 ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> {
   return new Promise((resolve, reject) => {
     const request = http.request(url, options, (response) => {
@@ -432,6 +434,139 @@ describe("App Router Production server (startProdServer)", () => {
     await expectRepeatedSlashRedirects(baseUrl);
   });
 
+  // Without VINEXT_TRUST_PROXY / VINEXT_TRUSTED_HOSTS, any client can send
+  // these headers to the Node server, so NextRequest.ip / .geo must not
+  // report them.
+  it("ignores client-supplied IP and geo headers without proxy trust", async () => {
+    const res = await fetch(`${baseUrl}/api/request-ip-geo`, {
+      headers: {
+        "cf-connecting-ip": "10.0.0.1",
+        "x-real-ip": "10.0.0.2",
+        "x-forwarded-for": "10.0.0.3, 10.0.0.4",
+        "cf-ipcountry": "US",
+        "cf-ipcity": "San Francisco",
+        "x-vercel-ip-country": "US",
+      },
+    });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ ip: null, geo: null });
+  });
+
+  // Next.js writes middleware response headers before the handler runs and
+  // appends the handler's Set-Cookie afterwards, so the browser keeps the
+  // handler's cookie when middleware refreshes the same one.
+  it.each([
+    { method: "POST", status: 200, session: /^session=; / },
+    { method: "PUT", status: 200, session: /^session=rotated; / },
+    { method: "DELETE", status: 307, session: /^session=; / },
+  ])(
+    "orders a route handler's $method cookie after middleware's refresh of it",
+    async ({ method, status, session }) => {
+      const res = await fetch(`${baseUrl}/api/session-refresh`, {
+        method,
+        headers: { cookie: "session=old" },
+        redirect: "manual",
+      });
+      expect(res.status).toBe(status);
+      const sessionCookies = res.headers
+        .getSetCookie()
+        .filter((cookie) => cookie.startsWith("session="));
+      expect(sessionCookies).toHaveLength(2);
+      expect(sessionCookies[0]).toMatch(/^session=old; .*Max-Age=600/);
+      expect(sessionCookies[1]).toMatch(session);
+    },
+  );
+
+  // Next.js's send-response keeps a route handler's WWW-Authenticate and
+  // Proxy-Authenticate values after middleware's; singular headers stay
+  // middleware-owned.
+  it("keeps a route handler's authentication challenges after middleware's", async () => {
+    const res = await fetch(`${baseUrl}/api/auth-challenge`);
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toBe(
+      'Basic realm="middleware", Bearer realm="handler"',
+    );
+    expect(res.headers.get("proxy-authenticate")).toBe(
+      'Basic realm="middleware", Bearer realm="handler"',
+    );
+    expect(res.headers.get("x-auth-source")).toBe("middleware");
+  });
+
+  it("never joins a hybrid Pages API route's challenge to middleware's", async () => {
+    const res = await fetch(`${baseUrl}/api/pages-auth-challenge`);
+    expect(res.status).toBe(401);
+    // Next.js lets the handler's setHeader() replace middleware's challenge.
+    expect(['Basic realm="middleware"', 'Bearer realm="handler"']).toContain(
+      res.headers.get("www-authenticate"),
+    );
+  });
+
+  // Next.js proxies a next.config external rewrite without the headers it
+  // staged, and sets the upstream's headers over a middleware rewrite's.
+  it.each(EXTERNAL_REWRITE_HEADER_CASES)(
+    "applies config and middleware headers to external rewrites like Next.js for $path",
+    async ({ path: requestPath, ...expected }) => {
+      expect(await requestExternalRewriteHeaders(baseUrl, requestPath)).toEqual({
+        status: 200,
+        cacheControl: "public, max-age=60",
+        upstreamHeader: "1",
+        ...expected,
+      });
+    },
+  );
+
+  // Next.js stages next.config headers before middleware: a config Set-Cookie
+  // precedes the response's own cookies, and middleware's cookie replaces it.
+  it.each([
+    {
+      path: "/api/config-cookie",
+      cookies: ["config-cookie=1; Path=/", "handler-cookie=1; Path=/"],
+    },
+    {
+      path: "/api/config-cookie?empty-middleware-cookie",
+      cookies: ["config-cookie=1; Path=/", "handler-cookie=1; Path=/"],
+    },
+    {
+      path: "/api/config-cookie?middleware-cookie",
+      cookies: ["middleware-cookie=1; Path=/", "handler-cookie=1; Path=/"],
+    },
+    { path: "/config-cookie-redirect", cookies: ["config-cookie=1; Path=/"] },
+    { path: "/config-cookie-redirect?middleware-cookie", cookies: ["middleware-cookie=1; Path=/"] },
+    {
+      path: "/config-cookie-redirect?empty-middleware-cookie",
+      cookies: ["config-cookie=1; Path=/"],
+    },
+    {
+      path: "/config-cookie-response?empty-middleware-cookie",
+      cookies: ["config-cookie=1; Path=/"],
+    },
+    { path: "/config-cookie-response", cookies: ["config-cookie=1; Path=/"] },
+    { path: "/config-cookie-response?middleware-cookie", cookies: ["middleware-cookie=1; Path=/"] },
+  ])("orders next.config Set-Cookie like Next.js for $path", async ({ path, cookies }) => {
+    // Read raw headers: fetch() hides an empty Set-Cookie line.
+    const rawCookies = await new Promise<string[]>((resolve, reject) => {
+      http
+        .get(`${baseUrl}${path}`, (res) => {
+          res.resume();
+          resolve(res.headers["set-cookie"] ?? []);
+        })
+        .on("error", reject);
+    });
+    expect(rawCookies).toEqual(cookies);
+  });
+
+  it("never lets an absolute-form request target choose the request origin", async () => {
+    // `/middleware-redirect` answers `NextResponse.redirect(new URL("/about",
+    // request.url))`, so routing this request would echo the target's origin.
+    const res = await rawHttpRequest(new URL(baseUrl), {
+      path: "http://evil.example/middleware-redirect",
+      headers: { host: "app.example" },
+    });
+    expect(res.status).toBe(404);
+    expect(res.headers.location).toBeUndefined();
+    expect(res.body.toString()).not.toContain("evil.example");
+  });
+
   it("never turns a same-origin double-slash middleware redirect protocol-relative", async () => {
     const res = await fetch(`${baseUrl}/middleware-redirect-double-slash`, { redirect: "manual" });
     expect(res.status).toBe(307);
@@ -623,6 +758,28 @@ describe("App Router Production server (startProdServer)", () => {
     });
     expect(forcedRange.status).toBe(206);
     expect(forcedRange.body).toEqual(full.body.subarray(0, 3));
+  });
+
+  // https://github.com/cloudflare/vinext/issues/3919
+  it("fails a dynamic = 'error' page that passes searchParams to a client component", async () => {
+    // Like Next.js, React's read of the prop's `then` fails the render, so the
+    // response must finish as an error instead of leaving the stream open.
+    const readBody = (res: Response) =>
+      Promise.race([
+        res.text(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("response body did not finish")), 5_000),
+        ),
+      ]);
+    const pathname = "/nextjs-compat/dynamic-error-client-search-params/client-prop";
+    const rsc = await fetch(`${baseUrl}${pathname}.rsc?foo=bar`, { headers: { RSC: "1" } });
+    await expect(readBody(rsc)).resolves.toBeTypeOf("string");
+
+    const res = await fetch(`${baseUrl}${pathname}?foo=bar`);
+    expect(res.status).toBe(500);
+    const html = await readBody(res);
+    expect(html).toContain("</html>");
+    expect(html).not.toContain('data-testid="search-params-label"');
   });
 
   // Ported from Next.js: test/e2e/app-dir/app-static/app-static.test.ts
@@ -1027,12 +1184,18 @@ describe("App Router Production server (startProdServer)", () => {
     // of its own, its script preload links must not follow the text, or React
     // leaves a `<!-- -->` separator in their place, which Next.js doesn't emit.
     expect(html).toMatch(/<div>Index<p id="dynamic-use-id">/);
-    // The component's script preload is still rendered (and hoisted).
+    // The component's script preload is still rendered (and hoisted). Client
+    // file names are hash-only, so find the chunk through the build manifest.
+    const clientManifest = JSON.parse(
+      fs.readFileSync(path.join(outDir, "client", ".vite", "manifest.json"), "utf8"),
+    ) as Record<string, { file: string }>;
+    const useIdKey = Object.keys(clientManifest).find((key) => key.endsWith("/use-id-field.tsx"));
+    expect(useIdKey).toBeDefined();
     const dynamicScriptPreloads = (html.match(/<link\b[^>]*>/g) ?? []).filter(
       (tag) =>
         /\brel="modulepreload"/.test(tag) &&
         /\bfetchpriority="low"/i.test(tag) &&
-        /use-id-field[^"]*\.js"/.test(tag),
+        tag.includes(`href="/${clientManifest[useIdKey!].file}"`),
     );
     expect(dynamicScriptPreloads).toHaveLength(1);
   });
@@ -1291,23 +1454,36 @@ describe("App Router Production server (startProdServer)", () => {
         );
 
         const html = await res.text();
-        const dynamicScriptPreloads = (html.match(/<link\b[^>]*>/g) ?? []).filter(
-          (tag) =>
-            /\bfetchpriority="low"/i.test(tag) &&
-            tag.includes('nonce="vinext-test-nonce"') &&
-            tag.includes("https://cdn.example.com/_next/static/chunks/"),
-        );
+        const lowPriorityScriptPreloads = (page: string) =>
+          (page.match(/<link\b[^>]*>/g) ?? []).filter(
+            (tag) =>
+              /\bfetchpriority="low"/i.test(tag) &&
+              tag.includes("https://cdn.example.com/_next/static/chunks/"),
+          );
+        const dynamicScriptPreloads = lowPriorityScriptPreloads(html);
 
-        expect(dynamicScriptPreloads.length).toBeGreaterThan(0);
+        // next/dynamic's links, and client references' hints, which leave `as` out.
+        expect(dynamicScriptPreloads.filter((tag) => tag.includes('as="script"'))).not.toEqual([]);
+        expect(dynamicScriptPreloads.filter((tag) => !tag.includes('as="script"'))).not.toEqual([]);
         for (const tag of dynamicScriptPreloads) {
           expect(tag).toMatch(
             /\bhref="https:\/\/cdn\.example\.com\/_next\/static\/chunks\/[^"]+\.js"/,
           );
+          expect(tag).toContain('nonce="vinext-test-nonce"');
           expect(tag).toContain(`crossorigin="${expectedCrossOrigin}"`);
         }
 
-        // @vitejs/plugin-rsc owns additional client-reference hints. This parity port covers
-        // the bootstrap and next/dynamic assets emitted by vinext in this PR.
+        // Without a nonce too.
+        const unnoncedHtml = await (await fetch(`${tmpBaseUrl}/nextjs-compat/dynamic`)).text();
+        const unnoncedScriptPreloads = lowPriorityScriptPreloads(unnoncedHtml);
+        expect(unnoncedScriptPreloads.length).toBe(dynamicScriptPreloads.length);
+        for (const tag of unnoncedScriptPreloads) {
+          expect(tag).not.toContain("nonce=");
+          expect(tag).toContain(`crossorigin="${expectedCrossOrigin}"`);
+        }
+
+        // Client-reference stylesheets keep plugin-rsc's crossOrigin. This
+        // parity port covers the scripts and next/dynamic assets.
         const cdnAssetScripts = (html.match(/<script\b[^>]*>/g) ?? []).filter((tag) =>
           tag.includes('src="https://cdn.example.com/_next/static/'),
         );
@@ -1344,6 +1520,21 @@ describe("App Router Production server (startProdServer)", () => {
         for (const tag of dynamicStylesheets) {
           expect(tag).toContain('nonce="vinext-test-nonce"');
           expect(tag).not.toContain('as="style"');
+          expect(tag).toContain(`crossorigin="${expectedCrossOrigin}"`);
+        }
+
+        // Anonymous when unset, unlike Next.js: Vite's preload helper links a
+        // lazily imported component's stylesheet as anonymous, which would
+        // fail the CORS check on a no-cors copy the browser cached.
+        const bannerHtml = await (await fetch(`${tmpBaseUrl}/cookie-notice-chunks`)).text();
+        expect(bannerHtml).toContain('data-testid="consent-banner"');
+        const clientStylesheets = (bannerHtml.match(/<link\b[^>]*>/g) ?? []).filter(
+          (tag) =>
+            /\brel="stylesheet"/.test(tag) &&
+            tag.includes('data-precedence="vite-rsc/client-reference"'),
+        );
+        expect(clientStylesheets).not.toEqual([]);
+        for (const tag of clientStylesheets) {
           expect(tag).toContain(`crossorigin="${expectedCrossOrigin}"`);
         }
       } finally {
@@ -1467,6 +1658,19 @@ describe("App Router Production server (startProdServer)", () => {
     expect(res.headers.get("content-type")).toContain("image/png");
     expect(res.headers.get("x-mw-ran")).toBe("true");
     expect((await res.blob()).size).toBeGreaterThan(0);
+  });
+
+  it("supports res.appendHeader in Pages API routes after middleware cookies in hybrid production", async () => {
+    const res = await fetch(`${baseUrl}/api/pages-append-header`);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.getSetCookie()).toEqual(["mw=1; Path=/", "h=1; Path=/"]);
+    expect(res.headers.get("x-multi")).toBe("a, b");
+    await expect(res.json()).resolves.toEqual({
+      ok: true,
+      multi: ["a", "b"],
+      headersMulti: ["a", "b"],
+    });
   });
 
   it("serves dynamic routes", async () => {
@@ -1824,6 +2028,12 @@ describe("App Router Production server (startProdServer)", () => {
     expect(location).toContain("/about");
   });
 
+  it("answers a config redirect with its statusCode (production)", async () => {
+    const res = await fetch(`${baseUrl}/config-redirect-status-code`, { redirect: "manual" });
+    expect(res.status).toBe(301);
+    expect(res.headers.get("location")).toMatch(/\/about$/);
+  });
+
   // Issue #1529: an RSC client navigation that hits a next.config.js redirect
   // must keep the cache-busting `_rsc` query on the redirect Location so the
   // browser's auto-followed request to the destination is still treated as an
@@ -2001,22 +2211,26 @@ describe("App Router Production server (startProdServer)", () => {
       const withoutBasePathRes = await fetch(`${tmpBaseUrl}/logo/logo.svg`);
       expect(withoutBasePathRes.status).toBe(404);
 
-      // Middleware runs before the image endpoint reads a source, in both the
-      // Next.js form and the unprefixed form vinext's next/image emits.
-      for (const imagePath of [
-        "/app/_next/image?url=%2Fimage-endpoint-guarded.png&w=640&q=75",
-        "/_next/image?url=%2Fimage-endpoint-guarded.png&w=640&q=75",
-      ]) {
-        const imageRes = await fetch(`${tmpBaseUrl}${imagePath}`);
-        expect(imageRes.status, imagePath).toBe(403);
-        expect(await imageRes.text(), imagePath).toBe("image endpoint blocked by middleware");
-      }
-      const imageRes = await fetch(`${tmpBaseUrl}/_next/image?url=%2Fheart.png&w=640&q=75`);
+      // Next.js serves the image endpoint only under basePath, and middleware
+      // runs before it reads a source, which must carry the basePath itself.
+      const guardedRes = await fetch(
+        `${tmpBaseUrl}/app/_next/image?url=%2Fimage-endpoint-guarded.png&w=640&q=75`,
+      );
+      expect(guardedRes.status).toBe(403);
+      expect(await guardedRes.text()).toBe("image endpoint blocked by middleware");
+      const unprefixedRes = await fetch(
+        `${tmpBaseUrl}/_next/image?url=%2Fapp%2Fheart.png&w=640&q=75`,
+      );
+      expect(unprefixedRes.status).toBe(404);
+      await unprefixedRes.arrayBuffer();
+      const imageRes = await fetch(
+        `${tmpBaseUrl}/app/_next/image?url=%2Fapp%2Fheart.png&w=640&q=75`,
+      );
       expect(imageRes.status).toBe(200);
       expect(imageRes.headers.get("content-type")).toBe("image/png");
       await imageRes.arrayBuffer();
       const protectedImageRes = await fetch(
-        `${tmpBaseUrl}/_next/image?url=%2Fmembers%20only%2Fprivate.png&w=640&q=75`,
+        `${tmpBaseUrl}/app/_next/image?url=%2Fapp%2Fmembers%20only%2Fprivate.png&w=640&q=75`,
       );
       expect(protectedImageRes.status).toBe(400);
       expect(await protectedImageRes.text()).toBe("The requested resource isn't a valid image.");
@@ -2200,8 +2414,16 @@ describe("App Router Production server (startProdServer)", () => {
     expect(response.status).toBe(200);
 
     const html = await response.text();
-    expect(html.match(/<title>/g) ?? []).toHaveLength(1);
-    expect(html).toContain("<title>Streamed not-found metadata</title>");
+    // Count title elements like Next's cheerio assertion does: the inline RSC
+    // payload scripts carry the same markup as text.
+    const markup = html
+      .split("<script")
+      .map((part, index) =>
+        index === 0 ? part : part.slice(part.indexOf("</script>") + "</script>".length),
+      )
+      .join("");
+    expect(markup.match(/<title>/g) ?? []).toHaveLength(1);
+    expect(markup).toContain("<title>Streamed not-found metadata</title>");
 
     const rscResponse = await fetch(`${baseUrl}/metadata-streaming-not-found.rsc`, {
       headers: { Accept: "text/x-component", RSC: "1", "user-agent": "HeadlessChrome" },
@@ -2685,6 +2907,83 @@ describe("App Router Production server (startProdServer)", () => {
 
     expect(freshRes.headers.get("x-vinext-cache")).toBe("HIT");
     expect(freshBody.timestamp).not.toBe(coldBody.timestamp);
+  });
+
+  // Next.js keeps a page's document and RSC payload in one entry, so an RSC
+  // request that finds it stale regenerates the document too.
+  // https://github.com/vercel/next.js/blob/v16.2.7/packages/next/src/build/templates/app-page.ts
+  it("App Router ISR: a stale RSC request regenerates the page's document too", async () => {
+    const readTimestamp = (html: string) =>
+      html.replaceAll("<!-- -->", "").match(/data-testid="timestamp"[^>]*>(\d+)/)?.[1];
+    const fetchRsc = () =>
+      fetch(`${baseUrl}/isr-test.rsc`, { headers: { Accept: "text/x-component", RSC: "1" } });
+
+    // An HTML render stores both entries; let them go stale (revalidate = 1).
+    const filled = await fetch(`${baseUrl}/isr-test`);
+    const filledTimestamp = readTimestamp(await filled.text());
+    expect(filledTimestamp).toBeTruthy();
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    // Only RSC requests reach the page until its RSC entry regenerates.
+    const stale = await fetchRsc();
+    await stale.arrayBuffer();
+    expect(stale.headers.get("x-vinext-cache")).toBe("STALE");
+    await waitForCondition(
+      async () => {
+        const res = await fetchRsc();
+        await res.arrayBuffer();
+        return res.headers.get("x-vinext-cache") === "HIT";
+      },
+      { timeoutMs: 5000 },
+    );
+
+    const document = await fetch(`${baseUrl}/isr-test`);
+    const documentTimestamp = readTimestamp(await document.text());
+    expect(documentTimestamp).toBeTruthy();
+    expect(documentTimestamp).not.toBe(filledTimestamp);
+  });
+
+  // Next.js keeps a page's document and RSC payload in one entry, so an RSC
+  // miss stores the document too.
+  // https://github.com/vercel/next.js/blob/v16.2.7/packages/next/src/build/templates/app-page.ts
+  it("App Router ISR: an RSC miss stores the page's document too", async () => {
+    const pathname = "/route-cache-identity/rsc-miss-document";
+    const fetchRsc = () =>
+      fetch(`${baseUrl}${pathname}.rsc`, { headers: { Accept: "text/x-component", RSC: "1" } });
+    const miss = await fetchRsc();
+    await miss.arrayBuffer();
+    expect(miss.headers.get("x-vinext-cache")).toBe("MISS");
+    await waitForCondition(async () => {
+      const res = await fetchRsc();
+      await res.arrayBuffer();
+      return res.headers.get("x-vinext-cache") === "HIT";
+    });
+
+    const document = await fetch(`${baseUrl}${pathname}`);
+    expect(document.headers.get("x-vinext-cache")).toBe("HIT");
+    expect(await document.text()).toContain("CACHE_IDENTITY_CATCH_ALL:<!-- -->rsc-miss-document");
+  });
+
+  // Next.js prerenders a page's document beside its payload, so a client page
+  // that reads its searchParams makes the route dynamic. An RSC miss renders
+  // the document too, so it stores neither part.
+  it("App Router ISR: an RSC miss for a client page that reads searchParams stores nothing", async () => {
+    const pathname = "/client-page-search-params";
+    const fetchRsc = (q: string) =>
+      fetch(`${baseUrl}${pathname}.rsc?q=${q}`, {
+        headers: { Accept: "text/x-component", RSC: "1" },
+      });
+    const miss = await fetchRsc("first");
+    await miss.arrayBuffer();
+    // Give the background cache write time to settle.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    const rsc = await fetchRsc("second");
+    await rsc.arrayBuffer();
+    expect(rsc.headers.get("x-vinext-cache")).not.toBe("HIT");
+    const document = await fetch(`${baseUrl}${pathname}?q=document`);
+    expect(document.headers.get("x-vinext-cache")).not.toBe("HIT");
+    expect(await document.text()).toContain('data-testid="client-page-search-params-q">document<');
   });
 
   it("route handler ISR: auto-HEAD returns cached headers with empty body", async () => {

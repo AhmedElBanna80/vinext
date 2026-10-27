@@ -15,9 +15,9 @@ import {
   NEXT_ROUTER_STATE_TREE_HEADER,
   NEXT_URL_HEADER,
   RSC_HEADER,
-  VINEXT_CLIENT_REUSE_MANIFEST_HEADER,
   VINEXT_INTERCEPTION_CONTEXT_HEADER,
   VINEXT_INTERCEPTION_ID_HEADER,
+  VINEXT_MOUNTED_LAYOUTS_HEADER,
   VINEXT_MOUNTED_SLOTS_HEADER,
   NEXTJS_DEPLOYMENT_ID_HEADER,
   VINEXT_RSC_RENDER_MODE_HEADER,
@@ -43,10 +43,10 @@ const CACHE_BUSTING_DIGEST_BYTES = 12;
 const textEncoder = new TextEncoder();
 
 type CreateRscRequestHeadersOptions = {
-  clientReuseManifestHeader?: string | null;
   interceptionContext?: string | null;
   interceptionId?: string | null;
   mountedSlotsHeader?: string | null;
+  mountedLayoutsHeader?: string | null;
   includePrefetchHeader?: boolean;
   renderMode?: AppRscRenderMode;
   fetchPriority?: "auto" | "high" | "low";
@@ -373,12 +373,10 @@ export function createRscRequestHeaders(options: CreateRscRequestHeadersOptions 
   if (options.mountedSlotsHeader !== undefined && options.mountedSlotsHeader !== null) {
     headers.set(VINEXT_MOUNTED_SLOTS_HEADER, options.mountedSlotsHeader);
   }
-
-  if (
-    options.clientReuseManifestHeader !== undefined &&
-    options.clientReuseManifestHeader !== null
-  ) {
-    headers.set(VINEXT_CLIENT_REUSE_MANIFEST_HEADER, options.clientReuseManifestHeader);
+  // Not part of the cache-busting hash: only a render that's never stored
+  // reads it (see app-mounted-layouts.ts).
+  if (options.mountedLayoutsHeader !== undefined && options.mountedLayoutsHeader !== null) {
+    headers.set(VINEXT_MOUNTED_LAYOUTS_HEADER, options.mountedLayoutsHeader);
   }
 
   const renderMode = options.renderMode ?? APP_RSC_RENDER_MODE_NAVIGATION;
@@ -408,8 +406,8 @@ export function canonicalizePrewarmableRscRequestHeaders(headers: Headers): bool
   headers.delete(NEXT_ROUTER_SEGMENT_PREFETCH_HEADER);
   headers.delete(NEXT_ROUTER_STATE_TREE_HEADER);
   headers.delete(NEXT_URL_HEADER);
+  headers.delete(VINEXT_MOUNTED_LAYOUTS_HEADER);
   headers.delete(VINEXT_RSC_STATE_FINGERPRINT_HEADER);
-  headers.delete(VINEXT_CLIENT_REUSE_MANIFEST_HEADER);
   return true;
 }
 
@@ -432,19 +430,43 @@ export function canonicalizeLoadingShellRscRequestHeaders(headers: Headers): boo
   headers.set(NEXT_ROUTER_SEGMENT_PREFETCH_HEADER, "1");
   headers.delete(NEXT_ROUTER_STATE_TREE_HEADER);
   headers.delete(NEXT_URL_HEADER);
+  headers.delete(VINEXT_MOUNTED_LAYOUTS_HEADER);
   headers.delete(VINEXT_RSC_STATE_FINGERPRINT_HEADER);
-  headers.delete(VINEXT_CLIENT_REUSE_MANIFEST_HEADER);
   return true;
 }
 
-function toRscRequestPath(href: string): string {
+const RSC_REQUEST_URL_BASE = "http://vinext.local";
+
+/**
+ * Callers pass a path (usually a parsed URL's pathname + search) or an
+ * absolute URL. A pathname can begin with "//", and resolving that as a
+ * relative reference would read its first segment as a host, so a path is
+ * appended to the base instead of resolved against it.
+ */
+export function parseRscRequestPath(href: string): URL {
   const hashIndex = href.indexOf("#");
   const beforeHash = hashIndex === -1 ? href : href.slice(0, hashIndex);
-  return beforeHash;
+  if (beforeHash.startsWith("/") || beforeHash.startsWith("\\")) {
+    return new URL(`${RSC_REQUEST_URL_BASE}${beforeHash}`);
+  }
+  return new URL(beforeHash, RSC_REQUEST_URL_BASE);
+}
+
+/**
+ * Serialize the path-absolute reference callers fetch against the app origin.
+ * A pathname that begins with "//" would serialize as a protocol-relative URL
+ * and send the request to another host, so it keeps a "/." prefix, as the
+ * WHATWG URL serializer does. URL resolution drops the dot segment, so the
+ * request still targets the same pathname on the app origin, as Next.js's
+ * full-URL fetch does.
+ */
+export function formatRscRequestPath(url: URL): string {
+  const pathname = url.pathname.startsWith("//") ? `/.${url.pathname}` : url.pathname;
+  return `${pathname}${url.search}`;
 }
 
 export async function createRscRequestUrl(href: string, headers: Headers): Promise<string> {
-  const url = new URL(toRscRequestPath(href), "http://vinext.local");
+  const url = parseRscRequestPath(href);
   if (
     typeof window !== "undefined" &&
     process.env.NODE_ENV === "production" &&
@@ -462,25 +484,22 @@ export async function createRscRequestUrl(href: string, headers: Headers): Promi
     } else {
       url.pathname += isBasePathRoot ? "/index.txt" : ".txt";
     }
-    return `${url.pathname}${url.search}`;
+    return formatRscRequestPath(url);
   }
   const hash = await computeRscCacheBustingSearchParam(headers);
   setRscCacheBustingSearchParam(url, hash);
-  return `${url.pathname}${url.search}`;
+  return formatRscRequestPath(url);
 }
 
 /** Build the definitive full-route RSC URL shared by prefetch and navigation. */
 export function createCanonicalRscRequestUrl(href: string): string {
-  const url = new URL(toRscRequestPath(href), "http://vinext.local");
+  const url = parseRscRequestPath(href);
   setRscCacheBustingSearchParam(url, "");
-  return `${url.pathname}${url.search}`;
+  return formatRscRequestPath(url);
 }
 
 export function createServerActionRequestUrl(href: string): string {
-  const hashIndex = href.indexOf("#");
-  const beforeHash = hashIndex === -1 ? href : href.slice(0, hashIndex);
-  const url = new URL(beforeHash, "http://vinext.local");
-  return `${url.pathname}${url.search}`;
+  return formatRscRequestPath(parseRscRequestPath(href));
 }
 
 export async function createRscRedirectLocation(

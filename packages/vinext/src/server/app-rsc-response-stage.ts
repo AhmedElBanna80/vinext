@@ -35,6 +35,10 @@ import {
   VINEXT_RSC_CACHE_BUSTING_SEARCH_PARAM,
 } from "./app-rsc-cache-busting.js";
 import { VINEXT_REVALIDATE_HOST_HEADER } from "./headers.js";
+import {
+  isOnDemandRevalidateRequest,
+  PRERENDER_REVALIDATE_HEADER,
+} from "./revalidation-request.js";
 import { buildPageCacheTags } from "./implicit-tags.js";
 import { traceAppPageRender } from "./app-page-tracing.js";
 import { getRenderedConcreteUrlPathsForRoute } from "./pregenerated-concrete-paths.js";
@@ -160,12 +164,14 @@ export async function renderAppWorkerResponseStage<TRoute extends AppRscHandlerR
   if (props.kind === "app-full-request") {
     return new Response("Invalid vinext App response stage", { status: 400 });
   }
+  // Read before cloning, like the full App RSC lifecycle: route handlers
+  // follow this signal directly instead of the clone chain below.
+  const rawRequestSignal = rawRequest.signal;
   options.registerCacheAdapters();
-  await options.ensureInstrumentation?.();
-
   const executionContext = isExecutionContextLike(ctx)
     ? ctx
     : (getRequestExecutionContext() ?? null);
+  await options.ensureInstrumentation?.(executionContext);
   const filteredHeaders = executionContext?.isInternalPagesRevalidation
     ? new Headers(rawRequest.headers)
     : filterInternalHeaders(rawRequest.headers);
@@ -236,6 +242,12 @@ export async function renderAppWorkerResponseStage<TRoute extends AppRscHandlerR
   const requestContext = createRequestContext({
     headersContext,
     executionContext,
+    // Like Next.js's work store, an authorized on-demand revalidation makes
+    // the data caches skip their reads for the whole request.
+    isOnDemandRevalidate: isOnDemandRevalidateRequest(
+      request.headers.get(PRERENDER_REVALIDATE_HEADER),
+    ),
+    requestSignal: executionContext?.requestSignal ?? rawRequestSignal,
     unstableCacheRevalidation: "background",
   });
   const middlewareContext: AppMiddlewareContext = {
@@ -335,6 +347,7 @@ export async function renderAppWorkerResponseStage<TRoute extends AppRscHandlerR
               pathname: props.resolvedUrl,
               pagesDataRequest: props.isDataRequest ? request : null,
               request: pageRequest,
+              sharedAcrossHosts: props.sharedAcrossHosts,
               url: new URL(props.requestUrl),
             }),
           );
@@ -413,7 +426,6 @@ export async function renderAppWorkerResponseStage<TRoute extends AppRscHandlerR
         return options.dispatchMatchedPage({
           bypassInterceptionContextCache: props.bypassInterceptionContextCache,
           cachePathname: props.cachePathname,
-          clientReuseManifest: normalized.clientReuseManifest,
           cleanPathname: props.cleanPathname,
           displayPathname: props.canonicalPathname,
           formState: null,
