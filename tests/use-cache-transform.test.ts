@@ -1064,6 +1064,30 @@ describe("plugin-rsc inline use-cache references", () => {
     expect(code).toContain('"acceptsSecondArgument":true');
   });
 
+  it("records the arity of file-level cached const functions exported by name", async () => {
+    const code = await transformRsc(
+      [
+        `"use cache";`,
+        `const getRandomValue = async () => Math.random();`,
+        `const getValue = async (previousState, formData) => formData;`,
+        `async function reassigned() {}`,
+        `reassigned = async (previousState, formData) => formData;`,
+        `export { getRandomValue, getValue as aliased, reassigned };`,
+      ].join("\n"),
+    );
+    const options = getCacheWrapperOptionsByName(code);
+    expect(options.getRandomValue).toMatchObject({
+      argumentCount: 0,
+      acceptsSecondArgument: false,
+    });
+    expect(options.aliased).toMatchObject({ argumentCount: 2, acceptsSecondArgument: true });
+    // A function declaration is a mutable binding, so its arity stays unknown.
+    expect(options.reassigned).toEqual(
+      expect.not.objectContaining({ argumentCount: expect.anything() }),
+    );
+    expect(options.reassigned).toMatchObject({ acceptsSecondArgument: true });
+  });
+
   it("records when a cached function omits the second argument", async () => {
     const code = await transformRsc(
       `export async function generateMetadata() {\n  "use cache";\n  return {};\n}`,

@@ -122,6 +122,40 @@ function getArgumentCount(
   return node.params.at(-1)?.type === "RestElement" ? undefined : node.params.length;
 }
 
+/**
+ * `export { fn }` carries no value node, so find the exported binding's
+ * `const` initializer, which records the function's parameters. Other
+ * bindings, function declarations included, can be reassigned before the
+ * module finishes evaluating, so their arity stays unknown.
+ */
+function getSpecifierExportValueNodes(ast: Program): Map<string, ModuleExportMeta["valueNode"]> {
+  const locals = new Map<string, ModuleExportMeta["valueNode"]>();
+  for (const statement of ast.body) {
+    const declaration =
+      statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
+    if (declaration?.type !== "VariableDeclaration" || declaration.kind !== "const") continue;
+    for (const declarator of declaration.declarations) {
+      if (declarator.id.type === "Identifier" && declarator.init) {
+        locals.set(declarator.id.name, declarator.init as ModuleExportMeta["valueNode"]);
+      }
+    }
+  }
+  const values = new Map<string, ModuleExportMeta["valueNode"]>();
+  for (const statement of ast.body) {
+    if (statement.type !== "ExportNamedDeclaration" || statement.declaration || statement.source) {
+      continue;
+    }
+    for (const specifier of statement.specifiers) {
+      if (specifier.local.type !== "Identifier" || specifier.exported.type !== "Identifier") {
+        continue;
+      }
+      const value = locals.get(specifier.local.name);
+      if (value) values.set(specifier.exported.name, value);
+    }
+  }
+  return values;
+}
+
 function acceptsSecondArgument(
   meta: Pick<ModuleExportMeta, "valueNode"> | TransformHoistInlineDirectiveMeta,
 ): boolean {
@@ -403,6 +437,7 @@ export async function createUseCacheCallablePlugin(
       return `(${secureName} = $$VinextReactServer.registerServerReference(${cached}, ${JSON.stringify(reference.referenceKey)}, ${JSON.stringify(secureName)}))`;
     };
 
+    const specifierValueNodes = moduleDirective ? getSpecifierExportValueNodes(ast) : undefined;
     const result = moduleDirective
       ? transforms.transformWrapExport(code, ast, {
           filter: (name, meta) => {
@@ -416,7 +451,10 @@ export async function createUseCacheCallablePlugin(
             return true;
           },
           runtime: (value, name, meta) =>
-            runtime(value, name, matchUseCacheDirective(moduleDirective), meta),
+            runtime(value, name, matchUseCacheDirective(moduleDirective), {
+              ...meta,
+              valueNode: meta.valueNode ?? specifierValueNodes?.get(name),
+            }),
         })
       : transforms.transformHoistInlineDirective(code, ast, {
           directive: USE_CACHE_DIRECTIVE_CANDIDATE,
