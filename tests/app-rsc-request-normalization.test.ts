@@ -27,17 +27,11 @@ import {
   APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
 } from "../packages/vinext/src/server/app-rsc-render-mode.js";
 import {
-  createClientReuseManifest,
-  createClientReusePayloadHash,
-} from "../packages/vinext/src/server/client-reuse-manifest.js";
-import { createArtifactCompatibilityEnvelope } from "../packages/vinext/src/server/artifact-compatibility.js";
-import {
   NEXT_ROUTER_PREFETCH_HEADER,
   NEXT_ROUTER_SEGMENT_PREFETCH_HEADER,
   NEXT_ROUTER_STATE_TREE_HEADER,
   NEXT_URL_HEADER,
   RSC_HEADER,
-  VINEXT_CLIENT_REUSE_MANIFEST_HEADER,
 } from "../packages/vinext/src/server/headers.js";
 
 function prefetchRouterStateHeader(pathAndSearch: string, routeId = "route:/dashboard"): string {
@@ -77,17 +71,25 @@ function normalized(result: Response | NormalizedRscRequest): NormalizedRscReque
 // ── Protocol-relative URL guard ─────────────────────────────────────────────
 
 describe("normalizeRscRequest — protocol-relative URL guard", () => {
-  it("returns 404 for // path so trailing-slash redirect cannot emit open-redirect Location", () => {
+  it("308s a // path to the collapsed same-origin path, like Next.js", () => {
     // Regression for: trailing-slash 308 echoes //evil.com → open redirect.
-    const result = normalizeRscRequest(req("//evil.com/path"), "");
+    const result = normalizeRscRequest(req("//evil.com/path?a=1"), "");
     expect(result).toBeInstanceOf(Response);
-    expect((result as Response).status).toBe(404);
+    expect((result as Response).status).toBe(308);
+    expect((result as Response).headers.get("location")).toBe("/evil.com/path?a=1");
   });
 
-  it("returns 404 for /\\ path (browsers normalize \\ to / in Location headers)", () => {
+  it("308s a /\\ path to the collapsed path (the URL parser turns \\ into /)", () => {
     const result = normalizeRscRequest(req("/\\evil.com"), "");
     expect(result).toBeInstanceOf(Response);
-    expect((result as Response).status).toBe(404);
+    expect((result as Response).status).toBe(308);
+    expect((result as Response).headers.get("location")).toBe("/evil.com");
+  });
+
+  it("308s repeated slashes inside a basePath before the basePath check", () => {
+    const result = normalizeRscRequest(req("/docs//"), "/docs");
+    expect((result as Response).status).toBe(308);
+    expect((result as Response).headers.get("location")).toBe("/docs/");
   });
 
   it("returns 404 for /%5C encoded backslash (survives segment-wise decode, then echoed in Location)", () => {
@@ -107,7 +109,8 @@ describe("normalizeRscRequest — protocol-relative URL guard", () => {
     // would miss it. Verify the guard still fires on the raw url.pathname.
     const result = normalizeRscRequest(req("//evil.com"), "");
     expect(result).toBeInstanceOf(Response);
-    expect((result as Response).status).toBe(404);
+    expect((result as Response).status).toBe(308);
+    expect((result as Response).headers.get("location")).toBe("/evil.com");
   });
 
   it("does not block a normal leading-slash path", () => {
@@ -214,12 +217,10 @@ describe("normalizeRscRequest — basePath", () => {
 // ── Path normalization ───────────────────────────────────────────────────────
 
 describe("normalizeRscRequest — path normalization", () => {
-  it("collapses double slashes within a path (not at the start)", () => {
-    // //foo is caught by the protocol-relative guard (correctly). Mid-path
-    // double slashes like /foo//bar are not open-redirect shaped and must
-    // be collapsed by normalizePath.
-    const result = normalized(normalizeRscRequest(req("/foo//bar"), ""));
-    expect(result.pathname).toBe("/foo/bar");
+  it("308s double slashes within a path to the collapsed path, like Next.js", () => {
+    const result = normalizeRscRequest(req("/foo//bar"), "");
+    expect((result as Response).status).toBe(308);
+    expect((result as Response).headers.get("location")).toBe("/foo/bar");
   });
 
   it("resolves single-dot segments", () => {
@@ -714,79 +715,6 @@ describe("normalizeRscRequest — mounted slots normalization", () => {
     );
 
     expect(result.renderMode).toBe(APP_RSC_RENDER_MODE_NAVIGATION);
-  });
-});
-
-// ── Client reuse manifest normalization ─────────────────────────────────────
-
-describe("normalizeRscRequest — ClientReuseManifest boundary", () => {
-  it("parses ClientReuseManifest only for canonical RSC payload requests", () => {
-    const manifest = createClientReuseManifest({
-      entries: [
-        {
-          artifactCompatibility: createArtifactCompatibilityEnvelope({
-            deploymentVersion: "deploy-a",
-            graphVersion: "graph-a",
-            renderEpoch: "epoch-a",
-            rootBoundaryId: "layout:/",
-          }),
-          id: "layout:/",
-          payloadHash: createClientReusePayloadHash("root"),
-          privacy: "public",
-          variantCacheKey: "cp1:root",
-        },
-      ],
-      visibleCommitVersion: 1,
-    });
-    const header = JSON.stringify(manifest);
-
-    const rsc = normalized(
-      normalizeRscRequest(req("/page.rsc", { [VINEXT_CLIENT_REUSE_MANIFEST_HEADER]: header }), ""),
-    );
-    const nextStyleRsc = normalized(
-      normalizeRscRequest(
-        req(`/page?${VINEXT_RSC_CACHE_BUSTING_SEARCH_PARAM}`, {
-          [RSC_HEADER]: "1",
-          [VINEXT_CLIENT_REUSE_MANIFEST_HEADER]: header,
-        }),
-        "",
-      ),
-    );
-    const html = normalized(
-      normalizeRscRequest(req("/page", { [VINEXT_CLIENT_REUSE_MANIFEST_HEADER]: header }), ""),
-    );
-
-    expect(rsc.clientReuseManifest.kind).toBe("parsed");
-    expect(nextStyleRsc.clientReuseManifest.kind).toBe("parsed");
-    expect(html.clientReuseManifest).toEqual({ kind: "absent" });
-  });
-
-  it("keeps rejected ClientReuseManifest hints as disabled metadata instead of failing routing", () => {
-    const result = normalized(
-      normalizeRscRequest(
-        req("/page.rsc", {
-          [VINEXT_CLIENT_REUSE_MANIFEST_HEADER]: JSON.stringify({
-            entries: [],
-            hashAlgorithm: "sha512",
-            replayWindow: {
-              validFromVisibleCommitVersion: 1,
-              validUntilVisibleCommitVersion: 1,
-            },
-            schemaVersion: 1,
-            visibleCommitVersion: 1,
-          }),
-        }),
-        "",
-      ),
-    );
-
-    expect(result.clientReuseManifest).toEqual({
-      kind: "rejected",
-      rejection: {
-        code: "SKIP_HASH_ALGORITHM_UNSUPPORTED",
-        fields: { hashAlgorithm: "sha512" },
-      },
-    });
   });
 });
 

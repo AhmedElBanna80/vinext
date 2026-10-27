@@ -9,6 +9,7 @@
  */
 import "./server-globals.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { Stream } from "node:stream";
 import type { NextI18nConfig } from "../config/next-config.js";
 import { decode as decodeQueryString } from "node:querystring";
 import { Buffer } from "node:buffer";
@@ -19,7 +20,11 @@ import {
   parseQueryString,
   urlQueryToSearchParams,
 } from "../utils/query.js";
-import { PagesBodyParseError, getMediaType, isJsonMediaType } from "./pages-media-type.js";
+import {
+  PagesBodyParseError,
+  createPagesBodyDecoder,
+  isJsonMediaType,
+} from "./pages-media-type.js";
 import { finalizeEdgeApiResponse, isEdgeApiRuntime } from "./edge-api-runtime.js";
 import {
   DEFAULT_PAGES_API_BODY_SIZE_LIMIT,
@@ -28,6 +33,7 @@ import {
 import { resolveRequestProtocol, resolveRequestHost } from "./proxy-trust.js";
 import { performOnDemandRevalidate, type RevalidateOptions } from "./pages-revalidate.js";
 import { NextRequest } from "vinext/shims/server";
+import { signalFromNodeResponse } from "./node-response-signal.js";
 import { hasBasePath } from "../utils/base-path.js";
 import {
   attachPagesPreviewApi,
@@ -103,6 +109,10 @@ async function parseBody(
   req: IncomingMessage,
   sizeLimit: number = MAX_BODY_SIZE,
 ): Promise<unknown> {
+  const { mediaType, decoder } = await createPagesBodyDecoder(req.headers["content-type"]);
+  // A client that disconnected while the decoder loaded has already emitted
+  // its error/close events, which the listeners below would never see.
+  if (req.destroyed) throw req.errored ?? new Error("Request aborted");
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let totalSize = 0;
@@ -126,15 +136,19 @@ async function parseBody(
     req.on("end", () => {
       if (settled) return;
       settled = true;
-      const raw = Buffer.concat(chunks).toString("utf-8");
-      const mediaType = getMediaType(req.headers["content-type"]);
+      const body = Buffer.concat(chunks);
+      const raw = decoder.decode(body);
       if (!raw) {
+        // A body that decodes to nothing, such as a lone BOM, stays "" like
+        // in Next.js; only a request without body bytes gets undefined.
         resolve(
           isJsonMediaType(mediaType)
             ? {}
             : mediaType === "application/x-www-form-urlencoded"
               ? decodeQueryString(raw)
-              : undefined,
+              : body.length > 0
+                ? raw
+                : undefined,
         );
         return;
       }
@@ -181,6 +195,7 @@ function readEdgeRequestBody(req: IncomingMessage): ReadableStream<Uint8Array> |
 
 function createEdgeApiRequest(
   req: IncomingMessage,
+  res: ServerResponse,
   url: string,
   params: Record<string, string | string[]>,
   nextConfig?: { basePath?: string },
@@ -218,11 +233,15 @@ function createEdgeApiRequest(
   }
   const query = mergeRouteParamsIntoQuery(parseQueryString(url), params);
   requestUrl.search = urlQueryToSearchParams(query).toString();
-  const body = readEdgeRequestBody(req);
+  // Match prod/Next.js: edge API handlers observe client disconnects, and an
+  // already-aborted request carries no body.
+  const signal = signalFromNodeResponse(res);
+  const body = signal.aborted ? undefined : readEdgeRequestBody(req);
 
   const init: RequestInit & { duplex?: "half" } = {
     headers,
     method: req.method,
+    signal,
   };
 
   if (body) {
@@ -261,6 +280,7 @@ function waitForWritableDrain(res: ServerResponse): Promise<void> {
 async function writeEdgeApiResponseBody(
   res: ServerResponse,
   body: ReadableStream<Uint8Array> | null,
+  signal: AbortSignal,
 ): Promise<void> {
   if (!body) {
     res.end();
@@ -268,6 +288,14 @@ async function writeEdgeApiResponseBody(
   }
 
   const reader = body.getReader();
+  // A stalled body would otherwise keep the read pending after the client left.
+  const cancel = () => {
+    reader.cancel(signal.reason).catch(() => {
+      /* ignore cancellation failures on discarded bodies */
+    });
+  };
+  if (signal.aborted) cancel();
+  else signal.addEventListener("abort", cancel, { once: true });
   try {
     while (true) {
       const result = await reader.read();
@@ -277,11 +305,14 @@ async function writeEdgeApiResponseBody(
         await waitForWritableDrain(res);
       }
     }
-    res.end();
+    if (!signal.aborted) res.end();
   } catch (error) {
+    // A client disconnect is not a route error.
+    if (signal.aborted) return;
     res.destroy(error instanceof Error ? error : new Error(String(error)));
     throw error;
   } finally {
+    signal.removeEventListener("abort", cancel);
     reader.releaseLock();
   }
 }
@@ -316,6 +347,24 @@ function enhanceApiObjects(
     },
 
     send(this: NextApiResponse, data: unknown) {
+      // Next.js's sendData() ends 204/304 responses before it inspects the
+      // data, so a stream is never piped into them.
+      if (this.statusCode === 204 || this.statusCode === 304) {
+        this.removeHeader("Content-Type");
+        this.removeHeader("Content-Length");
+        this.removeHeader("Transfer-Encoding");
+        this.end();
+        return;
+      }
+
+      if (data instanceof Stream) {
+        if (!this.getHeader("Content-Type")) {
+          this.setHeader("Content-Type", "application/octet-stream");
+        }
+        data.pipe(this);
+        return;
+      }
+
       if (Buffer.isBuffer(data)) {
         if (!this.getHeader("Content-Type")) {
           this.setHeader("Content-Type", "application/octet-stream");
@@ -391,6 +440,7 @@ export async function handleApiRoute(
     trustedRevalidateOrigin?: string;
     allowedRevalidateHeaderKeys?: readonly string[];
     trailingSlash?: boolean;
+    skipTrailingSlashRedirect?: boolean;
   },
 ): Promise<boolean> {
   const match = matchRoute(url, apiRoutes);
@@ -406,13 +456,14 @@ export async function handleApiRoute(
       // edge API handlers, so handlers can use `req.nextUrl.searchParams`,
       // `req.cookies`, etc. (Cf. NextRequestHint in next/src/server/web/adapter.ts.)
       const nextRequest = new NextRequest(
-        createEdgeApiRequest(req, url, params, nextConfig),
+        createEdgeApiRequest(req, res, url, params, nextConfig),
         nextConfig
           ? {
               nextConfig: {
                 basePath: nextConfig.basePath,
                 i18n: nextConfig.i18n ?? undefined,
                 trailingSlash: nextConfig.trailingSlash,
+                skipTrailingSlashRedirect: nextConfig.skipTrailingSlashRedirect,
               },
             }
           : undefined,
@@ -434,7 +485,7 @@ export async function handleApiRoute(
       if (setCookieHeaders.length) {
         res.setHeader("set-cookie", setCookieHeaders);
       }
-      await writeEdgeApiResponseBody(res, response.body);
+      await writeEdgeApiResponseBody(res, response.body, nextRequest.signal);
       return true;
     }
 

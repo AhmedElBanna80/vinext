@@ -95,7 +95,7 @@ async function fetchFromNitroServer(root: string, pathname: string): Promise<str
 }
 
 describe("inline CSS production build", () => {
-  it("injects the inline CSS manifest into a custom App Router RSC output directory", async () => {
+  it("injects the inline CSS manifest with custom App Router output directories", async () => {
     const fixtureRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-inline-css-build-"));
     const outRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-inline-css-build-out-"));
     try {
@@ -103,6 +103,7 @@ describe("inline CSS production build", () => {
 
       const rscOutDir = path.join(outRoot, "custom-rsc");
       const ssrOutDir = path.join(outRoot, "custom-ssr");
+      const clientOutDir = path.join(outRoot, "custom-client");
       const builder = await createBuilder({
         root: fixtureRoot,
         configFile: false,
@@ -111,6 +112,7 @@ describe("inline CSS production build", () => {
             appDir: fixtureRoot,
             rscOutDir,
             ssrOutDir,
+            clientOutDir,
             nextConfig: {
               experimental: {
                 inlineCss: true,
@@ -128,6 +130,9 @@ describe("inline CSS production build", () => {
 
       expect(code).toContain("globalThis.__VINEXT_INLINE_CSS__");
       expect(code).toContain("_next/static");
+      // The manifest is read from the client output directory, so the marker
+      // CSS is only inlined when clientOutDir is honoured.
+      expect(code).toContain("inline-css-build-marker");
     } finally {
       await fsp.rm(fixtureRoot, { recursive: true, force: true }).catch(() => {});
       await fsp.rm(outRoot, { recursive: true, force: true }).catch(() => {});

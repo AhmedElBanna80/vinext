@@ -155,88 +155,24 @@ function mergeMiddlewareSetCookies(ctx: HeadersContext, rawHeader: string | null
 }
 
 /**
- * Measure dynamic usage in a child async scope without clearing the parent.
- * Concurrent work that already belongs to the request (such as deferred
- * metadata) keeps writing to the parent state and therefore remains visible
- * to the final cache policy.
+ * Run a layout probe without letting its dynamic API usage, fetch tags or
+ * cacheLife reach the request. Next.js has no probe: only the render decides
+ * whether a page is dynamic and how long it is cached.
  */
-export async function runWithIsolatedDynamicUsage<T>(
-  fn: () => T | Promise<T>,
-): Promise<{ result: T; dynamicDetected: boolean }> {
-  const runInChildState = async (childState: VinextHeadersShimState) => {
-    const result = await fn();
-    return { result, dynamicDetected: childState.dynamicUsageDetected };
-  };
-
+export async function runWithDetachedDynamicUsage<T>(fn: () => T | Promise<T>): Promise<T> {
   if (isInsideUnifiedScope()) {
-    let childState: VinextHeadersShimState | null = null;
-    return await runWithUnifiedStateMutation(
-      (context) => {
-        context.dynamicUsageDetected = false;
-        childState = context;
-      },
-      () => {
-        if (!childState) {
-          throw new Error("Dynamic usage scope was not initialized");
-        }
-        return runInChildState(childState);
-      },
-    );
-  }
-
-  const parentState = _getState();
-  const childState: VinextHeadersShimState = {
-    ...parentState,
-    // Share the parent's latch, creating it first on a stale fallback state.
-    renderDynamicLatch: ensureRenderDynamicLatch(parentState),
-    dynamicUsageDetected: false,
-  };
-  return await _als.run(childState, () => runInChildState(childState));
-}
-
-/**
- * Run a pre-render probe without letting its dynamic API usage classify the
- * request. Next.js has no probe: only the render decides whether a page is
- * dynamic, and the render runs the probed layouts and page again. Returns the
- * probe's own usage for a caller whose probe response replaces the render.
- */
-export async function runWithDetachedDynamicUsage<T>(
-  fn: () => T | Promise<T>,
-): Promise<{ result: T; dynamicDetected: boolean }> {
-  const runInChildState = async (childState: VinextHeadersShimState) => {
-    const result = await fn();
-    return {
-      result,
-      // Nested isolated scopes latch without setting this scope's flag.
-      dynamicDetected: childState.dynamicUsageDetected || childState.renderDynamicLatch.dynamic,
-    };
-  };
-
-  if (isInsideUnifiedScope()) {
-    let childState: VinextHeadersShimState | null = null;
-    return await runWithUnifiedStateMutation(
-      (context) => {
-        context.dynamicUsageDetected = false;
-        context.renderDynamicLatch = createRenderDynamicLatch();
-        context.renderRequestApiUsage = new Set();
-        // cacheForRequest() values would hand the probe's result to the render
-        // without the dynamic API calls that produced it.
-        context.requestCache = new WeakMap();
-        // The render records its own fetches, tags and cacheLife.
-        context.cacheableFetchUrls = new Set();
-        context.currentRequestTags = [];
-        context.dynamicFetchUrls = new Set();
-        context.requestScopedCacheLife = null;
-        context.unstableCacheObservations = new Map();
-        childState = context;
-      },
-      () => {
-        if (!childState) {
-          throw new Error("Dynamic usage scope was not initialized");
-        }
-        return runInChildState(childState);
-      },
-    );
+    return await runWithUnifiedStateMutation((context) => {
+      context.dynamicUsageDetected = false;
+      context.renderDynamicLatch = createRenderDynamicLatch();
+      context.renderRequestApiUsage = new Set();
+      // cacheForRequest() values would hand the probe's result to the render
+      // without the dynamic API calls that produced it.
+      context.requestCache = new WeakMap();
+      // The render records its own fetches, tags and cacheLife.
+      context.currentRequestTags = [];
+      context.dynamicFetchUrls = new Set();
+      context.requestScopedCacheLife = null;
+    }, fn);
   }
 
   const childState: VinextHeadersShimState = {
@@ -245,7 +181,7 @@ export async function runWithDetachedDynamicUsage<T>(
     renderDynamicLatch: createRenderDynamicLatch(),
     renderRequestApiUsage: new Set(),
   };
-  return await _als.run(childState, () => runInChildState(childState));
+  return await _als.run(childState, fn);
 }
 
 export async function runWithConnectionProbe<T>(
@@ -267,10 +203,6 @@ export async function runWithConnectionProbe<T>(
       probe.interrupted = true;
       interruptProbe();
     },
-    // `connection()` suspends forever inside speculative probes, matching
-    // Next.js's prerender/probe contract: code after `await connection()`
-    // must not run while classifying a route.
-    pending: new Promise<never>(() => {}),
   };
 
   const runInChildState = async (childState: VinextHeadersShimState) => {
@@ -281,11 +213,18 @@ export async function runWithConnectionProbe<T>(
       return await Promise.race([completed, interrupted]);
     } finally {
       probe.active = false;
-      // Async resources created inside this ALS scope retain `childState` after
-      // the probe returns. Restore the inherited probe when nested; otherwise
-      // retain this inactive probe so late dynamic usage can still propagate
-      // to its parent without suspending. Reading the parent at cleanup time
-      // preserves the right lifecycle if an outer probe completed separately.
+      // Async resources created inside this ALS scope retain `childState`, and
+      // through it this probe, after the probe returns. A completed probe would
+      // otherwise leave `interrupted` pending forever, holding Promise.race's
+      // reaction, which captured the caller's async context. workerd holds
+      // async context values through strong handles, so that cycle is never
+      // collected and retained every request's context. The race is already
+      // decided here, so settling `interrupted` only drops the reaction.
+      interruptProbe();
+      // Restore the inherited probe when nested; otherwise retain this inactive
+      // probe so late dynamic usage can still propagate to its parent without
+      // suspending. Reading the parent at cleanup time preserves the right
+      // lifecycle if an outer probe completed separately.
       childState.connectionProbe = parentState.connectionProbe ?? probe;
 
       // Dynamic usage discovered by a speculative probe still classifies the
@@ -335,7 +274,12 @@ export function suspendConnectionProbe(): Promise<never> | null {
   if (!probe?.active) return null;
 
   probe.interrupt();
-  return probe.pending;
+  // `connection()` suspends forever inside speculative probes, matching
+  // Next.js's prerender/probe contract: code after `await connection()` must
+  // not run while classifying a route. Each call gets its own promise that
+  // the probe does not keep, so the suspended code (and the async context its
+  // continuation captured) is collected with the request.
+  return new Promise<never>(() => {});
 }
 
 export function peekRenderRequestApiUsage(): RenderRequestApiKind[] {
@@ -608,7 +552,7 @@ class ReadonlyHeadersError extends Error {
     );
   }
 
-  static callable(): never {
+  static callable(this: void): never {
     throw new ReadonlyHeadersError();
   }
 }
@@ -623,7 +567,7 @@ class ReadonlyRequestCookiesError extends Error {
     );
   }
 
-  static callable(): never {
+  static callable(this: void): never {
     throw new ReadonlyRequestCookiesError();
   }
 }
@@ -756,10 +700,12 @@ function _wrapMutableCookies(cookies: RequestCookies): RequestCookies {
 }
 
 function _sealCookies(cookies: RequestCookies): RequestCookies {
+  // Like Next.js's RequestCookiesAdapter.seal, the mutating methods throw when
+  // called, not when read.
   return new Proxy(cookies, {
     get(target, prop) {
-      if (prop === "set" || prop === "delete") {
-        throw new ReadonlyRequestCookiesError();
+      if (prop === "set" || prop === "delete" || prop === "clear") {
+        return ReadonlyRequestCookiesError.callable;
       }
 
       const value = Reflect.get(target, prop, target);
@@ -1157,8 +1103,11 @@ export async function draftMode(): Promise<DraftModeResult> {
 // RequestCookies implementation
 // ---------------------------------------------------------------------------
 
-const APPLY_RESPONSE_COOKIE = Symbol("vinext.apply-response-cookie");
-const SYNCHRONIZE_REQUEST_COOKIES = Symbol("vinext.synchronize-request-cookies");
+// Registered symbols: the request context (and its RequestCookies) is shared
+// through globalThis, so another headers module instance — e.g. Vite's
+// prebundled `next/headers` in dev — must be able to call these methods.
+const APPLY_RESPONSE_COOKIE = Symbol.for("vinext.apply-response-cookie");
+const SYNCHRONIZE_REQUEST_COOKIES = Symbol.for("vinext.synchronize-request-cookies");
 
 class RequestCookies {
   private _cookies: Map<string, string>;
@@ -1173,7 +1122,8 @@ class RequestCookies {
       : null;
   }
 
-  get(name: string): ResponseCookie | undefined {
+  get(nameOrOptions: string | { name: string }): ResponseCookie | undefined {
+    const name = typeof nameOrOptions === "string" ? nameOrOptions : nameOrOptions.name;
     if (this._responseCookies) return this._responseCookies.get(name);
     const value = this._cookies.get(name);
     if (value === undefined) return undefined;
