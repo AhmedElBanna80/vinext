@@ -132,7 +132,6 @@ function createRouterState(overrides: Partial<AppRouterState> = {}): AppRouterSt
     interception: null,
     interceptionContext: null,
     layoutIds: [AppElementsWire.encodeLayoutId("/")],
-    layoutFlags: {},
     navigationSnapshot: createClientNavigationRenderSnapshot("https://example.com/initial", {}),
     previousNextUrl: null,
     renderId: 0,
@@ -246,7 +245,7 @@ describe("AppBrowserHistoryController hash-only navigation", () => {
     const bfcacheIds = { "page:/shallow-test": "shallow-page" };
     const { controller, store } = createController({
       initialState: createHistoryStateWithNavigationMetadata(
-        { __vinext_externalHistoryState: true, __vinext_treeSnapshotId: 7 },
+        { __vinext_externalHistoryState: true, __vinext_treeSnapshotId: "doc:7" },
         {
           bfcacheIds,
           bfcacheVersion: 0,
@@ -261,7 +260,7 @@ describe("AppBrowserHistoryController hash-only navigation", () => {
 
     const writtenState = readWrittenState(store.pushed[0]);
     expect(writtenState.__vinext_externalHistoryState).toBe(true);
-    expect(readHistoryStateTreeSnapshotId(writtenState)).toBe(7);
+    expect(readHistoryStateTreeSnapshotId(writtenState)).toBe("doc:7");
     expect(writtenState.__vinext_bfcacheIds).toEqual(bfcacheIds);
     expect(readHistoryStateTraversalIndex(writtenState)).toBe(1);
   });
@@ -549,6 +548,63 @@ describe("AppBrowserHistoryController snapshot restore", () => {
     expect(approveVisibleRestore.mock.calls[0]?.[0].state).toBe(shallowState);
   });
 
+  it("restores the completed tree for entries that remembered an optimistic shell", () => {
+    // Next.js shares one tree between an optimistic shell and the data that
+    // fills it in, so going back to the shell's entry after a shallow history
+    // write shows the full page.
+    const { controller, store } = createController();
+    const createOperation = (navigationCommitKind: "authoritative" | "detached") => ({
+      id: 1,
+      lane: "navigation" as const,
+      navigationCommitKind,
+      navigationId: 3,
+      startedVisibleCommitVersion: 0,
+      state: "committed" as const,
+      visibleCommitVersion: 1,
+    });
+    const navigationSnapshot = createClientNavigationRenderSnapshot(
+      "https://example.com/slow/2",
+      {},
+    );
+    const shellState = createRouterState({
+      activeOperation: createOperation("detached"),
+      navigationSnapshot,
+      routeId: "route:/slow/[id]",
+    });
+    seedSnapshotAtIndex(controller, 1, shellState);
+    // A raw pushState copies the shell's tree onto a new entry.
+    controller.claimCurrentHistoryTreeSnapshot("push", store.state);
+    expect(controller.currentHistoryTraversalIndex).toBe(2);
+
+    const completedState = createRouterState({
+      activeOperation: createOperation("authoritative"),
+      navigationSnapshot,
+      routeId: "route:/slow/[id]",
+    });
+    controller.rememberHistoryStateSnapshot(completedState);
+
+    const approveVisibleRestore = vi.fn((candidate: RestorableSnapshotCandidate) => {
+      candidate.beforeCommit();
+      return true;
+    });
+    for (const historyState of [
+      createHistoryStateWithNavigationMetadata(null, { previousNextUrl: null, traversalIndex: 1 }),
+      store.state,
+    ]) {
+      expect(
+        controller.restoreHistorySnapshot({
+          historyState,
+          stageClientParams: vi.fn(),
+          approveVisibleRestore,
+        }),
+      ).toBe(true);
+    }
+    expect(approveVisibleRestore.mock.calls.map(([candidate]) => candidate.state)).toEqual([
+      completedState,
+      completedState,
+    ]);
+  });
+
   it("retains reachable external tree snapshots across traversal-cache eviction", () => {
     const { controller, store } = createController();
     const externalState = createRouterState({ routeId: "route:/external" });
@@ -623,7 +679,7 @@ describe("AppBrowserHistoryController snapshot restore", () => {
 
   it("releases raw replace claims when app replace overwrites the same entry", () => {
     const { controller, store } = createController();
-    const overwrittenTreeSnapshotIds: Array<number | null> = [];
+    const overwrittenTreeSnapshotIds: Array<string | null> = [];
     seedSnapshotAtIndex(controller, 0, createRouterState({ routeId: "route:/cycle-0" }));
 
     for (let render = 1; render <= 52; render += 1) {
@@ -693,7 +749,7 @@ describe("AppBrowserHistoryController snapshot restore", () => {
 
   it("releases claimed snapshots when a push truncates forward history", () => {
     const { controller, store } = createController();
-    const truncatedTreeSnapshotIds: Array<number | null> = [];
+    const truncatedTreeSnapshotIds: Array<string | null> = [];
 
     for (let render = 0; render <= 52; render += 1) {
       seedSnapshotAtIndex(controller, 0, createRouterState({ routeId: `route:/source-${render}` }));
@@ -838,6 +894,40 @@ describe("AppBrowserHistoryController snapshot restore", () => {
       }),
     ).toBe(true);
     expect(approveVisibleRestore.mock.calls[0]?.[0].state).toBe(refreshedState);
+  });
+
+  it("does not resolve a copied tree id that an earlier document wrote", () => {
+    // History state survives a reload, but the trees its ids name do not.
+    const firstDocument = createController();
+    seedSnapshotAtIndex(
+      firstDocument.controller,
+      0,
+      createRouterState({ routeId: "route:/shallow-test" }),
+    );
+    firstDocument.controller.claimCurrentHistoryTreeSnapshot("replace", firstDocument.store.state);
+    const copiedHistoryState = firstDocument.store.state;
+    expect(readHistoryStateTreeSnapshotId(copiedHistoryState)).not.toBeNull();
+
+    const reloadedDocument = createController();
+    seedSnapshotAtIndex(
+      reloadedDocument.controller,
+      1,
+      createRouterState({ routeId: "route:/about" }),
+    );
+
+    expect(reloadedDocument.controller.isCurrentExternalHistoryTree(copiedHistoryState)).toBe(
+      false,
+    );
+    const approveVisibleRestore = vi.fn(() => true);
+    expect(
+      reloadedDocument.controller.restoreHistorySnapshot({
+        historyState: copiedHistoryState,
+        preferExternalSnapshot: true,
+        stageClientParams: vi.fn(),
+        approveVisibleRestore,
+      }),
+    ).toBe(false);
+    expect(approveVisibleRestore).not.toHaveBeenCalled();
   });
 });
 

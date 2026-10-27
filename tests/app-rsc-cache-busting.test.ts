@@ -26,7 +26,6 @@ import {
 import { APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL } from "../packages/vinext/src/server/app-rsc-render-mode.js";
 import {
   FLIGHT_HEADERS,
-  VINEXT_CLIENT_REUSE_MANIFEST_HEADER,
   VINEXT_RSC_STATE_FINGERPRINT_HEADER,
 } from "../packages/vinext/src/server/headers.js";
 import { fnv1a64 } from "../packages/vinext/src/utils/hash.js";
@@ -105,7 +104,6 @@ describe("App Router RSC cache-busting", () => {
 
   it("normalizes full prefetch and navigation headers to the warmer shape", async () => {
     const headers = createRscRequestHeaders({
-      clientReuseManifestHeader: '{"entries":[]}',
       deploymentId: "dpl_123",
       nextUrl: "/source",
       prefetchRouterState: { pathAndSearch: "/source", routeId: "route:/source" },
@@ -163,6 +161,9 @@ describe("App Router RSC cache-busting", () => {
           await expect(createRscRequestUrl("/docs/", headers)).resolves.toBe("/docs/index.txt");
           await expect(createRscRequestUrl("/docs?tab=api", headers)).resolves.toBe(
             "/docs.txt?tab=api",
+          );
+          await expect(createRscRequestUrl("//a//attacker.example/z", headers)).resolves.toBe(
+            "/.//a//attacker.example/z.txt",
           );
           await withEnvVar("__NEXT_ROUTER_BASEPATH", "/docs", async () => {
             await expect(createRscRequestUrl("/docs", headers)).resolves.toBe("/docs/index.txt");
@@ -271,18 +272,46 @@ describe("App Router RSC cache-busting", () => {
     expect(headers.get("next-url")).toBe("/current");
   });
 
+  it("keeps request URLs for pathnames that start with // on the app origin", async () => {
+    // A pathname such as "//a//attacker.example/z" (from the local href
+    // "/.//a//attacker.example/z") must stay a path. Next.js fetches the full
+    // same-origin URL, so the request never treats "a" as a host.
+    const origin = "https://app.example";
+    const headers = createRscRequestHeaders();
+    const resolve = (requestUrl: string) => new URL(requestUrl, `${origin}/current`);
+
+    for (const requestUrl of [
+      await createRscRequestUrl("//a//attacker.example/z?tab=1#hash", headers),
+      createCanonicalRscRequestUrl("//a//attacker.example/z?tab=1"),
+      createServerActionRequestUrl("//a//attacker.example/z?tab=1#hash"),
+    ]) {
+      expect(requestUrl.startsWith("//")).toBe(false);
+      expect(resolve(requestUrl).origin).toBe(origin);
+      expect(resolve(requestUrl).pathname).toBe("//a//attacker.example/z");
+      expect(resolve(requestUrl).searchParams.get("tab")).toBe("1");
+    }
+
+    // Backslashes are path separators in special-scheme URLs.
+    expect(resolve(createServerActionRequestUrl("\\\\a\\attacker.example")).href).toBe(
+      `${origin}//a/attacker.example`,
+    );
+    // Absolute URLs keep their path in full.
+    expect(
+      resolve(createServerActionRequestUrl("https://app.example//a//attacker.example/z")).href,
+    ).toBe(`${origin}//a//attacker.example/z`);
+
+    await expect(
+      createRscRedirectLocation(
+        "/.//a//attacker.example/z",
+        new Request(`${origin}/photos?_rsc`, { headers: createCanonicalRscRequestHeaders() }),
+      ),
+    ).resolves.toBe(`${origin}/.//a//attacker.example/z?_rsc`);
+  });
+
   it("keeps server action POSTs on the visible route URL", () => {
     // Ported from Next.js: test/e2e/app-dir/actions/app-action.test.ts
     // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/actions/app-action.test.ts
     expect(createServerActionRequestUrl("/server?name=alice#section")).toBe("/server?name=alice");
-  });
-
-  it("attaches client reuse manifests without making them shared cache variants", async () => {
-    const manifestHeader = '{"entries":[]}';
-    const headers = createRscRequestHeaders({ clientReuseManifestHeader: manifestHeader });
-
-    expect(headers.get(VINEXT_CLIENT_REUSE_MANIFEST_HEADER)).toBe(manifestHeader);
-    await expect(createRscRequestUrl("/dashboard", headers)).resolves.toBe("/dashboard?_rsc");
   });
 
   it("changes the hash when a varying header changes", async () => {

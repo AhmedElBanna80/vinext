@@ -12,6 +12,15 @@ export type RouteCacheabilityOutcome = {
   searchParamsUnread?: true;
   /** A transient classification failure that may succeed on another bounded attempt. */
   retryable?: true;
+  /**
+   * App page RSC: the status and headers that replace the streamed 200 of a
+   * render whose special error rejected its document's shell, once the
+   * response is complete.
+   */
+  status?: number;
+  headers?: Readonly<Record<string, string>>;
+  /** App pages: the client-router stale time from the completed render's cacheLife. */
+  staleTimeSeconds?: number;
   tags?: readonly string[];
 };
 

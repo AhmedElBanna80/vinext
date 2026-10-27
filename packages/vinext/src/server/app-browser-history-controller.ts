@@ -114,9 +114,14 @@ export class AppBrowserHistoryController {
   // history can remain reachable for the document lifetime. Keep one current
   // candidate and promote only ids claimed by those history writes; ordinary
   // renders are released when the candidate advances.
-  readonly #treeSnapshots = new Map<number, AppRouterState>();
-  readonly #treeSnapshotClaimCounts = new Map<number, number>();
-  readonly #treeSnapshotClaimByHistoryIndex = new Map<number, number>();
+  readonly #treeSnapshots = new Map<string, AppRouterState>();
+  readonly #treeSnapshotClaimCounts = new Map<string, number>();
+  readonly #treeSnapshotClaimByHistoryIndex = new Map<number, string>();
+  // History state outlives the document, but the trees its ids name live only
+  // in this document's memory. A per-document prefix keeps an id that an
+  // earlier document wrote (before a reload or hard navigation) from naming a
+  // tree of this one; such an entry falls back to rendering its URL.
+  readonly #treeSnapshotIdPrefix = createDocumentTreeSnapshotIdPrefix();
   readonly #readHistoryState: () => unknown;
   readonly #readCurrentHref: () => string;
   readonly #pushHistoryState: (state: unknown, href: string) => void;
@@ -129,9 +134,9 @@ export class AppBrowserHistoryController {
   // still continue from the highest known app history.
   #currentHistoryTraversalIndex: number | null;
   #nextHistoryTraversalIndex: number;
-  #currentTreeSnapshotId: number | null = null;
+  #currentTreeSnapshotId: string | null = null;
   #nextTreeSnapshotId = 0;
-  #treeSnapshotIdPendingFreshState: number | null = null;
+  #treeSnapshotIdPendingFreshState: string | null = null;
 
   constructor(deps: AppBrowserHistoryControllerDeps) {
     this.#readHistoryState = deps.readHistoryState;
@@ -215,6 +220,20 @@ export class AppBrowserHistoryController {
   }
 
   rememberHistoryStateSnapshot(state: AppRouterState): void {
+    // An authoritative render completes the optimistic shell its navigation
+    // committed first. In Next.js both share one tree whose data fills in, so
+    // every entry that remembered the shell (including the shell's own entry
+    // after a shallow history write moved on) must restore the full tree.
+    const previousState = this.readCurrentTreeSnapshot();
+    const previousOperation = previousState?.activeOperation;
+    if (
+      previousState &&
+      previousOperation?.navigationCommitKind === "detached" &&
+      state.activeOperation?.navigationCommitKind === "authoritative" &&
+      state.activeOperation.navigationId === previousOperation.navigationId
+    ) {
+      this.#restorableClientState.replaceHistoryStateSnapshots(previousState, state);
+    }
     this.#restorableClientState.rememberHistoryStateSnapshot({
       historyIndex: this.#currentHistoryTraversalIndex,
       state,
@@ -231,7 +250,9 @@ export class AppBrowserHistoryController {
       this.#treeSnapshots.has(historyTreeSnapshotId) &&
       (historyTreeSnapshotId === this.#treeSnapshotIdPendingFreshState ||
         this.#treeSnapshotClaimCounts.has(historyTreeSnapshotId));
-    const treeSnapshotId = updatesExistingTree ? historyTreeSnapshotId : this.#nextTreeSnapshotId++;
+    const treeSnapshotId = updatesExistingTree
+      ? historyTreeSnapshotId
+      : `${this.#treeSnapshotIdPrefix}:${this.#nextTreeSnapshotId++}`;
     this.#treeSnapshotIdPendingFreshState = null;
     const previousTreeSnapshotId = this.#currentTreeSnapshotId;
     this.#currentTreeSnapshotId = treeSnapshotId;
@@ -248,6 +269,12 @@ export class AppBrowserHistoryController {
         createHistoryStateWithTreeSnapshotId(this.#readHistoryState(), treeSnapshotId),
       );
     }
+  }
+
+  /** The router state of the most recently committed render, if any. */
+  readCurrentTreeSnapshot(): AppRouterState | null {
+    if (this.#currentTreeSnapshotId === null) return null;
+    return this.#treeSnapshots.get(this.#currentTreeSnapshotId) ?? null;
   }
 
   isCurrentExternalHistoryTree(historyState: unknown): boolean {
@@ -315,7 +342,7 @@ export class AppBrowserHistoryController {
     }
   }
 
-  #claimTreeSnapshotAtHistoryIndex(historyIndex: number, treeSnapshotId: number): void {
+  #claimTreeSnapshotAtHistoryIndex(historyIndex: number, treeSnapshotId: string): void {
     const previousTreeSnapshotId = this.#treeSnapshotClaimByHistoryIndex.get(historyIndex);
     if (previousTreeSnapshotId === treeSnapshotId) return;
     if (previousTreeSnapshotId !== undefined) {
@@ -345,7 +372,7 @@ export class AppBrowserHistoryController {
     }
   }
 
-  #releaseTreeSnapshotClaim(treeSnapshotId: number): void {
+  #releaseTreeSnapshotClaim(treeSnapshotId: string): void {
     const claimCount = this.#treeSnapshotClaimCounts.get(treeSnapshotId);
     if (claimCount === undefined) return;
     if (claimCount > 1) {
@@ -641,6 +668,11 @@ export class AppBrowserHistoryController {
       },
     });
   }
+}
+
+function createDocumentTreeSnapshotIdPrefix(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function areStringArraysEqual(a: readonly string[] | null, b: readonly string[] | null): boolean {
