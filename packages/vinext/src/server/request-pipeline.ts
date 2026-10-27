@@ -485,7 +485,21 @@ export function isOriginAllowed(origin: string, allowed: string[]): boolean {
  *
  * @param headers - The Headers object to modify in place
  */
+/**
+ * Next.js drops each empty middleware Set-Cookie value when it converts
+ * middleware's response headers, so blank values never reach the response.
+ */
+export function dropEmptyMiddlewareSetCookie(headers: Headers): void {
+  const cookies = headers.getSetCookie();
+  if (!cookies.includes("")) return;
+  headers.delete("set-cookie");
+  for (const cookie of cookies) {
+    if (cookie) headers.append("set-cookie", cookie);
+  }
+}
+
 export function processMiddlewareHeaders(headers: Headers): void {
+  dropEmptyMiddlewareSetCookie(headers);
   const keysToDelete: string[] = [];
   const unconsumedRequestHeaders = getUnconsumedMiddlewareRequestHeaders(headers);
 
@@ -605,6 +619,40 @@ export function cloneRequestWithHeaders(request: Request, headers: Headers): Req
     cloned = new Request(request.url, init);
   }
   return attachRequestCfMetadata(cloned, request);
+}
+
+export function haveSameHeaders(first: Headers, second: Headers): boolean {
+  const firstEntries = [...first];
+  const secondEntries = [...second];
+  return (
+    firstEntries.length === secondEntries.length &&
+    firstEntries.every(
+      ([name, value], index) =>
+        name === secondEntries[index]?.[0] && value === secondEntries[index]?.[1],
+    )
+  );
+}
+
+// Node hosts can hand over Request look-alikes, such as srvx's NodeRequest,
+// that pass `instanceof Request` but lack its internal state, so native
+// Request code throws on them. Only the native getter tells them apart.
+function isNativeRequest(request: Request): boolean {
+  try {
+    Reflect.get(Request.prototype, "url", request);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `cloneRequestWithHeaders`, except that a native request whose headers
+ * already match is returned as is, so its body stays where it is.
+ */
+export function withRequestHeaders(request: Request, headers: Headers): Request {
+  return isNativeRequest(request) && haveSameHeaders(headers, request.headers)
+    ? request
+    : cloneRequestWithHeaders(request, headers);
 }
 
 /**

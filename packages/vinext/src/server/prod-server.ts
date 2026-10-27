@@ -17,7 +17,7 @@
  * - dist/server/index.js — RSC entry (default export: handler(Request) → Response)
  * - dist/server/ssr/index.js — SSR entry (imported by RSC entry at runtime)
  */
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Readable, pipeline } from "node:stream";
@@ -99,7 +99,6 @@ import {
   readTrustedPrerenderRouteParamsFromHeaders,
   serializePrerenderRouteParamsHeader,
 } from "./prerender-route-params.js";
-import { seedMemoryCacheFromPrerender as seedMemoryCacheFromPrerenderFallback } from "./seed-cache.js";
 import { installSocketErrorBackstop } from "./socket-error-backstop.js";
 import {
   trustProxy,
@@ -127,6 +126,7 @@ import type { NextI18nConfig } from "../config/next-config.js";
 import { readTrustedRevalidationHostname } from "./revalidation-host.js";
 import { readStaticFileSignal } from "./static-file-signal.js";
 import { traceFrameworkRequest } from "./request-tracing.js";
+import { shouldRestoreLocaleRootTrailingSlash } from "./pages-i18n.js";
 
 /**
  * mtime of the build each bare (query-less) server-entry URL was first
@@ -521,6 +521,7 @@ function installClientBuildManifestGlobals(
   const metadata = computeClientRuntimeMetadata({ clientDir, assetBase, assetPrefix });
   setPagesClientAssets({
     appBootstrapPreinitModules: metadata.appBootstrapPreinitModules,
+    appRouteManifestModule: metadata.appRouteManifestModule,
     lazyChunks: metadata.lazyChunks,
     dynamicPreloads: metadata.dynamicPreloads,
     crossOrigin,
@@ -590,6 +591,29 @@ function isVinextStreamedHtmlResponse(response: Response): boolean {
 // stream in memory.
 function isVinextStreamedApiResponse(response: Response): boolean {
   return (response as ResponseWithVinextStreamingMetadata).__vinextStreamedApiResponse === true;
+}
+
+// The build fetches pages from the prerender server over pooled keep-alive
+// sockets. If a render blocks the event loop past keepAliveTimeout, the server
+// can close an idle socket just as the client reuses it, and the request fails
+// with ECONNRESET. Only the client expires idle sockets on this server. #4118
+function disablePrerenderKeepAliveTimeout(server: Server, purpose: ProdServerOptions["purpose"]) {
+  if (purpose === "prerender") server.keepAliveTimeout = 0;
+}
+
+// Resolves with the bound port, or rejects with the listen error (e.g.
+// EADDRINUSE). Without an "error" listener the failure escapes to the
+// socket-error backstop, which logs and absorbs it on a running server, so
+// startup never settles and `vinext start` exits 0 instead of failing.
+function listen(server: Server, port: number, host: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      const addr = server.address();
+      resolve(typeof addr === "object" && addr ? addr.port : port);
+    });
+  });
 }
 
 function logProdServerStarted(host: string, port: number, purpose: ProdServerOptions["purpose"]) {
@@ -1425,6 +1449,15 @@ export async function startProdServer(options: ProdServerOptions = {}) {
   // the build process.
   installSocketErrorBackstop({ runningServer: options.purpose !== "prerender" });
 
+  // Like `vinext start` and `next start`, default to production so React and
+  // the other packages the server bundles import load their production
+  // builds. Custom entries, including the generated standalone server.js,
+  // call this directly. Build-time servers run inside the build, which has
+  // already chosen NODE_ENV.
+  if (options.purpose !== "prerender" && !process.env.NODE_ENV) {
+    Reflect.set(process.env, "NODE_ENV", "production");
+  }
+
   const {
     port = process.env.PORT ? parseInt(process.env.PORT) : 3000,
     host = "0.0.0.0",
@@ -1625,6 +1658,14 @@ function resolveAppRouterHandler(
 }
 
 type AppRouterPrerenderSeeder = (serverDir: string) => Promise<number>;
+
+// Loaded on demand: seed-cache imports React, which picks its development or
+// production build when first loaded, so it must not load before
+// startProdServer has chosen NODE_ENV.
+async function seedMemoryCacheFromPrerenderFallback(serverDir: string): Promise<number> {
+  const { seedMemoryCacheFromPrerender } = await import("./seed-cache.js");
+  return seedMemoryCacheFromPrerender(serverDir);
+}
 type AppRouterPrerenderSeederExport = (serverDir: string) => unknown;
 
 function isAppRouterPrerenderSeederExport(value: unknown): value is AppRouterPrerenderSeederExport {
@@ -1765,7 +1806,9 @@ function installPagesClientAssets(options: {
   setPagesClientAssets({
     clientEntry: metadata.clientEntryFile,
     appBootstrapPreinitModules: metadata.appBootstrapPreinitModules,
+    appRouteManifestModule: metadata.appRouteManifestModule,
     ssrManifest: Object.keys(ssrManifest).length > 0 ? ssrManifest : undefined,
+    sharedChunks: metadata.sharedChunks,
     cssGraph: metadata.cssGraph,
     lazyChunks: metadata.lazyChunks,
     dynamicPreloads: metadata.dynamicPreloads,
@@ -2246,18 +2289,10 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   const server = createServer((req, res) => {
     void runWithServerEntryRequire(rscEntryRequire, () => handleRequest(req, res));
   });
+  disablePrerenderKeepAliveTimeout(server, purpose);
 
-  await new Promise<void>((resolve) => {
-    server.listen(port, host, () => {
-      const addr = server.address();
-      const actualPort = typeof addr === "object" && addr ? addr.port : port;
-      if (!silent) logProdServerStarted(host, actualPort, purpose);
-      resolve();
-    });
-  });
-
-  const addr = server.address();
-  const actualPort = typeof addr === "object" && addr ? addr.port : port;
+  const actualPort = await listen(server, port, host);
+  if (!silent) logProdServerStarted(host, actualPort, purpose);
   return { server, port: actualPort };
 }
 
@@ -2312,18 +2347,10 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
   const { port, host, purpose, silent } = options;
   const handler = await createPagesRouterRequestHandler(options);
   const server = createServer(handler);
+  disablePrerenderKeepAliveTimeout(server, purpose);
 
-  await new Promise<void>((resolve) => {
-    server.listen(port, host, () => {
-      const addr = server.address();
-      const actualPort = typeof addr === "object" && addr ? addr.port : port;
-      if (!silent) logProdServerStarted(host, actualPort, purpose);
-      resolve();
-    });
-  });
-
-  const addr = server.address();
-  const actualPort = typeof addr === "object" && addr ? addr.port : port;
+  const actualPort = await listen(server, port, host);
+  if (!silent) logProdServerStarted(host, actualPort, purpose);
   return { server, port: actualPort };
 }
 
@@ -2576,6 +2603,10 @@ async function createPagesRouterRequestHandler(
       // only applies default rules to requests inside basePath, and only
       // applies `basePath: false` rules to requests outside it.
       const hadBasePath = !basePath || hasBasePath(requestPathname, basePath);
+      const restoreLocaleRootTrailingSlash = shouldRestoreLocaleRootTrailingSlash(requestPathname, {
+        trailingSlash,
+        skipProxyUrlNormalize,
+      });
       let configMatchPathname = stripBasePath(requestPathname, basePath);
       {
         const strippedPathname = stripBasePath(pathname, basePath);
@@ -2714,6 +2745,10 @@ async function createPagesRouterRequestHandler(
             recordCacheability: false,
             rawSearch: sourceUrl.search,
             configMatchPathname: strippedSourcePathname,
+            restoreLocaleRootTrailingSlash: shouldRestoreLocaleRootTrailingSlash(
+              sourceRequestPathname,
+              { trailingSlash, skipProxyUrlNormalize },
+            ),
             runMiddleware: runNodeMiddleware
               ? wrapMiddlewareWithBasePath(runNodeMiddleware, basePath, sourceHadBasePath)
               : null,
@@ -2777,6 +2812,7 @@ async function createPagesRouterRequestHandler(
             ? authorizeOnDemandRevalidate
             : undefined,
         configMatchPathname,
+        restoreLocaleRootTrailingSlash,
         matchPageRoute: matchPageRoute ?? null,
         matchApiRoute: matchApiRoute ?? null,
         // Pass the original (pre-basePath-stripping) URL to middleware so that
